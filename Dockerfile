@@ -7,17 +7,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN useradd --create-home --uid 10001 appuser
-COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
-COPY main.py ./
-RUN mkdir -p /app/data && chown -R appuser:appuser /app
+COPY requirements.txt ./
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.txt
+
+COPY main.py healthcheck.py ./
+
+RUN mkdir -p /app/data \
+    && chown -R appuser:appuser /app
 
 USER appuser
 VOLUME ["/app/data"]
+STOPSIGNAL SIGTERM
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
-  CMD python main.py healthcheck
+# Быстрая проверка: не импортирует aiogram/Telethon и не запускает второй экземпляр бота.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=45s --retries=3 \
+    CMD ["python", "/app/healthcheck.py"]
 
-CMD ["python", "main.py", "bot"]
+CMD ["python", "-u", "/app/main.py", "bot"]
