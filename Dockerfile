@@ -13,16 +13,14 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
-COPY main.py healthcheck.py ./
+COPY main.py logic.py healthcheck.py ./
 
 RUN mkdir -p /app/data \
     && chown -R appuser:appuser /app
 
 USER appuser
-VOLUME ["/app/data"]
 STOPSIGNAL SIGTERM
 
-# Быстрая проверка: не импортирует aiogram/Telethon и не запускает второй экземпляр бота.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=45s --retries=3 \
     CMD ["python", "/app/healthcheck.py"]
 

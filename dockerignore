@@ -12,3 +12,4 @@ logs/
 *.log
 *.zip
 .DS_Store
+.pytest_cache/
