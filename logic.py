@@ -52,6 +52,28 @@ def parse_target_numbers(text: str) -> list[int]:
     return values
 
 
+
+
+def base_slug_from_unique(slug: str, number: int | None = None) -> str | None:
+    """Extract the collectible type slug from a full unique slug.
+
+    Telegram unique slugs normally look like ``DurovsGlasses-1234``.  Prefer
+    the actual ``num`` suffix when available, then fall back to a trailing
+    numeric suffix.
+    """
+    value = (slug or "").strip().strip("/@")
+    if not value:
+        return None
+    if number is not None:
+        suffix = f"-{int(number)}"
+        if value.endswith(suffix) and len(value) > len(suffix):
+            return value[:-len(suffix)]
+    match = TRAILING_NUMBER_RE.match(value)
+    if match and match.group(1):
+        return match.group(1)
+    return value
+
+
 def slug_candidates(text: str) -> list[str]:
     """Return likely collectible base slugs from a title, slug or t.me/nft URL."""
     value = (text or "").strip()

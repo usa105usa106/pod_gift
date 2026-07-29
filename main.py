@@ -15,6 +15,7 @@ import statistics
 import socket
 import sys
 import time
+import zipfile
 from dataclasses import asdict, dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -34,11 +35,13 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    FSInputFile,
 )
 from telethon import TelegramClient, errors, functions, types, utils
 
 from logic import (
     AdaptiveRateController,
+    base_slug_from_unique,
     evaluate_target,
     find_object_by_class_name,
     next_target,
@@ -69,7 +72,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0008"
+APP_VERSION = "v0011"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -113,6 +116,7 @@ STRESS_SECOND_INTERVAL_MS = 120.0
 STRESS_MAX_INTERVAL_MS = 0.0
 STRESS_STATUS_INTERVAL_SECONDS = 10.0
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
+CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
 
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -439,6 +443,16 @@ class GiftCounter:
     base_gift_id: int | None
 
 
+@dataclass(frozen=True)
+class CatalogNumber:
+    gift_id: int
+    title: str
+    issued: int | None
+    total: int | None
+    slug: str | None
+    error: str | None = None
+
+
 @dataclass
 class PreparedUpgrade:
     saved_id: int
@@ -468,6 +482,8 @@ class MTProtoService:
         self._slug_cache: dict[str, GiftCounter] = {}
         self._slug_cache_at: dict[str, float] = {}
         self._slug_probe: dict[str, int] = {}
+        self._gift_catalog: dict[int, Any] = {}
+        self._gift_catalog_at: float = 0.0
         self._authorized: bool | None = None
 
     @staticmethod
@@ -765,8 +781,263 @@ class MTProtoService:
                 mapping[saved_id] = item
         return mapping
 
+    async def get_gift_catalog(self, *, cache_seconds: float = 300.0) -> dict[int, Any]:
+        """Return regular Telegram gifts keyed by base gift ID.
+
+        Saved gift objects do not always include the optional title.  The
+        catalog is therefore used as a name source, not as the number source.
+        """
+        now = time.monotonic()
+        if self._gift_catalog and now - self._gift_catalog_at <= cache_seconds:
+            return dict(self._gift_catalog)
+        request_cls = getattr(functions.payments, "GetStarGiftsRequest", None)
+        if request_cls is None:
+            return dict(self._gift_catalog)
+        try:
+            result = await self.call(construct(request_cls, hash=0))
+            gifts = list(getattr(result, "gifts", []) or [])
+            catalog: dict[int, Any] = {}
+            for gift in gifts:
+                gift_id = _int_or_none(getattr(gift, "id", None))
+                if gift_id is not None:
+                    catalog[gift_id] = gift
+            if catalog:
+                self._gift_catalog = catalog
+                self._gift_catalog_at = now
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            logger.debug("gift_catalog_failed error=%s", exc)
+        return dict(self._gift_catalog)
+
+    async def fetch_global_catalog_numbers(
+        self,
+        *,
+        concurrency: int = CATALOG_CONCURRENCY,
+    ) -> tuple[list[CatalogNumber], float]:
+        """Fetch the global Telegram collectible catalog and latest issued numbers.
+
+        This intentionally does not resolve or inspect the selected channel.  It
+        mirrors the v0002 behaviour: ``payments.getStarGifts`` supplies every
+        regular gift type that supports collectible upgrades, and one
+        ``payments.getUniqueStarGift`` lookup per type supplies
+        ``availability_issued``.  Lookups are bounded-concurrent so a full
+        catalog remains fast without creating unbounded request bursts.
+        """
+        rate_limit.clear_if_expired()
+        rate_limit.assert_available()
+        started = time.perf_counter()
+        client = await self.require_authorized()
+        request_cls = getattr(functions.payments, "GetStarGiftsRequest", None)
+        unique_cls = getattr(functions.payments, "GetUniqueStarGiftRequest", None)
+        if request_cls is None or unique_cls is None:
+            raise RuntimeError("Установленная версия Telethon не поддерживает каталог подарков")
+
+        catalog_result = await self.call(construct(request_cls, hash=0))
+        gifts = [
+            gift
+            for gift in list(getattr(catalog_result, "gifts", []) or [])
+            if gift.__class__.__name__ == "StarGift"
+            and getattr(gift, "upgrade_stars", None) is not None
+            and _int_or_none(getattr(gift, "id", None)) is not None
+        ]
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def resolve(gift: Any) -> CatalogNumber:
+            gift_id = int(getattr(gift, "id"))
+            title = str(getattr(gift, "title", None) or f"Gift {gift_id}")
+            stored = self.store.settings.slug_map.get(str(gift_id))
+            candidates: list[str] = []
+            for candidate in ([stored] if stored else []) + slug_candidates(title):
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+            if not candidates:
+                return CatalogNumber(gift_id, title, None, None, None, "slug unavailable")
+
+            last_error: str | None = None
+            for base in candidates:
+                for probe in (1, 2, 3, 10):
+                    try:
+                        async with semaphore:
+                            rate_limit.clear_if_expired()
+                            rate_limit.assert_available()
+                            response = await client(construct(unique_cls, slug=f"{base}-{probe}"))
+                        unique = getattr(response, "gift", None)
+                        if unique is None or unique.__class__.__name__ != "StarGiftUnique":
+                            continue
+                        returned_id = _int_or_none(getattr(unique, "gift_id", None))
+                        if returned_id != gift_id:
+                            continue
+                        issued = _int_or_none(getattr(unique, "availability_issued", None))
+                        if issued is None:
+                            continue
+                        number = _int_or_none(getattr(unique, "num", None))
+                        full_slug = _str_or_none(getattr(unique, "slug", None))
+                        resolved_slug = base_slug_from_unique(full_slug or "", number) or base
+                        return CatalogNumber(
+                            gift_id=gift_id,
+                            title=str(getattr(unique, "title", None) or title),
+                            issued=issued,
+                            total=_int_or_none(getattr(unique, "availability_total", None)),
+                            slug=resolved_slug,
+                        )
+                    except errors.FloodWaitError as exc:
+                        rate_limit.register(float(exc.seconds), "global_catalog_numbers")
+                        return CatalogNumber(
+                            gift_id, title, None, None, base, f"FLOOD_WAIT_{int(exc.seconds)}"
+                        )
+                    except RateLimitActiveError as exc:
+                        return CatalogNumber(gift_id, title, None, None, base, str(exc))
+                    except errors.RPCError as exc:
+                        last_error = exc.__class__.__name__
+                        if "STARGIFT_SLUG_INVALID" in str(exc).upper():
+                            continue
+                        logger.debug(
+                            "global_catalog_item_rpc_error gift_id=%s slug=%s error=%s",
+                            gift_id,
+                            base,
+                            exc,
+                        )
+                    except Exception as exc:
+                        last_error = exc.__class__.__name__
+                        logger.debug(
+                            "global_catalog_item_error gift_id=%s slug=%s error=%s",
+                            gift_id,
+                            base,
+                            exc,
+                        )
+            return CatalogNumber(gift_id, title, None, None, candidates[0], last_error or "not found")
+
+        results = await asyncio.gather(*(resolve(gift) for gift in gifts))
+        results.sort(key=lambda item: item.title.casefold())
+
+        changed = False
+        for item in results:
+            if item.slug and item.issued is not None and self.store.settings.slug_map.get(str(item.gift_id)) != item.slug:
+                self.store.settings.slug_map[str(item.gift_id)] = item.slug
+                changed = True
+        if changed:
+            await self.store.save()
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "global_catalog_numbers_complete collections=%s resolved=%s errors=%s elapsed_ms=%.1f concurrency=%s",
+            len(results),
+            sum(1 for item in results if item.issued is not None),
+            sum(1 for item in results if item.issued is None),
+            elapsed_ms,
+            max(1, int(concurrency)),
+        )
+        return results, elapsed_ms
+
+    async def _remember_counter(self, counter: GiftCounter, *, probe: int | None = None) -> GiftCounter:
+        self._slug_cache[counter.slug] = counter
+        self._slug_cache_at[counter.slug] = time.monotonic()
+        if probe is not None and probe > 0:
+            self._slug_probe[counter.slug] = int(probe)
+        if counter.base_gift_id and self.store.settings.slug_map.get(str(counter.base_gift_id)) != counter.slug:
+            self.store.settings.slug_map[str(counter.base_gift_id)] = counter.slug
+            await self.store.save()
+        return counter
+
+    async def _counter_from_unique(self, gift: Any, *, expected_gift_id: int) -> GiftCounter | None:
+        if gift is None or gift.__class__.__name__ != "StarGiftUnique":
+            return None
+        gift_id = _int_or_none(getattr(gift, "gift_id", None))
+        if gift_id != expected_gift_id:
+            return None
+        full_slug = _str_or_none(getattr(gift, "slug", None))
+        number = _int_or_none(getattr(gift, "num", None))
+        base_slug = base_slug_from_unique(full_slug or "", number)
+        current = _int_or_none(getattr(gift, "availability_issued", None))
+        if not base_slug or current is None:
+            return None
+        return await self._remember_counter(
+            GiftCounter(
+                slug=base_slug,
+                title=str(getattr(gift, "title", None) or base_slug),
+                current=current,
+                total=_int_or_none(getattr(gift, "availability_total", None)),
+                base_gift_id=gift_id,
+            ),
+            probe=number,
+        )
+
+    async def discover_counter_by_gift_id(self, gift_id: int, *, peer: Any | None = None) -> GiftCounter | None:
+        """Resolve a collectible type from the exact regular gift ID.
+
+        This avoids asking the user to type a slug.  The primary lookup uses
+        ``payments.getResaleStarGifts(gift_id=...)`` because every returned
+        collectible already contains its title, full slug and current issued
+        counter.  If no item is currently on resale, owned unique gifts and
+        the regular gift catalog are used as fallbacks.
+        """
+        gift_id = int(gift_id)
+
+        resale_cls = getattr(functions.payments, "GetResaleStarGiftsRequest", None)
+        if resale_cls is not None:
+            try:
+                request = construct(
+                    resale_cls,
+                    gift_id=gift_id,
+                    offset="",
+                    limit=1,
+                    sort_by_num=True,
+                )
+                result = await self.call(request)
+                for gift in list(getattr(result, "gifts", []) or []):
+                    counter = await self._counter_from_unique(gift, expected_gift_id=gift_id)
+                    if counter is not None:
+                        logger.info("slug_auto_resolved source=resale gift_id=%s slug=%s", gift_id, counter.slug)
+                        return counter
+            except errors.FloodWaitError:
+                raise
+            except errors.RPCError as exc:
+                logger.debug("slug_resale_lookup_rpc_error gift_id=%s error=%s", gift_id, exc)
+            except Exception as exc:
+                logger.debug("slug_resale_lookup_error gift_id=%s error=%s", gift_id, exc)
+
+        if peer is not None:
+            request_cls = getattr(functions.payments, "GetSavedStarGiftsRequest", None)
+            if request_cls is not None:
+                offset = ""
+                try:
+                    for _page in range(5):
+                        result = await self.call(construct(request_cls, peer=peer, offset=offset, limit=100))
+                        gifts = list(getattr(result, "gifts", []) or [])
+                        for item in gifts:
+                            counter = await self._counter_from_unique(
+                                getattr(item, "gift", None), expected_gift_id=gift_id
+                            )
+                            if counter is not None:
+                                logger.info(
+                                    "slug_auto_resolved source=owned_unique gift_id=%s slug=%s",
+                                    gift_id,
+                                    counter.slug,
+                                )
+                                return counter
+                        next_offset = getattr(result, "next_offset", None)
+                        if not next_offset or not gifts:
+                            break
+                        offset = str(next_offset)
+                except errors.FloodWaitError:
+                    raise
+                except Exception as exc:
+                    logger.debug("slug_owned_lookup_error gift_id=%s error=%s", gift_id, exc)
+
+        catalog = await self.get_gift_catalog(cache_seconds=0.0)
+        regular = catalog.get(gift_id)
+        title = _str_or_none(getattr(regular, "title", None)) if regular is not None else None
+        if title:
+            counter = await self.resolve_slug(title, expected_gift_id=gift_id, cache_seconds=0.0)
+            if counter is not None:
+                logger.info("slug_auto_resolved source=catalog_title gift_id=%s slug=%s", gift_id, counter.slug)
+                return counter
+        return None
+
     async def list_upgradable_infos(self, peer: Any) -> list[SavedGiftInfo]:
         gifts = await self.fetch_saved_gifts(peer, only_upgradable=True)
+        catalog = await self.get_gift_catalog()
         infos: list[SavedGiftInfo] = []
         for item in gifts:
             saved_id = _int_or_none(getattr(item, "saved_id", None))
@@ -774,7 +1045,12 @@ class MTProtoService:
             base_id = _int_or_none(getattr(gift, "id", None))
             if not saved_id or not base_id:
                 continue
-            title = str(getattr(gift, "title", None) or f"Gift {base_id}")
+            catalog_gift = catalog.get(base_id)
+            title = str(
+                getattr(gift, "title", None)
+                or (getattr(catalog_gift, "title", None) if catalog_gift is not None else None)
+                or f"Gift {base_id}"
+            )
             cached_slug = self.store.settings.slug_map.get(str(base_id))
             cost = _int_or_none(getattr(gift, "upgrade_stars", None)) or 0
             prepaid = bool(getattr(item, "upgrade_separate", False) or getattr(item, "upgrade_stars", None))
@@ -796,6 +1072,7 @@ class MTProtoService:
     async def get_selected_infos(self, peer: Any) -> list[SavedGiftInfo]:
         selected = list(self.store.settings.selected_saved_ids)
         mapping = await self.fetch_saved_by_ids(peer, selected)
+        catalog = await self.get_gift_catalog()
         infos: list[SavedGiftInfo] = []
         for saved_id in selected:
             item = mapping.get(saved_id)
@@ -806,7 +1083,12 @@ class MTProtoService:
             if not base_id:
                 # Already unique gifts expose gift_id rather than id; they are no longer candidates.
                 continue
-            title = str(getattr(gift, "title", None) or f"Gift {base_id}")
+            catalog_gift = catalog.get(base_id)
+            title = str(
+                getattr(gift, "title", None)
+                or (getattr(catalog_gift, "title", None) if catalog_gift is not None else None)
+                or f"Gift {base_id}"
+            )
             slug = self.store.settings.slug_map.get(str(base_id))
             if not slug and not title.startswith("Gift "):
                 resolved = await self.resolve_slug(title, expected_gift_id=base_id)
@@ -909,20 +1191,45 @@ class MTProtoService:
                     raise
         raise RuntimeError(f"Не удалось получить текущий номер {slug}: {last_error or 'нет данных'}")
 
-    async def counter_for_info(self, info: SavedGiftInfo, *, cache_seconds: float = 0.0) -> GiftCounter:
+    async def counter_for_info(
+        self,
+        info: SavedGiftInfo,
+        *,
+        peer: Any | None = None,
+        cache_seconds: float = 0.0,
+    ) -> GiftCounter:
         slug = info.slug or self.store.settings.slug_map.get(str(info.base_gift_id))
         if slug:
-            counter = await self.resolve_slug(slug, expected_gift_id=info.base_gift_id, cache_seconds=cache_seconds)
+            counter = await self.resolve_slug(
+                slug,
+                expected_gift_id=info.base_gift_id,
+                cache_seconds=cache_seconds,
+            )
             if counter:
                 info.slug = counter.slug
                 return counter
-        counter = await self.resolve_slug(info.title, expected_gift_id=info.base_gift_id, cache_seconds=cache_seconds)
+
+        # Exact gift-ID discovery is the normal path when Telegram omits the
+        # optional regular-gift title from a saved gift object.
+        counter = await self.discover_counter_by_gift_id(info.base_gift_id, peer=peer)
         if counter:
             info.slug = counter.slug
+            info.title = counter.title
             return counter
+
+        if info.title and not info.title.startswith("Gift "):
+            counter = await self.resolve_slug(
+                info.title,
+                expected_gift_id=info.base_gift_id,
+                cache_seconds=cache_seconds,
+            )
+            if counter:
+                info.slug = counter.slug
+                return counter
         raise RuntimeError(
-            f"Не удалось определить slug для «{info.title}». "
-            "Напиши в чат название slug, например DurovsGlasses, чтобы привязать его к выбранному подарку."
+            f"Не удалось автоматически определить тип подарка ID {info.base_gift_id}. "
+            "Telegram не вернул ни одного коллекционного экземпляра или названия для этого типа. "
+            "Можно прислать slug вручную, но сканер останется остановлен до успешной привязки."
         )
 
     async def prepare_upgrade(self, peer: Any, info: SavedGiftInfo) -> PreparedUpgrade:
@@ -1238,7 +1545,7 @@ class Scanner:
         for info in infos:
             counter = counter_by_base.get(info.base_gift_id)
             if counter is None:
-                counter = await self.service.counter_for_info(info, cache_seconds=0)
+                counter = await self.service.counter_for_info(info, peer=peer, cache_seconds=0)
                 counter_by_base[info.base_gift_id] = counter
             info.slug = counter.slug
             groups.setdefault(counter.slug, []).append(info)
@@ -1297,6 +1604,11 @@ class Scanner:
         rate_limit.assert_available()
         if not await self.service.is_authorized():
             raise RuntimeError("Telegram-аккаунт не авторизован")
+
+        # Reset the visible state first, but do not mark the scanner active until
+        # channel, gifts, slug/counter and (for LIVE) payment forms have all been
+        # validated synchronously.  This prevents a failed start from briefly
+        # showing a green "active" status.
         self.stop_event = asyncio.Event()
         self.triggered.clear()
         self.notified_missed.clear()
@@ -1305,8 +1617,8 @@ class Scanner:
         self._counter_meta.clear()
         self._last_poll_started = None
         self.rate.reset()
-        runtime.active = True
-        runtime.started_at = time.monotonic()
+        runtime.active = False
+        runtime.started_at = None
         runtime.checks = 0
         runtime.last_cycle_ms = None
         runtime.last_error = None
@@ -1322,7 +1634,26 @@ class Scanner:
         runtime.flood_count = 0
         runtime.last_flood_wait_s = None
         runtime.rate_cooldown_cycles = 0
-        self.task = asyncio.create_task(self._run(), name="gift-scanner")
+
+        try:
+            peer = await self.service.resolve_channel()
+            await self._load_plan(peer)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            runtime.active = False
+            runtime.started_at = None
+            runtime.current_by_slug.clear()
+            runtime.title_by_slug.clear()
+            runtime.last_error = f"{type(exc).__name__}: {exc}"
+            await self._maybe_write_diagnostics(force=True)
+            raise
+
+        runtime.active = True
+        runtime.started_at = time.monotonic()
+        runtime.last_error = None
+        self._plan_dirty = False
+        self.task = asyncio.create_task(self._run(peer), name="gift-scanner")
         self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-scanner-monitor")
         logger.info(
             "scanner_started version=%s saved_ids=%s targets=%s live=%s adaptive=%s start_ms=%s min_ms=%s",
@@ -1359,11 +1690,8 @@ class Scanner:
         await self.refresh_status_message(force=True)
         logger.info("scanner_stopped reason=%s", reason)
 
-    async def _run(self) -> None:
+    async def _run(self, peer: Any) -> None:
         try:
-            peer = await self.service.resolve_channel()
-            await self._load_plan(peer)
-
             while not self.stop_event.is_set():
                 poll_started = time.monotonic()
                 if self._last_poll_started is not None:
@@ -1829,7 +2157,7 @@ class StressTester:
         counters: dict[int, GiftCounter] = {}
         for info in infos:
             if info.base_gift_id not in counters:
-                counters[info.base_gift_id] = await self.service.counter_for_info(info, cache_seconds=0)
+                counters[info.base_gift_id] = await self.service.counter_for_info(info, peer=peer, cache_seconds=0)
         if len(counters) != 1:
             raise RuntimeError("Для теста выбери подарки только одного типа")
 
@@ -2662,11 +2990,10 @@ async def gifts_handler(message: Message) -> None:
         if not infos:
             await message.answer("В канале нет подарков, доступных для улучшения.")
             return
-        lines = [
-            f"🎁 <b>Подарки канала: {html.escape(store.settings.channel_title or '')}</b>",
-            "Каждая строка — отдельный экземпляр. Выбери тот, который бот должен улучшить.",
-        ]
-        await message.answer("\n".join(lines), reply_markup=gifts_keyboard(infos, selected))
+        await message.answer(
+            build_channel_gifts_text(infos),
+            reply_markup=gifts_keyboard(infos, selected),
+        )
     except Exception as exc:
         logger.exception("gifts_handler_failed")
         await message.answer(f"❌ {html.escape(str(exc))}")
@@ -2773,6 +3100,126 @@ async def targets_value_handler(message: Message, state: FSMContext) -> None:
     )
 
 
+def build_channel_gifts_text(infos: list[SavedGiftInfo]) -> str:
+    """Build the selected-channel gift picker without checking collectible counters."""
+    grouped: dict[int, list[SavedGiftInfo]] = {}
+    for info in infos:
+        grouped.setdefault(info.base_gift_id, []).append(info)
+    selected = set(store.settings.selected_saved_ids)
+    lines = [
+        f"🎁 <b>Подарки канала · {html.escape(store.settings.channel_title or 'канал')}</b>",
+        f"Типов: <b>{len(grouped)}</b> · экземпляров: <b>{len(infos)}</b>",
+        "",
+    ]
+    for index, group in enumerate(
+        sorted(grouped.values(), key=lambda items: items[0].title.casefold()), start=1
+    ):
+        representative = group[0]
+        selected_count = sum(1 for item in group if item.saved_id in selected)
+        selected_suffix = f" · выбрано {selected_count}" if selected_count else ""
+        prices = [item.upgrade_cost for item in group if item.upgrade_cost > 0]
+        price_suffix = f" · до {max(prices)} ⭐" if prices else ""
+        lines.append(
+            f"{index}. <b>{html.escape(representative.title)}</b> — "
+            f"{len(group)} шт.{selected_suffix}{price_suffix}"
+        )
+    lines.extend(
+        [
+            "",
+            "Каждая кнопка ниже — отдельный экземпляр. "
+            "Последние номера всех коллекций открываются отдельной кнопкой «🔢 Проверить номера».",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def build_global_gift_numbers_text(service: MTProtoService) -> str:
+    """Return the global Telegram collectible catalog, independent of channels."""
+    results, elapsed_ms = await service.fetch_global_catalog_numbers()
+    results = sorted(results, key=lambda item: item.title.casefold())
+    resolved = sum(1 for item in results if item.issued is not None)
+    errors_count = len(results) - resolved
+    lines = [
+        f"🔢 <b>Последние выданные номера · {APP_VERSION}</b>",
+        f"Проверено коллекций: <b>{len(results)}</b> · {elapsed_ms:.0f} мс",
+    ]
+    if errors_count:
+        lines.append(f"Получено номеров: <b>{resolved}</b> · ошибок: <b>{errors_count}</b>")
+    lines.append("")
+    for item in results:
+        if item.issued is None:
+            lines.append(f"{html.escape(item.title)} — не определён")
+        else:
+            lines.append(f"{html.escape(item.title)} — {item.issued}")
+    return "\n".join(lines)
+
+
+def split_message_text(text: str, *, limit: int = 3800) -> list[str]:
+    """Split long line-oriented HTML messages without cutting a line."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.splitlines():
+        addition = len(line) + (1 if current else 0)
+        if current and current_len + addition > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += addition
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def send_text_chunks(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: Any | None = None,
+) -> None:
+    chunks = split_message_text(text)
+    for index, chunk in enumerate(chunks):
+        await message.answer(
+            chunk,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
+
+
+def build_full_log_export() -> Path:
+    """Build one owner-only ZIP containing all available bot logs."""
+    export_path = DATA_DIR / f"gift-hunter-{APP_VERSION}-full-log.zip"
+    candidates = sorted(
+        (
+            path
+            for path in DATA_DIR.glob("gift-hunter-v*.log*")
+            if path.is_file()
+            and "-full-log" not in path.name
+            and not path.name.endswith("-full.log")
+        ),
+        key=lambda path: (path.stat().st_mtime, path.name),
+    )
+    extras = [
+        path
+        for path in (STRESS_REPORT_PATH, STRESS_HISTORY_PATH, DIAGNOSTICS_PATH, RATE_LIMIT_PATH)
+        if path.exists() and path.is_file()
+    ]
+    manifest = (
+        f"{APP_NAME} {APP_VERSION} full log export\n"
+        f"generated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+        f"log_files={len(candidates)}\n"
+        f"extra_files={len(extras)}\n"
+    )
+    with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("MANIFEST.txt", manifest)
+        for path in candidates + extras:
+            archive.write(path, arcname=path.name)
+    return export_path
+
+
 async def current_status_text() -> str:
     peer = await mtproto.resolve_channel()
     infos = await mtproto.get_selected_infos(peer)
@@ -2781,7 +3228,7 @@ async def current_status_text() -> str:
     lines = [f"🎯 <b>{APP_NAME} {APP_VERSION}</b>"]
     seen: set[str] = set()
     for info in infos:
-        counter = await mtproto.counter_for_info(info, cache_seconds=0)
+        counter = await mtproto.counter_for_info(info, peer=peer, cache_seconds=0)
         if counter.slug in seen:
             continue
         seen.add(counter.slug)
@@ -2809,12 +3256,24 @@ async def current_status_text() -> str:
 async def check_numbers_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
+    if runtime.stress_active:
+        await message.answer(
+            "Идёт стресс-тест. Общий список номеров временно недоступен, чтобы не искажать тест.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    if runtime.active:
+        await message.answer(
+            "Сначала останови сканер: полная проверка каталога создаёт много запросов и не должна мешать ловле номера.",
+            reply_markup=main_keyboard(),
+        )
+        return
     try:
-        text = await stress_status_text() if runtime.stress_active else (await status_text() if runtime.active else await current_status_text())
-        await message.answer(text, reply_markup=main_keyboard())
+        text = await build_global_gift_numbers_text(mtproto)
+        await send_text_chunks(message, text, reply_markup=main_keyboard())
     except Exception as exc:
         logger.exception("check_numbers_failed")
-        await message.answer(f"❌ {html.escape(str(exc))}")
+        await message.answer(f"❌ {html.escape(str(exc))}", reply_markup=main_keyboard())
 
 
 @router.message(F.text == BTN_START)
@@ -2879,7 +3338,7 @@ async def live_preflight(*, prepare: bool) -> str:
     if any(not info.can_upgrade for info in infos):
         raise RuntimeError("Один из выбранных подарков больше нельзя улучшить. Обнови список подарков.")
 
-    counter = await mtproto.counter_for_info(infos[0], cache_seconds=0)
+    counter = await mtproto.counter_for_info(infos[0], peer=peer, cache_seconds=0)
     future_targets = sorted({target for target in store.settings.target_numbers if target > counter.current})
     if not future_targets:
         raise RuntimeError(f"Все цели уже прошли. Текущий номер: {counter.current}")
@@ -2949,6 +3408,11 @@ async def live_preflight(*, prepare: bool) -> str:
 
 @router.message(F.text.in_({BTN_PAYMENT_OFF, BTN_PAYMENT_ON}))
 async def payment_toggle_handler(message: Message) -> None:
+    """The payment switch and scanner mode are the same setting.
+
+    Pressing the OFF label performs the full preflight and immediately enables
+    LIVE. The button press itself is the explicit financial confirmation.
+    """
     if not await owner_guard_message(message):
         return
     if await reject_changes_while_running_message(message):
@@ -2957,42 +3421,39 @@ async def payment_toggle_handler(message: Message) -> None:
         store.settings.live_upgrades = False
         scanner.prepared.clear()
         await store.save()
+        logger.info("live_disabled_by_toggle")
         await message.answer("🛡 Оплата выключена. Режим DRY-RUN.", reply_markup=main_keyboard())
         return
     try:
-        text = await live_preflight(prepare=True)
-        await message.answer(text, reply_markup=payment_confirm_keyboard())
+        summary = await live_preflight(prepare=True)
+        store.settings.live_upgrades = True
+        await store.save()
+        logger.info("live_enabled_by_toggle")
+        await message.answer(
+            "💳 <b>Оплата включена — режим LIVE активирован.</b>\n"
+            + summary.replace("⚠️ <b>Подтверждение LIVE</b>\n", ""),
+            reply_markup=main_keyboard(),
+        )
     except Exception as exc:
+        store.settings.live_upgrades = False
+        await store.save()
         logger.exception("live_preflight_failed")
         await message.answer(f"LIVE не включён: {html.escape(str(exc))}", reply_markup=main_keyboard())
 
 
 @router.callback_query(F.data.startswith("payment:"))
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
+    """Reject confirmation buttons left in chat by older versions.
+
+    v0011 uses the reply-keyboard payment switch itself as confirmation, so a
+    stale inline button must never change the current LIVE state.
+    """
     if not await owner_guard_callback(callback):
         return
-    if await reject_changes_while_running_callback(callback):
-        return
-    action = (callback.data or "").split(":", 1)[1]
-    if action != "on":
-        scanner.prepared.clear()
-        await callback.answer("Отменено")
-        return
-    try:
-        summary = await live_preflight(prepare=True)
-        store.settings.live_upgrades = True
-        await store.save()
-        await callback.answer("LIVE включён", show_alert=True)
-        if callback.message:
-            await callback.message.answer(
-                "💳 <b>LIVE включён.</b>\n" + summary.replace("⚠️ <b>Подтверждение LIVE</b>\n", ""),
-                reply_markup=main_keyboard(),
-            )
-    except Exception as exc:
-        store.settings.live_upgrades = False
-        await store.save()
-        logger.exception("live_enable_failed")
-        await callback.answer(str(exc)[:180], show_alert=True)
+    await callback.answer(
+        "Эта кнопка устарела. Используй тумблер «Оплата» в нижней клавиатуре.",
+        show_alert=True,
+    )
 
 
 async def stress_status_text() -> str:
@@ -3191,6 +3652,22 @@ async def reset_confirm_handler(callback: CallbackQuery) -> None:
             await callback.message.answer("🗑 Выбор и цели сброшены.", reply_markup=main_keyboard())
     else:
         await callback.answer("Отменено")
+
+
+@router.message(Command("log_full"))
+async def log_full_handler(message: Message) -> None:
+    if not await owner_guard_message(message):
+        return
+    try:
+        export_path = build_full_log_export()
+        document = FSInputFile(export_path, filename=export_path.name)
+        await message.answer_document(
+            document,
+            caption=f"📄 Полный лог {APP_NAME} {APP_VERSION}",
+        )
+    except Exception as exc:
+        logger.exception("log_full_failed")
+        await message.answer(f"❌ Не удалось отправить полный лог: {html.escape(str(exc))}")
 
 
 @router.message(Command("version"))
