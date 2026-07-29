@@ -1,0 +1,5 @@
+aiogram==3.30.0
+Telethon==1.44.0
+pydantic-settings==2.14.2
+cryptg==0.6.0
+pyasn1>=0.6.4
