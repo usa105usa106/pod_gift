@@ -24,7 +24,7 @@ from typing import Any, Iterable
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -72,7 +72,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0012"
+APP_VERSION = "v0014"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -114,8 +114,8 @@ STRESS_MAX_PHASE_START_SECONDS = 120.0
 STRESS_FIRST_INTERVAL_MS = 300.0
 STRESS_SECOND_INTERVAL_MS = 120.0
 STRESS_MAX_INTERVAL_MS = 0.0
-LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 1.0, minimum=0.5)
-STRESS_STATUS_INTERVAL_SECONDS = env_float("STRESS_STATUS_INTERVAL_SECONDS", 2.0, minimum=0.5)
+LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
+STRESS_STATUS_INTERVAL_SECONDS = env_float("STRESS_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
 STATUS_REPLACE_AFTER_FAILURES = env_int("STATUS_REPLACE_AFTER_FAILURES", 2, minimum=1)
 STATUS_REPLACE_COOLDOWN_SECONDS = env_float("STATUS_REPLACE_COOLDOWN_SECONDS", 5.0, minimum=1.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
@@ -241,16 +241,35 @@ class SettingsStore:
             os.chmod(self.path, 0o600)
 
     async def reset_operational(self) -> None:
-        if self.settings.payment_hold_saved_ids:
+        """Reset every user-facing setting while preserving authorization.
+
+        Authorization is deliberately split into two layers and both survive:
+        * owner_user_id keeps the Bot API control binding;
+        * api_id/api_hash/phone plus the SQLite ``*.session`` file keep MTProto.
+
+        Session files are never opened, renamed or deleted here.  Replacing the
+        Settings object with a small allow-list also makes newly added operational
+        fields reset by default instead of being accidentally retained.
+        """
+        current = self.settings
+        if current.payment_hold_saved_ids:
             raise RuntimeError(PENDING_PAYMENT_HOLD_MESSAGE)
-        self.settings.selected_saved_ids = []
-        self.settings.legacy_selected_gift_ids = []
-        self.settings.target_numbers = []
-        self.settings.live_upgrades = False
-        self.settings.payment_hold_targets = {}
-        self.settings.payment_hold_reason = None
-        self.settings.payment_verification_url = None
-        await self.save()
+
+        replacement = Settings(
+            version=APP_VERSION,
+            owner_user_id=current.owner_user_id,
+            api_id=current.api_id,
+            api_hash=current.api_hash,
+            phone=current.phone,
+        )
+        self.settings = replacement
+        try:
+            await self.save()
+        except BaseException:
+            # A failed disk write must not leave the process with a half-reset
+            # in-memory configuration that differs from settings.json.
+            self.settings = current
+            raise
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -505,6 +524,14 @@ class MTProtoService:
             if candidate.exists():
                 return str(candidate.with_suffix(""))
         return str(preferred)
+
+    def clear_operational_cache(self) -> None:
+        """Drop gift/channel lookup caches without touching authorization."""
+        self._slug_cache.clear()
+        self._slug_cache_at.clear()
+        self._slug_probe.clear()
+        self._gift_catalog.clear()
+        self._gift_catalog_at = 0.0
 
     def configured(self) -> bool:
         s = self.store.settings
@@ -1459,6 +1486,7 @@ class StatusMessageUpdater:
         self._last_text: str | None = None
         self._consecutive_failures = 0
         self._last_replacement_at = 0.0
+        self._retry_after_until = 0.0
         self._lock = asyncio.Lock()
 
     def attach(self, chat_id: int, message_id: int) -> None:
@@ -1467,6 +1495,7 @@ class StatusMessageUpdater:
         self._last_edit_at = 0.0
         self._last_text = None
         self._consecutive_failures = 0
+        self._retry_after_until = 0.0
 
     def clear(self) -> None:
         self.chat_id = None
@@ -1474,11 +1503,32 @@ class StatusMessageUpdater:
         self._last_edit_at = 0.0
         self._last_text = None
         self._consecutive_failures = 0
+        self._retry_after_until = 0.0
+
+    @property
+    def retry_after_remaining(self) -> float:
+        return max(0.0, self._retry_after_until - time.monotonic())
+
+    def _apply_retry_after(self, retry_after: float, *, error: BaseException) -> None:
+        delay = max(1.0, float(retry_after)) + 0.25
+        now = time.monotonic()
+        self._retry_after_until = max(self._retry_after_until, now + delay)
+        self._last_edit_at = now
+        self._consecutive_failures = 0
+        logger.warning(
+            "%s_status_rate_limited retry_after_s=%.2f blocked_until_monotonic=%.3f error=%s",
+            self.name,
+            delay,
+            self._retry_after_until,
+            error,
+        )
 
     async def update(self, text: str, *, force: bool = False) -> bool:
         if self.chat_id is None or self.message_id is None:
             return False
         now = time.monotonic()
+        if now < self._retry_after_until:
+            return False
         if not force and now - self._last_edit_at < self.min_interval_seconds:
             return False
         if not force and text == self._last_text:
@@ -1489,6 +1539,8 @@ class StatusMessageUpdater:
             if self.chat_id is None or self.message_id is None:
                 return False
             now = time.monotonic()
+            if now < self._retry_after_until:
+                return False
             if not force and now - self._last_edit_at < self.min_interval_seconds:
                 return False
             if not force and text == self._last_text:
@@ -1517,6 +1569,9 @@ class StatusMessageUpdater:
                         self.message_id,
                     )
                 return True
+            except TelegramRetryAfter as exc:
+                self._apply_retry_after(getattr(exc, "retry_after", 1.0), error=exc)
+                return False
             except TelegramBadRequest as exc:
                 lowered = str(exc).lower()
                 if "message is not modified" in lowered:
@@ -1532,6 +1587,10 @@ class StatusMessageUpdater:
                     exc,
                 )
             except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None:
+                    self._apply_retry_after(retry_after, error=exc)
+                    return False
                 logger.warning(
                     "%s_status_edit_failed chat_id=%s message_id=%s error=%s",
                     self.name,
@@ -2812,7 +2871,7 @@ def payment_confirm_keyboard() -> InlineKeyboardMarkup:
 def reset_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Сбросить выбор и цели", callback_data="reset:yes")],
+            [InlineKeyboardButton(text="🗑 Сбросить все настройки", callback_data="reset:yes")],
             [InlineKeyboardButton(text="Отмена", callback_data="reset:no")],
         ]
     )
@@ -3613,7 +3672,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0012 uses the reply-keyboard payment switch itself as confirmation, so a
+    v0014 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -3759,14 +3818,40 @@ async def status_text() -> str:
 
 @router.message(F.text == BTN_PING)
 async def ping_handler(message: Message) -> None:
+    """Return a compact health reply instead of duplicating the live status card."""
     if not await owner_guard_message(message):
         return
+
     started = time.perf_counter()
-    authorized = True if (runtime.active or runtime.stress_active) else await mtproto.is_authorized()
-    latency = (time.perf_counter() - started) * 1000
-    text = await status_text()
-    text += f"\nПроверка MTProto: {latency:.0f} мс ({'OK' if authorized else 'нет авторизации'})"
-    await message.answer(text, reply_markup=main_keyboard())
+    if runtime.active or runtime.stress_active:
+        authorized = True
+        mtproto_note = "подключён (без лишнего запроса во время скана)"
+    else:
+        authorized = await mtproto.is_authorized()
+        mtproto_note = "подключён" if authorized else "нет авторизации"
+    handler_ms = (time.perf_counter() - started) * 1000
+
+    lines = [
+        "🏓 <b>PONG</b>",
+        f"Бот: <b>работает</b>",
+        f"MTProto: <b>{mtproto_note}</b>",
+        f"Сканер: <b>{'активен' if runtime.active else 'остановлен'}</b>",
+        f"Стресс-тест: <b>{'идёт' if runtime.stress_active else 'выключен'}</b>",
+        f"Проверок сканера: <b>{runtime.checks}</b>",
+        (
+            f"Последний цикл: <b>{runtime.last_cycle_ms:.0f} мс</b>"
+            if runtime.last_cycle_ms is not None
+            else "Последний цикл: —"
+        ),
+        f"Обработка Ping: <b>{handler_ms:.1f} мс</b>",
+    ]
+    if runtime.current_by_slug:
+        current_parts = []
+        for slug, current in runtime.current_by_slug.items():
+            title = runtime.title_by_slug.get(slug, slug)
+            current_parts.append(f"{html.escape(title)}: <b>{current}</b>")
+        lines.append("Текущие номера: " + " · ".join(current_parts))
+    await message.answer("\n".join(lines), reply_markup=main_keyboard())
 
 
 @router.message(F.text == BTN_LOG)
@@ -3798,13 +3883,14 @@ async def reset_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
     await message.answer(
-        "Сбросить выбранные подарки, цели и выключить LIVE? Авторизация Telegram сохранится.",
+        "Сбросить канал, выбранные подарки, цели, LIVE, slug-привязки и временное состояние?\n\n"
+        "Сохранятся авторизация владельца бота, TG_API_ID/TG_API_HASH/телефон и MTProto-сессия.",
         reply_markup=reset_confirm_keyboard(),
     )
 
 
 @router.callback_query(F.data.startswith("reset:"))
-async def reset_confirm_handler(callback: CallbackQuery) -> None:
+async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
     if not await owner_guard_callback(callback):
         return
     action = (callback.data or "").split(":", 1)[1]
@@ -3816,11 +3902,40 @@ async def reset_confirm_handler(callback: CallbackQuery) -> None:
         except RuntimeError as exc:
             await callback.answer(str(exc)[:180], show_alert=True)
             return
-        runtime.current_by_slug.clear()
-        runtime.title_by_slug.clear()
-        await callback.answer("Сброшено")
+
+        # Clear only operational memory.  The connected TelegramClient, its
+        # authorization flag and every *.session database remain untouched.
+        await state.clear()
+        mtproto.clear_operational_cache()
+        scanner.prepared.clear()
+        scanner.triggered.clear()
+        scanner.notified_missed.clear()
+        scanner._groups.clear()
+        scanner._counter_meta.clear()
+        scanner._plan_dirty = True
+        scanner.status_chat_id = None
+        scanner.status_message_id = None
+        scanner.status_updater.clear()
+        stress_tester.status_chat_id = None
+        stress_tester.status_message_id = None
+        stress_tester.status_updater.clear()
+
+        fresh_runtime = RuntimeState()
+        runtime.__dict__.clear()
+        runtime.__dict__.update(fresh_runtime.__dict__)
+        logger.info(
+            "operational_reset_complete authorization_preserved=true owner_bound=%s mtproto_configured=%s",
+            store.settings.owner_user_id is not None,
+            mtproto.configured(),
+        )
+        await write_diagnostics()
+        await callback.answer("Сброшено; авторизация сохранена")
         if callback.message:
-            await callback.message.answer("🗑 Выбор и цели сброшены.", reply_markup=main_keyboard())
+            await callback.message.answer(
+                "🗑 Все рабочие настройки сброшены. Авторизация бота и Telegram-сессия сохранены.\n"
+                "Сначала выбери канал, затем подарок и цели.",
+                reply_markup=main_keyboard(),
+            )
     else:
         await callback.answer("Отменено")
 
