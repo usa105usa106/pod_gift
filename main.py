@@ -72,7 +72,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0011"
+APP_VERSION = "v0012"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -114,7 +114,10 @@ STRESS_MAX_PHASE_START_SECONDS = 120.0
 STRESS_FIRST_INTERVAL_MS = 300.0
 STRESS_SECOND_INTERVAL_MS = 120.0
 STRESS_MAX_INTERVAL_MS = 0.0
-STRESS_STATUS_INTERVAL_SECONDS = 10.0
+LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 1.0, minimum=0.5)
+STRESS_STATUS_INTERVAL_SECONDS = env_float("STRESS_STATUS_INTERVAL_SECONDS", 2.0, minimum=0.5)
+STATUS_REPLACE_AFTER_FAILURES = env_int("STATUS_REPLACE_AFTER_FAILURES", 2, minimum=1)
+STATUS_REPLACE_COOLDOWN_SECONDS = env_float("STATUS_REPLACE_COOLDOWN_SECONDS", 5.0, minimum=1.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
 CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
 
@@ -406,6 +409,7 @@ class RuntimeState:
     stress_last_error: str | None = None
     stress_avg_latency_ms: float | None = None
     stress_p95_latency_ms: float | None = None
+    stress_current_rate_per_s: float = 0.0
     stress_max_rate_per_s: float = 0.0
     stress_result: str | None = None
 
@@ -1430,6 +1434,144 @@ def construct(cls: Any, **kwargs: Any) -> Any:
     return cls(**accepted)
 
 
+class StatusMessageUpdater:
+    """Reliably edit one live status message, replacing it if editing breaks.
+
+    Telegram message edits can fail after reconnects, stale message IDs or a
+    transient Bot API error.  The scanner must never stop because of UI
+    telemetry, so failures are isolated and, after a small number of retries,
+    a fresh status message is sent and becomes the new edit target.
+    """
+
+    def __init__(
+        self,
+        bot_getter: Any,
+        *,
+        name: str,
+        min_interval_seconds: float,
+    ) -> None:
+        self.bot_getter = bot_getter
+        self.name = name
+        self.min_interval_seconds = max(0.1, float(min_interval_seconds))
+        self.chat_id: int | None = None
+        self.message_id: int | None = None
+        self._last_edit_at = 0.0
+        self._last_text: str | None = None
+        self._consecutive_failures = 0
+        self._last_replacement_at = 0.0
+        self._lock = asyncio.Lock()
+
+    def attach(self, chat_id: int, message_id: int) -> None:
+        self.chat_id = int(chat_id)
+        self.message_id = int(message_id)
+        self._last_edit_at = 0.0
+        self._last_text = None
+        self._consecutive_failures = 0
+
+    def clear(self) -> None:
+        self.chat_id = None
+        self.message_id = None
+        self._last_edit_at = 0.0
+        self._last_text = None
+        self._consecutive_failures = 0
+
+    async def update(self, text: str, *, force: bool = False) -> bool:
+        if self.chat_id is None or self.message_id is None:
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_edit_at < self.min_interval_seconds:
+            return False
+        if not force and text == self._last_text:
+            self._last_edit_at = now
+            return False
+
+        async with self._lock:
+            if self.chat_id is None or self.message_id is None:
+                return False
+            now = time.monotonic()
+            if not force and now - self._last_edit_at < self.min_interval_seconds:
+                return False
+            if not force and text == self._last_text:
+                self._last_edit_at = now
+                return False
+
+            bot = self.bot_getter()
+            if bot is None:
+                return False
+            try:
+                await bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                first_success = self._last_text is None
+                self._last_text = text
+                self._last_edit_at = now
+                self._consecutive_failures = 0
+                if first_success:
+                    logger.info(
+                        "%s_status_edit_started chat_id=%s message_id=%s",
+                        self.name,
+                        self.chat_id,
+                        self.message_id,
+                    )
+                return True
+            except TelegramBadRequest as exc:
+                lowered = str(exc).lower()
+                if "message is not modified" in lowered:
+                    self._last_text = text
+                    self._last_edit_at = now
+                    self._consecutive_failures = 0
+                    return True
+                logger.warning(
+                    "%s_status_edit_failed chat_id=%s message_id=%s error=%s",
+                    self.name,
+                    self.chat_id,
+                    self.message_id,
+                    exc,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s_status_edit_failed chat_id=%s message_id=%s error=%s",
+                    self.name,
+                    self.chat_id,
+                    self.message_id,
+                    exc,
+                )
+
+            self._consecutive_failures += 1
+            if self._consecutive_failures < STATUS_REPLACE_AFTER_FAILURES:
+                return False
+            if now - self._last_replacement_at < STATUS_REPLACE_COOLDOWN_SECONDS:
+                return False
+
+            try:
+                replacement = await bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                new_message_id = int(getattr(replacement, "message_id"))
+                old_message_id = self.message_id
+                self.message_id = new_message_id
+                self._last_text = text
+                self._last_edit_at = now
+                self._last_replacement_at = now
+                self._consecutive_failures = 0
+                logger.warning(
+                    "%s_status_message_replaced chat_id=%s old_message_id=%s new_message_id=%s",
+                    self.name,
+                    self.chat_id,
+                    old_message_id,
+                    new_message_id,
+                )
+                return True
+            except Exception as exc:
+                logger.error("%s_status_replacement_failed error=%s", self.name, exc)
+                return False
+
+
 mtproto = MTProtoService(store)
 
 
@@ -1446,10 +1588,14 @@ class Scanner:
         self._upgrade_lock = asyncio.Lock()
         self.status_chat_id: int | None = None
         self.status_message_id: int | None = None
-        self._last_status_edit = 0.0
-        self._last_status_text: str | None = None
+        self.status_updater = StatusMessageUpdater(
+            bot_getter,
+            name="scanner",
+            min_interval_seconds=LIVE_STATUS_INTERVAL_SECONDS,
+        )
         self._last_diagnostics_write = 0.0
         self._last_poll_started: float | None = None
+        self._status_wakeup = asyncio.Event()
         self._plan_dirty = True
         self._groups: dict[str, list[SavedGiftInfo]] = {}
         self._counter_meta: dict[str, GiftCounter] = {}
@@ -1466,38 +1612,16 @@ class Scanner:
     def attach_status_message(self, chat_id: int, message_id: int) -> None:
         self.status_chat_id = int(chat_id)
         self.status_message_id = int(message_id)
-        self._last_status_edit = 0.0
-        self._last_status_text = None
+        self.status_updater.attach(chat_id, message_id)
+        self._status_wakeup.set()
+        if runtime.active and (self.monitor_task is None or self.monitor_task.done()):
+            self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-scanner-monitor")
 
     async def refresh_status_message(self, *, force: bool = False) -> None:
-        if self.status_chat_id is None or self.status_message_id is None:
-            return
-        now = time.monotonic()
-        if not force and now - self._last_status_edit < 2.0:
-            return
         text = await status_text()
-        if not force and text == self._last_status_text:
-            self._last_status_edit = now
-            return
-        bot = self.bot_getter()
-        if bot is None:
-            return
-        try:
-            await bot.edit_message_text(
-                chat_id=self.status_chat_id,
-                message_id=self.status_message_id,
-                text=text,
-            )
-            self._last_status_text = text
-            self._last_status_edit = now
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                self._last_status_text = text
-                self._last_status_edit = now
-            else:
-                logger.debug("live_status_edit_failed error=%s", exc)
-        except Exception as exc:
-            logger.debug("live_status_edit_failed error=%s", exc)
+        await self.status_updater.update(text, force=force)
+        self.status_chat_id = self.status_updater.chat_id
+        self.status_message_id = self.status_updater.message_id
 
     async def _maybe_write_diagnostics(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -1516,7 +1640,11 @@ class Scanner:
             while runtime.active and not self.stop_event.is_set():
                 await self._maybe_write_diagnostics()
                 await self.refresh_status_message()
-                await self._wait(1.0)
+                try:
+                    await asyncio.wait_for(self._status_wakeup.wait(), timeout=0.5)
+                    self._status_wakeup.clear()
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -1654,7 +1782,7 @@ class Scanner:
         runtime.last_error = None
         self._plan_dirty = False
         self.task = asyncio.create_task(self._run(peer), name="gift-scanner")
-        self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-scanner-monitor")
+        self.monitor_task = None
         logger.info(
             "scanner_started version=%s saved_ids=%s targets=%s live=%s adaptive=%s start_ms=%s min_ms=%s",
             APP_VERSION,
@@ -1714,8 +1842,19 @@ class Scanner:
                             expected_gift_id=meta.base_gift_id,
                         )
                         counters[slug] = counter
+                        previous_current = runtime.current_by_slug.get(slug)
                         runtime.current_by_slug[slug] = counter.current
                         runtime.title_by_slug[slug] = counter.title
+                        if previous_current is not None and previous_current != counter.current:
+                            target = next_target(store.settings.target_numbers, counter.current)
+                            logger.info(
+                                "gift_counter_changed slug=%s from=%s to=%s target=%s",
+                                slug,
+                                previous_current,
+                                counter.current,
+                                target,
+                            )
+                            self._status_wakeup.set()
 
                     current_max = max(counter.current for counter in counters.values())
                     future_targets = [value for value in store.settings.target_numbers if value > current_max]
@@ -1871,6 +2010,12 @@ class Scanner:
             self.task = None
             await self._maybe_write_diagnostics(force=True)
             await self.refresh_status_message(force=True)
+            monitor = self.monitor_task
+            if monitor and monitor is not asyncio.current_task():
+                monitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor
+            self.monitor_task = None
 
     async def _upgrade(
         self,
@@ -2134,10 +2279,15 @@ class StressTester:
         self.service = service
         self.bot_getter = bot_getter
         self.task: asyncio.Task[None] | None = None
+        self.monitor_task: asyncio.Task[None] | None = None
         self.stop_event = asyncio.Event()
         self.status_chat_id: int | None = None
         self.status_message_id: int | None = None
-        self._last_status_update = 0.0
+        self.status_updater = StatusMessageUpdater(
+            bot_getter,
+            name="stress",
+            min_interval_seconds=STRESS_STATUS_INTERVAL_SECONDS,
+        )
 
     async def start(self, chat_id: int) -> None:
         if runtime.active:
@@ -2165,7 +2315,7 @@ class StressTester:
         self.stop_event = asyncio.Event()
         self.status_chat_id = int(chat_id)
         self.status_message_id = None
-        self._last_status_update = 0.0
+        self.status_updater.clear()
         self._reset_runtime(counter)
         self.task = asyncio.create_task(
             self._run(counter.slug, counter.base_gift_id, counter.title),
@@ -2180,7 +2330,9 @@ class StressTester:
     def attach_status_message(self, chat_id: int, message_id: int) -> None:
         self.status_chat_id = int(chat_id)
         self.status_message_id = int(message_id)
-        self._last_status_update = 0.0
+        self.status_updater.attach(chat_id, message_id)
+        if runtime.stress_active and (self.monitor_task is None or self.monitor_task.done()):
+            self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-stress-status-monitor")
 
     def _reset_runtime(self, counter: GiftCounter) -> None:
         runtime.stress_active = True
@@ -2196,6 +2348,7 @@ class StressTester:
         runtime.stress_last_error = None
         runtime.stress_avg_latency_ms = None
         runtime.stress_p95_latency_ms = None
+        runtime.stress_current_rate_per_s = 0.0
         runtime.stress_max_rate_per_s = 0.0
         runtime.stress_result = None
         runtime.current_by_slug = {counter.slug: counter.current}
@@ -2206,6 +2359,12 @@ class StressTester:
         if not task or task.done():
             runtime.stress_active = False
             self.task = None
+            monitor = self.monitor_task
+            if monitor and monitor is not asyncio.current_task():
+                monitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor
+            self.monitor_task = None
             return
         self.stop_event.set()
         if task is not asyncio.current_task():
@@ -2216,6 +2375,12 @@ class StressTester:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        monitor = self.monitor_task
+        if monitor and monitor is not asyncio.current_task():
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+        self.monitor_task = None
         logger.info("stress_test_stop_requested reason=%s", reason)
 
     @staticmethod
@@ -2303,27 +2468,22 @@ class StressTester:
         )
 
     async def _refresh_status(self, *, force: bool = False) -> None:
-        if self.status_chat_id is None or self.status_message_id is None:
-            return
-        now = time.monotonic()
-        if not force and now - self._last_status_update < STRESS_STATUS_INTERVAL_SECONDS:
-            return
-        bot = self.bot_getter()
-        if bot is None:
-            return
+        await self.status_updater.update(await stress_status_text(), force=force)
+        self.status_chat_id = self.status_updater.chat_id
+        self.status_message_id = self.status_updater.message_id
+
+    async def _monitor_loop(self) -> None:
         try:
-            await bot.edit_message_text(
-                chat_id=self.status_chat_id,
-                message_id=self.status_message_id,
-                text=await stress_status_text(),
-                reply_markup=None,
-            )
-            self._last_status_update = now
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                logger.debug("stress_status_edit_failed error=%s", exc)
+            while runtime.stress_active and not self.stop_event.is_set():
+                await self._refresh_status()
+                try:
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
-            logger.debug("stress_status_edit_failed error=%s", exc)
+            logger.warning("stress_status_monitor_failed error=%s", exc)
 
     async def _interruptible_wait(self, seconds: float) -> None:
         if seconds <= 0:
@@ -2392,6 +2552,7 @@ class StressTester:
                     while success_timestamps and success_timestamps[0] < cutoff:
                         success_timestamps.pop(0)
                     current_rate = float(len(success_timestamps))
+                    runtime.stress_current_rate_per_s = current_rate
                     runtime.stress_max_rate_per_s = max(runtime.stress_max_rate_per_s, current_rate)
                     stats["max_rate_per_second"] = max(stats["max_rate_per_second"], current_rate)
                     minute_bucket["max_rate_per_second"] = max(minute_bucket["max_rate_per_second"], current_rate)
@@ -2450,7 +2611,8 @@ class StressTester:
                         slug=slug,
                     )
                     last_telemetry_second = telemetry_second
-                await self._refresh_status()
+                # Live Telegram UI updates run in a separate monitor task so
+                # Bot API latency is not counted as MTProto stress-test latency.
 
             aborted = self.stop_event.is_set() and (time.monotonic() - started) < STRESS_TEST_DURATION_SECONDS
 
@@ -2527,6 +2689,12 @@ class StressTester:
             self.task = None
             await write_diagnostics()
             await self._refresh_status(force=True)
+            monitor = self.monitor_task
+            if monitor and monitor is not asyncio.current_task():
+                monitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor
+            self.monitor_task = None
             await self._notify_report(report, write_status=write_status)
 
     async def _write_report(self, report: dict[str, Any]) -> dict[str, bool]:
@@ -3445,7 +3613,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0011 uses the reply-keyboard payment switch itself as confirmation, so a
+    v0012 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -3469,8 +3637,10 @@ async def stress_status_text() -> str:
         f"Ошибок: <b>{runtime.stress_errors}</b> · FloodWait: <b>{runtime.stress_flood_count}</b>",
         f"Средний ответ: <b>{runtime.stress_avg_latency_ms:.1f} мс</b>" if runtime.stress_avg_latency_ms is not None else "Средний ответ: —",
         f"P95: <b>{runtime.stress_p95_latency_ms:.1f} мс</b>" if runtime.stress_p95_latency_ms is not None else "P95: —",
+        f"Скорость сейчас: <b>{runtime.stress_current_rate_per_s:.1f} проверок/с</b>",
         f"Максимум: <b>{runtime.stress_max_rate_per_s:.1f} проверок/с</b>",
         "Оплата: <b>принудительно не используется</b>",
+        f"Обновлено: <b>{time.strftime('%H:%M:%S')}</b>",
     ]
     if runtime.current_by_slug:
         for slug, current in runtime.current_by_slug.items():
@@ -3546,6 +3716,7 @@ async def status_text() -> str:
         f"FloodWait: {runtime.flood_count}" + (f" · последний {runtime.last_flood_wait_s}с" if runtime.last_flood_wait_s is not None else ""),
         f"Cooldown: {runtime.rate_cooldown_cycles} циклов" if runtime.rate_cooldown_cycles else "Cooldown: нет",
         f"Uptime сканера: {uptime}с" if runtime.started_at else "Uptime сканера: —",
+        f"Обновлено: <b>{time.strftime('%H:%M:%S')}</b>",
     ]
     cooldown = rate_limit.remaining_seconds()
     if cooldown > 0:

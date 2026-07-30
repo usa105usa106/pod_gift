@@ -1,4 +1,4 @@
-"""Fast Docker healthcheck for Gift Hunter v0011.
+"""Fast Docker healthcheck for Gift Hunter v0012.
 
 The main process writes /app/data/heartbeat.json every ten seconds. This probe
 uses only the Python standard library and never starts a second bot instance.
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 
-APP_VERSION = "v0011"
+APP_VERSION = "v0012"
 
 
 def main() -> int:
