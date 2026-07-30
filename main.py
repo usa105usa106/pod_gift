@@ -72,7 +72,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0014"
+APP_VERSION = "v0015"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -120,6 +120,8 @@ STATUS_REPLACE_AFTER_FAILURES = env_int("STATUS_REPLACE_AFTER_FAILURES", 2, mini
 STATUS_REPLACE_COOLDOWN_SECONDS = env_float("STATUS_REPLACE_COOLDOWN_SECONDS", 5.0, minimum=1.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
 CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
+EXACT_PROBE_DISTANCE = env_int("EXACT_PROBE_DISTANCE", 100, minimum=2)
+EXACT_COUNTER_REFRESH_SECONDS = env_float("EXACT_COUNTER_REFRESH_SECONDS", 1.0, minimum=0.2)
 
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -289,6 +291,15 @@ def _str_or_none(value: Any) -> str | None:
         return None
     value = str(value).strip()
     return value or None
+
+
+def _is_stargift_slug_invalid(exc: BaseException) -> bool:
+    text = str(exc).upper()
+    class_name = exc.__class__.__name__.upper()
+    return (
+        "STARGIFT_SLUG_INVALID" in text
+        or "STARGIFTSLUGINVALID" in class_name
+    )
 
 
 def _unique_ints(values: Iterable[Any]) -> list[int]:
@@ -462,6 +473,16 @@ class GiftCounter:
     slug: str
     title: str
     current: int
+    total: int | None
+    base_gift_id: int | None
+
+
+@dataclass(frozen=True)
+class ExactGiftProbe:
+    slug: str
+    title: str
+    num: int
+    issued: int | None
     total: int | None
     base_gift_id: int | None
 
@@ -1222,6 +1243,53 @@ class MTProtoService:
                     raise
         raise RuntimeError(f"Не удалось получить текущий номер {slug}: {last_error or 'нет данных'}")
 
+    async def fetch_exact_unique(
+        self,
+        slug: str,
+        number: int,
+        *,
+        expected_gift_id: int | None = None,
+    ) -> ExactGiftProbe | None:
+        """Resolve one exact collectible number.
+
+        ``None`` means Telegram explicitly reported ``STARGIFT_SLUG_INVALID``
+        for this exact slug. Other RPC/network failures are raised so LIVE never
+        treats an uncertain answer as proof that the target is still free.
+        """
+        await self.require_authorized()
+        exact_number = int(number)
+        if exact_number <= 0:
+            return None
+        full_slug = f"{slug}-{exact_number}"
+        try:
+            request = construct(functions.payments.GetUniqueStarGiftRequest, slug=full_slug)
+            result = await self.call(request)
+        except errors.RPCError as exc:
+            if _is_stargift_slug_invalid(exc):
+                return None
+            raise
+
+        gift = getattr(result, "gift", None)
+        if gift is None or gift.__class__.__name__ != "StarGiftUnique":
+            raise RuntimeError(f"Telegram вернул неожиданный ответ для {full_slug}")
+        returned_num = _int_or_none(getattr(gift, "num", None))
+        if returned_num != exact_number:
+            raise RuntimeError(
+                f"Telegram вернул номер {returned_num} вместо запрошенного {exact_number}"
+            )
+        base_gift_id = _int_or_none(getattr(gift, "gift_id", None))
+        if expected_gift_id is not None and base_gift_id != expected_gift_id:
+            raise RuntimeError(f"Slug {slug} относится к другому типу подарка")
+        return ExactGiftProbe(
+            slug=slug,
+            title=str(getattr(gift, "title", None) or slug),
+            num=returned_num,
+            issued=_int_or_none(getattr(gift, "availability_issued", None)),
+            total=_int_or_none(getattr(gift, "availability_total", None)),
+            base_gift_id=base_gift_id,
+        )
+
+
     async def counter_for_info(
         self,
         info: SavedGiftInfo,
@@ -1658,6 +1726,8 @@ class Scanner:
         self._plan_dirty = True
         self._groups: dict[str, list[SavedGiftInfo]] = {}
         self._counter_meta: dict[str, GiftCounter] = {}
+        self._exact_probe_cursor: dict[str, int] = {}
+        self._last_exact_regular_refresh: dict[str, float] = {}
         self.rate = AdaptiveRateController(
             min_interval_ms=SCAN_MIN_INTERVAL_MS,
             max_interval_ms=SCAN_MAX_INTERVAL_MS,
@@ -1802,6 +1872,8 @@ class Scanner:
         self._plan_dirty = True
         self._groups.clear()
         self._counter_meta.clear()
+        self._exact_probe_cursor.clear()
+        self._last_exact_regular_refresh.clear()
         self._last_poll_started = None
         self.rate.reset()
         runtime.active = False
@@ -1877,6 +1949,145 @@ class Scanner:
         await self.refresh_status_message(force=True)
         logger.info("scanner_stopped reason=%s", reason)
 
+    @staticmethod
+    def _counter_with_current(counter: GiftCounter, current: int) -> GiftCounter:
+        return GiftCounter(
+            slug=counter.slug,
+            title=counter.title,
+            current=int(current),
+            total=counter.total,
+            base_gift_id=counter.base_gift_id,
+        )
+
+    async def _poll_counter_for_target(
+        self,
+        slug: str,
+        meta: GiftCounter,
+    ) -> tuple[GiftCounter, bool, int | None]:
+        """Poll one type and return ``(counter, predecessor_exact, existing_target)``.
+
+        Far from the goal the inexpensive aggregate counter is used. Inside the
+        exact window the scanner follows concrete slugs one-by-one (for example
+        ``DurovsGlasses-3332``), so a stale ``availability_issued`` value cannot
+        delay the trigger. The displayed/current value is monotonic.
+        """
+        previous = int(runtime.current_by_slug.get(slug, meta.current))
+        target = next_target(store.settings.target_numbers, previous)
+        if target is None:
+            return self._counter_with_current(meta, previous), False, None
+
+        distance = target - previous
+        if distance > EXACT_PROBE_DISTANCE:
+            raw = await self.service.fetch_counter_fast(
+                slug, expected_gift_id=meta.base_gift_id
+            )
+            current = max(previous, raw.current)
+            if raw.current < previous:
+                logger.info(
+                    "counter_regression_ignored slug=%s previous=%s response=%s target=%s",
+                    slug, previous, raw.current, target,
+                )
+            return self._counter_with_current(raw, current), False, None
+
+        now = time.monotonic()
+        cursor = self._exact_probe_cursor.get(slug)
+        if cursor is None:
+            # Confirm the aggregate value once before trusting it as an exact
+            # predecessor. This costs one cycle and prevents a stale aggregate
+            # response from triggering LIVE by itself.
+            cursor = max(0, previous - 1)
+            self._exact_probe_cursor[slug] = cursor
+            logger.info(
+                "exact_probe_mode_entered slug=%s current=%s target=%s distance=%s",
+                slug, previous, target, distance,
+            )
+
+        last_refresh = self._last_exact_regular_refresh.get(slug, 0.0)
+        display_counter = meta
+        if now - last_refresh >= EXACT_COUNTER_REFRESH_SECONDS:
+            raw = await self.service.fetch_counter_fast(
+                slug, expected_gift_id=meta.base_gift_id
+            )
+            self._last_exact_regular_refresh[slug] = now
+            display_counter = raw
+            if raw.current < previous:
+                logger.info(
+                    "counter_regression_ignored slug=%s previous=%s response=%s target=%s",
+                    slug, previous, raw.current, target,
+                )
+            previous = max(previous, raw.current)
+            # Use aggregate data only to jump close to the frontier. Never skip
+            # confirmation of target-1 itself.
+            jump_to = min(max(0, raw.current - 1), max(0, target - 2))
+            if jump_to > cursor:
+                cursor = jump_to
+                self._exact_probe_cursor[slug] = cursor
+                logger.info(
+                    "exact_probe_cursor_advanced slug=%s cursor=%s aggregate=%s target=%s",
+                    slug, cursor, raw.current, target,
+                )
+
+        probe_number = cursor + 1
+        exact = await self.service.fetch_exact_unique(
+            slug, probe_number, expected_gift_id=meta.base_gift_id
+        )
+        predecessor_exact = False
+        existing_target: int | None = None
+        if exact is not None:
+            self._exact_probe_cursor[slug] = exact.num
+            previous = max(previous, exact.num)
+            display_counter = GiftCounter(
+                slug=slug,
+                title=exact.title,
+                current=previous,
+                total=exact.total if exact.total is not None else display_counter.total,
+                base_gift_id=exact.base_gift_id or display_counter.base_gift_id,
+            )
+            logger.info(
+                "exact_number_confirmed slug=%s number=%s target=%s issued_hint=%s",
+                slug, exact.num, target, exact.issued,
+            )
+            if exact.num == target:
+                existing_target = target
+            elif exact.num == target - 1:
+                # One immediate exact target check is the final no-payment guard.
+                # STARGIFT_SLUG_INVALID means the target is not issued yet; any
+                # uncertain RPC/network error is raised and therefore cannot pay.
+                target_probe = await self.service.fetch_exact_unique(
+                    slug, target, expected_gift_id=meta.base_gift_id
+                )
+                if target_probe is not None:
+                    existing_target = target
+                    previous = max(previous, target_probe.num)
+                    display_counter = GiftCounter(
+                        slug=slug,
+                        title=target_probe.title,
+                        current=previous,
+                        total=(
+                            target_probe.total
+                            if target_probe.total is not None
+                            else display_counter.total
+                        ),
+                        base_gift_id=(
+                            target_probe.base_gift_id or display_counter.base_gift_id
+                        ),
+                    )
+                    self._exact_probe_cursor[slug] = max(
+                        self._exact_probe_cursor.get(slug, 0), target_probe.num
+                    )
+                    logger.warning(
+                        "exact_target_already_exists slug=%s target=%s payment_blocked=true",
+                        slug, target,
+                    )
+                else:
+                    predecessor_exact = True
+                    logger.warning(
+                        "exact_target_window_open slug=%s predecessor=%s target=%s",
+                        slug, exact.num, target,
+                    )
+
+        return self._counter_with_current(display_counter, previous), predecessor_exact, existing_target
+
     async def _run(self, peer: Any) -> None:
         try:
             while not self.stop_event.is_set():
@@ -1892,28 +2103,60 @@ class Scanner:
                         await self._load_plan(peer)
 
                     counters: dict[str, GiftCounter] = {}
-                    # Normal hot path: exactly one GetUniqueStarGift request per
-                    # selected collectible type. No saved-gift fetch and no disk
-                    # write is performed in the polling cycle.
+                    exact_predecessors: dict[str, bool] = {}
+                    exact_existing_targets: dict[str, int | None] = {}
+                    # Far from the goal one aggregate request is used. Near the
+                    # goal the hot path follows exact numbered slugs, with only a
+                    # periodic aggregate refresh for display/catch-up.
                     for slug, meta in self._counter_meta.items():
-                        counter = await self.service.fetch_counter_fast(
-                            slug,
-                            expected_gift_id=meta.base_gift_id,
+                        counter, predecessor_exact, existing_target = await self._poll_counter_for_target(
+                            slug, meta
                         )
                         counters[slug] = counter
+                        exact_predecessors[slug] = predecessor_exact
+                        exact_existing_targets[slug] = existing_target
                         previous_current = runtime.current_by_slug.get(slug)
-                        runtime.current_by_slug[slug] = counter.current
+                        runtime.current_by_slug[slug] = max(
+                            int(previous_current or 0), counter.current
+                        )
+                        counter = self._counter_with_current(
+                            counter, runtime.current_by_slug[slug]
+                        )
+                        counters[slug] = counter
                         runtime.title_by_slug[slug] = counter.title
                         if previous_current is not None and previous_current != counter.current:
                             target = next_target(store.settings.target_numbers, counter.current)
                             logger.info(
                                 "gift_counter_changed slug=%s from=%s to=%s target=%s",
-                                slug,
-                                previous_current,
-                                counter.current,
-                                target,
+                                slug, previous_current, counter.current, target,
                             )
                             self._status_wakeup.set()
+
+                    exact_missed_changed = False
+                    for slug, existing_target in exact_existing_targets.items():
+                        if existing_target is None:
+                            continue
+                        key = (slug, existing_target)
+                        if key not in self.notified_missed:
+                            self.notified_missed.add(key)
+                            await self.notify(
+                                f"⚠️ Цель <b>{existing_target}</b> для "
+                                f"<b>{html.escape(counters[slug].title)}</b> уже существует. "
+                                "Оплата не отправлена."
+                            )
+                        remaining = [
+                            value for value in store.settings.target_numbers
+                            if value > existing_target
+                        ]
+                        if remaining != store.settings.target_numbers:
+                            store.settings.target_numbers = remaining
+                            exact_missed_changed = True
+                    if exact_missed_changed:
+                        await store.save()
+                        if not store.settings.target_numbers:
+                            runtime.last_error = "Цель уже существует; оплата не отправлена"
+                            self.stop_event.set()
+                            break
 
                     current_max = max(counter.current for counter in counters.values())
                     future_targets = [value for value in store.settings.target_numbers if value > current_max]
@@ -1939,10 +2182,11 @@ class Scanner:
                             state.distance is not None and state.distance <= NEAR_TARGET_DISTANCE
                         )
 
-                        # The trigger is deliberately the first action after the
-                        # counter response. A second number check or owned-gift
-                        # refresh here only makes the race slower.
-                        if state.should_trigger:
+                        # LIVE may trigger only after the concrete target-1 slug
+                        # was resolved and the concrete target slug was confirmed
+                        # absent in the same cycle. Aggregate availability alone is
+                        # never sufficient for payment.
+                        if state.should_trigger and exact_predecessors.get(slug, False):
                             key = (slug, target)
                             if key in self.triggered:
                                 continue
@@ -3672,7 +3916,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0014 uses the reply-keyboard payment switch itself as confirmation, so a
+    v0015 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
