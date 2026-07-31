@@ -72,7 +72,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0015"
+APP_VERSION = "v0017"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -114,10 +114,16 @@ STRESS_MAX_PHASE_START_SECONDS = 120.0
 STRESS_FIRST_INTERVAL_MS = 300.0
 STRESS_SECOND_INTERVAL_MS = 120.0
 STRESS_MAX_INTERVAL_MS = 0.0
+# Long-running scanners must not edit one Telegram message every few seconds:
+# Telegram eventually applies very long EditMessageText RetryAfter penalties.
+# The card now gets a low-frequency heartbeat and is refreshed immediately when
+# the observed collectible number changes.
 LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
+STATUS_URGENT_MIN_INTERVAL_SECONDS = env_float("STATUS_URGENT_MIN_INTERVAL_SECONDS", 1.0, minimum=0.5)
 STRESS_STATUS_INTERVAL_SECONDS = env_float("STRESS_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
 STATUS_REPLACE_AFTER_FAILURES = env_int("STATUS_REPLACE_AFTER_FAILURES", 2, minimum=1)
 STATUS_REPLACE_COOLDOWN_SECONDS = env_float("STATUS_REPLACE_COOLDOWN_SECONDS", 5.0, minimum=1.0)
+STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS = env_float("STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS", 10.0, minimum=1.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
 CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
 EXACT_PROBE_DISTANCE = env_int("EXACT_PROBE_DISTANCE", 100, minimum=2)
@@ -1544,10 +1550,17 @@ class StatusMessageUpdater:
         *,
         name: str,
         min_interval_seconds: float,
+        urgent_min_interval_seconds: float | None = None,
     ) -> None:
         self.bot_getter = bot_getter
         self.name = name
-        self.min_interval_seconds = max(0.1, float(min_interval_seconds))
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        if urgent_min_interval_seconds is None:
+            urgent_min_interval_seconds = min(
+                self.min_interval_seconds,
+                STATUS_URGENT_MIN_INTERVAL_SECONDS,
+            )
+        self.urgent_min_interval_seconds = max(0.0, float(urgent_min_interval_seconds))
         self.chat_id: int | None = None
         self.message_id: int | None = None
         self._last_edit_at = 0.0
@@ -1591,13 +1604,59 @@ class StatusMessageUpdater:
             error,
         )
 
+    async def replace_with_new_message(
+        self,
+        text: str,
+        *,
+        chat_id: int | None = None,
+        reply_markup: Any = None,
+    ) -> int:
+        """Send a new status card and atomically switch future edits to it.
+
+        This intentionally ignores any EditMessageText RetryAfter attached to the
+        abandoned message.  The scanner itself is not restarted or paused.
+        """
+        async with self._lock:
+            target_chat_id = int(chat_id) if chat_id is not None else self.chat_id
+            if target_chat_id is None:
+                raise RuntimeError("Чат статусной карточки не задан")
+            bot = self.bot_getter()
+            if bot is None:
+                raise RuntimeError("Bot API ещё не готов")
+
+            replacement = await bot.send_message(
+                chat_id=target_chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+            new_message_id = int(getattr(replacement, "message_id"))
+            old_message_id = self.message_id
+            now = time.monotonic()
+            self.chat_id = target_chat_id
+            self.message_id = new_message_id
+            self._last_text = text
+            self._last_edit_at = now
+            self._consecutive_failures = 0
+            self._last_replacement_at = now
+            self._retry_after_until = 0.0
+            logger.warning(
+                "%s_status_message_manually_replaced chat_id=%s old_message_id=%s new_message_id=%s",
+                self.name,
+                target_chat_id,
+                old_message_id,
+                new_message_id,
+            )
+            return new_message_id
+
     async def update(self, text: str, *, force: bool = False) -> bool:
         if self.chat_id is None or self.message_id is None:
             return False
         now = time.monotonic()
         if now < self._retry_after_until:
             return False
-        if not force and now - self._last_edit_at < self.min_interval_seconds:
+        required_interval = self.urgent_min_interval_seconds if force else self.min_interval_seconds
+        if now - self._last_edit_at < required_interval:
             return False
         if not force and text == self._last_text:
             self._last_edit_at = now
@@ -1609,7 +1668,8 @@ class StatusMessageUpdater:
             now = time.monotonic()
             if now < self._retry_after_until:
                 return False
-            if not force and now - self._last_edit_at < self.min_interval_seconds:
+            required_interval = self.urgent_min_interval_seconds if force else self.min_interval_seconds
+            if now - self._last_edit_at < required_interval:
                 return False
             if not force and text == self._last_text:
                 self._last_edit_at = now
@@ -1723,6 +1783,8 @@ class Scanner:
         self._last_diagnostics_write = 0.0
         self._last_poll_started: float | None = None
         self._status_wakeup = asyncio.Event()
+        self._manual_status_refresh_lock = asyncio.Lock()
+        self._last_manual_status_refresh_at = 0.0
         self._plan_dirty = True
         self._groups: dict[str, list[SavedGiftInfo]] = {}
         self._counter_meta: dict[str, GiftCounter] = {}
@@ -1752,6 +1814,41 @@ class Scanner:
         self.status_chat_id = self.status_updater.chat_id
         self.status_message_id = self.status_updater.message_id
 
+    async def manually_replace_status_message(
+        self,
+        chat_id: int,
+        *,
+        reply_markup: Any = None,
+    ) -> int:
+        """Abandon the old card and continue monitoring through a new message."""
+        async with self._manual_status_refresh_lock:
+            now = time.monotonic()
+            remaining = (
+                STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS
+                - (now - self._last_manual_status_refresh_at)
+            )
+            if remaining > 0:
+                raise RuntimeError(
+                    f"Подожди ещё {int(remaining + 0.999)}с перед следующим перевыпуском карточки"
+                )
+
+            text = await status_text()
+            new_message_id = await self.status_updater.replace_with_new_message(
+                text,
+                chat_id=chat_id,
+                reply_markup=reply_markup,
+            )
+            self.status_chat_id = self.status_updater.chat_id
+            self.status_message_id = new_message_id
+            self._last_manual_status_refresh_at = time.monotonic()
+            self._status_wakeup.clear()
+            if runtime.active and (self.monitor_task is None or self.monitor_task.done()):
+                self.monitor_task = asyncio.create_task(
+                    self._monitor_loop(),
+                    name="gift-scanner-monitor",
+                )
+            return new_message_id
+
     async def _maybe_write_diagnostics(self, *, force: bool = False) -> None:
         now = time.monotonic()
         if force or now - self._last_diagnostics_write >= DIAGNOSTICS_INTERVAL_SECONDS:
@@ -1765,15 +1862,36 @@ class Scanner:
             pass
 
     async def _monitor_loop(self) -> None:
+        """Refresh the full card every three seconds and on important changes.
+
+        UI updates stay isolated from the MTProto scanner.  If Telegram freezes
+        one message, the owner can manually issue a new card without restarting
+        scanning, payment preparation, or LIVE mode.
+        """
+        next_heartbeat = time.monotonic() + LIVE_STATUS_INTERVAL_SECONDS
         try:
             while runtime.active and not self.stop_event.is_set():
                 await self._maybe_write_diagnostics()
-                await self.refresh_status_message()
+                now = time.monotonic()
+                timeout = min(0.5, max(0.0, next_heartbeat - now))
+                woke_for_change = False
                 try:
-                    await asyncio.wait_for(self._status_wakeup.wait(), timeout=0.5)
+                    await asyncio.wait_for(self._status_wakeup.wait(), timeout=timeout)
                     self._status_wakeup.clear()
+                    woke_for_change = True
                 except asyncio.TimeoutError:
                     pass
+
+                if not runtime.active or self.stop_event.is_set():
+                    break
+
+                now = time.monotonic()
+                if woke_for_change:
+                    await self.refresh_status_message(force=True)
+                    next_heartbeat = now + LIVE_STATUS_INTERVAL_SECONDS
+                elif now >= next_heartbeat:
+                    await self.refresh_status_message()
+                    next_heartbeat = now + LIVE_STATUS_INTERVAL_SECONDS
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -3074,6 +3192,7 @@ BTN_STOP = "⛔ Остановить"
 BTN_PAYMENT_OFF = "🛡 Оплата: ВЫКЛ"
 BTN_PAYMENT_ON = "💳 Оплата: ВКЛ"
 BTN_PING = "📡 Ping"
+BTN_REFRESH_CARD = "♻️ Обновить карточку"
 BTN_STRESS_OFF = "🧪 Стресс-тест: ВЫКЛ"
 BTN_STRESS_ON = "🧪 Стресс-тест: ВКЛ"
 BTN_LOG = "📄 Log"
@@ -3089,8 +3208,9 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_CHANNEL), KeyboardButton(text=BTN_GIFTS)],
             [KeyboardButton(text=BTN_CHECK), KeyboardButton(text=BTN_TARGETS)],
             [KeyboardButton(text=start_stop), KeyboardButton(text=payment)],
-            [KeyboardButton(text=BTN_PING), KeyboardButton(text=stress_button)],
-            [KeyboardButton(text=BTN_LOG), KeyboardButton(text=BTN_RESET)],
+            [KeyboardButton(text=BTN_REFRESH_CARD), KeyboardButton(text=BTN_PING)],
+            [KeyboardButton(text=stress_button), KeyboardButton(text=BTN_LOG)],
+            [KeyboardButton(text=BTN_RESET)],
         ],
         resize_keyboard=True,
         input_field_placeholder=f"{APP_NAME} {APP_VERSION}",
@@ -3916,7 +4036,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0015 uses the reply-keyboard payment switch itself as confirmation, so a
+    v0017 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -4060,6 +4180,36 @@ async def status_text() -> str:
     return "\n".join(lines)
 
 
+@router.message(F.text == BTN_REFRESH_CARD)
+async def refresh_card_handler(message: Message) -> None:
+    """Issue a fresh live card while leaving the scanner completely untouched."""
+    if not await owner_guard_message(message):
+        return
+    if runtime.stress_active:
+        await message.answer(
+            "Сначала останови стресс-тест: кнопка перевыпуска относится к основной карточке сканера.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    if not runtime.active:
+        await message.answer(
+            "Сканер остановлен. Новая живая карточка появится после запуска.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    try:
+        await scanner.manually_replace_status_message(
+            message.chat.id,
+            reply_markup=main_keyboard(),
+        )
+    except Exception as exc:
+        logger.warning("manual_status_refresh_failed error=%s", exc)
+        await message.answer(
+            f"Не удалось обновить карточку: {html.escape(str(exc))}",
+            reply_markup=main_keyboard(),
+        )
+
+
 @router.message(F.text == BTN_PING)
 async def ping_handler(message: Message) -> None:
     """Return a compact health reply instead of duplicating the live status card."""
@@ -4080,6 +4230,11 @@ async def ping_handler(message: Message) -> None:
         f"Бот: <b>работает</b>",
         f"MTProto: <b>{mtproto_note}</b>",
         f"Сканер: <b>{'активен' if runtime.active else 'остановлен'}</b>",
+        (
+            f"Карточка: <b>пауза Telegram {int(scanner.status_updater.retry_after_remaining + 0.999)}с</b>"
+            if scanner.status_updater.retry_after_remaining > 0
+            else f"Карточка: <b>раз в {int(LIVE_STATUS_INTERVAL_SECONDS)}с · ручной перевыпуск доступен</b>"
+        ),
         f"Стресс-тест: <b>{'идёт' if runtime.stress_active else 'выключен'}</b>",
         f"Проверок сканера: <b>{runtime.checks}</b>",
         (
