@@ -17,6 +17,7 @@ import sys
 import time
 import zipfile
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable
@@ -72,7 +73,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0017"
+APP_VERSION = "v0018"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -118,16 +119,36 @@ STRESS_MAX_INTERVAL_MS = 0.0
 # Telegram eventually applies very long EditMessageText RetryAfter penalties.
 # The card now gets a low-frequency heartbeat and is refreshed immediately when
 # the observed collectible number changes.
-LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
+LIVE_STATUS_INTERVAL_SECONDS = env_float("LIVE_STATUS_INTERVAL_SECONDS", 60.0, minimum=60.0)
 STATUS_URGENT_MIN_INTERVAL_SECONDS = env_float("STATUS_URGENT_MIN_INTERVAL_SECONDS", 1.0, minimum=0.5)
 STRESS_STATUS_INTERVAL_SECONDS = env_float("STRESS_STATUS_INTERVAL_SECONDS", 3.0, minimum=1.0)
-STATUS_REPLACE_AFTER_FAILURES = env_int("STATUS_REPLACE_AFTER_FAILURES", 2, minimum=1)
-STATUS_REPLACE_COOLDOWN_SECONDS = env_float("STATUS_REPLACE_COOLDOWN_SECONDS", 5.0, minimum=1.0)
-STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS = env_float("STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS", 10.0, minimum=1.0)
+STATUS_BAD_REQUEST_COOLDOWN_SECONDS = env_float("STATUS_BAD_REQUEST_COOLDOWN_SECONDS", 900.0, minimum=60.0)
+STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS = env_float("STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS", 60.0, minimum=10.0)
+STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS = env_float("STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS", 60.0, minimum=60.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
 CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
 EXACT_PROBE_DISTANCE = env_int("EXACT_PROBE_DISTANCE", 100, minimum=2)
 EXACT_COUNTER_REFRESH_SECONDS = env_float("EXACT_COUNTER_REFRESH_SECONDS", 1.0, minimum=0.2)
+
+
+MSK_TIMEZONE = timezone(timedelta(hours=3), name="MSK")
+
+def msk_now() -> datetime:
+    """Return wall-clock time for display only; scanner timing stays monotonic."""
+    return datetime.now(MSK_TIMEZONE)
+
+def msk_time_str() -> str:
+    return msk_now().strftime("%H:%M:%S")
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(float(seconds) + 0.999))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}ч {minutes:02d}м {secs:02d}с"
+    if minutes:
+        return f"{minutes}м {secs:02d}с"
+    return f"{secs}с"
 
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1536,12 +1557,12 @@ def construct(cls: Any, **kwargs: Any) -> Any:
 
 
 class StatusMessageUpdater:
-    """Reliably edit one live status message, replacing it if editing breaks.
+    """Edit one live status message without ever coupling UI failures to scanning.
 
-    Telegram message edits can fail after reconnects, stale message IDs or a
-    transient Bot API error.  The scanner must never stop because of UI
-    telemetry, so failures are isolated and, after a small number of retries,
-    a fresh status message is sent and becomes the new edit target.
+    Telegram UI rate limits are treated as a hard pause.  Automatic replacement
+    is intentionally disabled: repeated SendMessage fallbacks caused the v0017
+    flood loop.  A fresh static card can still be requested manually, while the
+    stored edit pause is preserved and future edits resume only after it expires.
     """
 
     def __init__(
@@ -1565,9 +1586,8 @@ class StatusMessageUpdater:
         self.message_id: int | None = None
         self._last_edit_at = 0.0
         self._last_text: str | None = None
-        self._consecutive_failures = 0
-        self._last_replacement_at = 0.0
         self._retry_after_until = 0.0
+        self._pause_reason: str | None = None
         self._lock = asyncio.Lock()
 
     def attach(self, chat_id: int, message_id: int) -> None:
@@ -1575,33 +1595,52 @@ class StatusMessageUpdater:
         self.message_id = int(message_id)
         self._last_edit_at = 0.0
         self._last_text = None
-        self._consecutive_failures = 0
-        self._retry_after_until = 0.0
+        # Keep an existing Telegram pause when a fresh card is attached in the
+        # same process. A redeploy starts with zero and learns the remaining
+        # RetryAfter on the first rejected edit.
 
     def clear(self) -> None:
         self.chat_id = None
         self.message_id = None
         self._last_edit_at = 0.0
         self._last_text = None
-        self._consecutive_failures = 0
         self._retry_after_until = 0.0
+        self._pause_reason = None
 
     @property
     def retry_after_remaining(self) -> float:
         return max(0.0, self._retry_after_until - time.monotonic())
 
-    def _apply_retry_after(self, retry_after: float, *, error: BaseException) -> None:
-        delay = max(1.0, float(retry_after)) + 0.25
+    @property
+    def pause_reason(self) -> str | None:
+        return self._pause_reason if self.retry_after_remaining > 0 else None
+
+    def _apply_pause(
+        self,
+        delay_seconds: float,
+        *,
+        reason: str,
+        error: BaseException,
+    ) -> None:
+        delay = max(1.0, float(delay_seconds)) + 0.25
         now = time.monotonic()
         self._retry_after_until = max(self._retry_after_until, now + delay)
+        self._pause_reason = reason
         self._last_edit_at = now
-        self._consecutive_failures = 0
         logger.warning(
-            "%s_status_rate_limited retry_after_s=%.2f blocked_until_monotonic=%.3f error=%s",
+            "%s_status_rate_limited retry_after_s=%.2f blocked_until_monotonic=%.3f reason=%s error=%s",
             self.name,
             delay,
             self._retry_after_until,
+            reason,
             error,
+        )
+
+    def _apply_retry_after(self, retry_after: float, *, error: BaseException) -> None:
+        self._apply_pause(
+            retry_after,
+            reason="Telegram RetryAfter",
+            error=error,
         )
 
     async def replace_with_new_message(
@@ -1611,10 +1650,11 @@ class StatusMessageUpdater:
         chat_id: int | None = None,
         reply_markup: Any = None,
     ) -> int:
-        """Send a new status card and atomically switch future edits to it.
+        """Send one fresh snapshot and switch future edits to it.
 
-        This intentionally ignores any EditMessageText RetryAfter attached to the
-        abandoned message.  The scanner itself is not restarted or paused.
+        The existing edit pause is deliberately preserved.  Thus the button can
+        show current state through a new static card, but it cannot restart a
+        flood loop or force edits before Telegram's ban expires.
         """
         async with self._lock:
             target_chat_id = int(chat_id) if chat_id is not None else self.chat_id
@@ -1624,12 +1664,22 @@ class StatusMessageUpdater:
             if bot is None:
                 raise RuntimeError("Bot API ещё не готов")
 
-            replacement = await bot.send_message(
-                chat_id=target_chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
+            try:
+                replacement = await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+            except TelegramRetryAfter as exc:
+                self._apply_retry_after(getattr(exc, "retry_after", 1.0), error=exc)
+                raise
+            except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None:
+                    self._apply_retry_after(retry_after, error=exc)
+                raise
+
             new_message_id = int(getattr(replacement, "message_id"))
             old_message_id = self.message_id
             now = time.monotonic()
@@ -1637,15 +1687,13 @@ class StatusMessageUpdater:
             self.message_id = new_message_id
             self._last_text = text
             self._last_edit_at = now
-            self._consecutive_failures = 0
-            self._last_replacement_at = now
-            self._retry_after_until = 0.0
             logger.warning(
-                "%s_status_message_manually_replaced chat_id=%s old_message_id=%s new_message_id=%s",
+                "%s_status_message_manually_replaced chat_id=%s old_message_id=%s new_message_id=%s pause_remaining_s=%.2f",
                 self.name,
                 target_chat_id,
                 old_message_id,
                 new_message_id,
+                self.retry_after_remaining,
             )
             return new_message_id
 
@@ -1688,7 +1736,7 @@ class StatusMessageUpdater:
                 first_success = self._last_text is None
                 self._last_text = text
                 self._last_edit_at = now
-                self._consecutive_failures = 0
+                self._pause_reason = None
                 if first_success:
                     logger.info(
                         "%s_status_edit_started chat_id=%s message_id=%s",
@@ -1705,57 +1753,23 @@ class StatusMessageUpdater:
                 if "message is not modified" in lowered:
                     self._last_text = text
                     self._last_edit_at = now
-                    self._consecutive_failures = 0
                     return True
-                logger.warning(
-                    "%s_status_edit_failed chat_id=%s message_id=%s error=%s",
-                    self.name,
-                    self.chat_id,
-                    self.message_id,
-                    exc,
+                self._apply_pause(
+                    STATUS_BAD_REQUEST_COOLDOWN_SECONDS,
+                    reason="EditMessageText отклонён",
+                    error=exc,
                 )
+                return False
             except Exception as exc:
                 retry_after = getattr(exc, "retry_after", None)
                 if retry_after is not None:
                     self._apply_retry_after(retry_after, error=exc)
                     return False
-                logger.warning(
-                    "%s_status_edit_failed chat_id=%s message_id=%s error=%s",
-                    self.name,
-                    self.chat_id,
-                    self.message_id,
-                    exc,
+                self._apply_pause(
+                    STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS,
+                    reason="ошибка интерфейса",
+                    error=exc,
                 )
-
-            self._consecutive_failures += 1
-            if self._consecutive_failures < STATUS_REPLACE_AFTER_FAILURES:
-                return False
-            if now - self._last_replacement_at < STATUS_REPLACE_COOLDOWN_SECONDS:
-                return False
-
-            try:
-                replacement = await bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                )
-                new_message_id = int(getattr(replacement, "message_id"))
-                old_message_id = self.message_id
-                self.message_id = new_message_id
-                self._last_text = text
-                self._last_edit_at = now
-                self._last_replacement_at = now
-                self._consecutive_failures = 0
-                logger.warning(
-                    "%s_status_message_replaced chat_id=%s old_message_id=%s new_message_id=%s",
-                    self.name,
-                    self.chat_id,
-                    old_message_id,
-                    new_message_id,
-                )
-                return True
-            except Exception as exc:
-                logger.error("%s_status_replacement_failed error=%s", self.name, exc)
                 return False
 
 
@@ -1808,11 +1822,12 @@ class Scanner:
         if runtime.active and (self.monitor_task is None or self.monitor_task.done()):
             self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-scanner-monitor")
 
-    async def refresh_status_message(self, *, force: bool = False) -> None:
+    async def refresh_status_message(self, *, force: bool = False) -> bool:
         text = await status_text()
-        await self.status_updater.update(text, force=force)
+        updated = await self.status_updater.update(text, force=force)
         self.status_chat_id = self.status_updater.chat_id
         self.status_message_id = self.status_updater.message_id
+        return updated
 
     async def manually_replace_status_message(
         self,
@@ -1862,11 +1877,11 @@ class Scanner:
             pass
 
     async def _monitor_loop(self) -> None:
-        """Refresh the full card every three seconds and on important changes.
+        """Refresh once per minute and immediately for meaningful changes.
 
-        UI updates stay isolated from the MTProto scanner.  If Telegram freezes
-        one message, the owner can manually issue a new card without restarting
-        scanning, payment preparation, or LIVE mode.
+        UI updates stay isolated from the MTProto scanner. Telegram pauses are
+        obeyed without automatic SendMessage retries; the scanner never waits
+        for this loop.
         """
         next_heartbeat = time.monotonic() + LIVE_STATUS_INTERVAL_SECONDS
         try:
@@ -1887,8 +1902,21 @@ class Scanner:
 
                 now = time.monotonic()
                 if woke_for_change:
-                    await self.refresh_status_message(force=True)
-                    next_heartbeat = now + LIVE_STATUS_INTERVAL_SECONDS
+                    updated = await self.refresh_status_message(force=True)
+                    # A change that lands inside the one-second urgent throttle
+                    # must not be lost until the next minute heartbeat. Retry once
+                    # after the short local throttle, but never during Telegram's
+                    # explicit UI pause.
+                    if (
+                        not updated
+                        and self.status_updater.retry_after_remaining <= 0
+                        and runtime.active
+                        and not self.stop_event.is_set()
+                    ):
+                        await self._wait(self.status_updater.urgent_min_interval_seconds)
+                        if runtime.active and not self.stop_event.is_set():
+                            await self.refresh_status_message(force=True)
+                    next_heartbeat = time.monotonic() + LIVE_STATUS_INTERVAL_SECONDS
                 elif now >= next_heartbeat:
                     await self.refresh_status_message()
                     next_heartbeat = now + LIVE_STATUS_INTERVAL_SECONDS
@@ -4036,7 +4064,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0017 uses the reply-keyboard payment switch itself as confirmation, so a
+    v0018 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -4063,7 +4091,7 @@ async def stress_status_text() -> str:
         f"Скорость сейчас: <b>{runtime.stress_current_rate_per_s:.1f} проверок/с</b>",
         f"Максимум: <b>{runtime.stress_max_rate_per_s:.1f} проверок/с</b>",
         "Оплата: <b>принудительно не используется</b>",
-        f"Обновлено: <b>{time.strftime('%H:%M:%S')}</b>",
+        f"Обновлено: <b>{msk_time_str()}</b>",
     ]
     if runtime.current_by_slug:
         for slug, current in runtime.current_by_slug.items():
@@ -4139,7 +4167,7 @@ async def status_text() -> str:
         f"FloodWait: {runtime.flood_count}" + (f" · последний {runtime.last_flood_wait_s}с" if runtime.last_flood_wait_s is not None else ""),
         f"Cooldown: {runtime.rate_cooldown_cycles} циклов" if runtime.rate_cooldown_cycles else "Cooldown: нет",
         f"Uptime сканера: {uptime}с" if runtime.started_at else "Uptime сканера: —",
-        f"Обновлено: <b>{time.strftime('%H:%M:%S')}</b>",
+        f"Обновлено: <b>{msk_time_str()}</b>",
     ]
     cooldown = rate_limit.remaining_seconds()
     if cooldown > 0:
@@ -4202,12 +4230,21 @@ async def refresh_card_handler(message: Message) -> None:
             message.chat.id,
             reply_markup=main_keyboard(),
         )
+    except TelegramRetryAfter as exc:
+        # SendMessage itself is rate-limited, so do not answer with yet another
+        # SendMessage and do not schedule retries. Ping will show the remainder.
+        logger.warning(
+            "manual_status_refresh_rate_limited retry_after_s=%s error=%s",
+            getattr(exc, "retry_after", None),
+            exc,
+        )
     except Exception as exc:
         logger.warning("manual_status_refresh_failed error=%s", exc)
-        await message.answer(
-            f"Не удалось обновить карточку: {html.escape(str(exc))}",
-            reply_markup=main_keyboard(),
-        )
+        if getattr(exc, "retry_after", None) is None:
+            await message.answer(
+                f"Не удалось обновить карточку: {html.escape(str(exc))}",
+                reply_markup=main_keyboard(),
+            )
 
 
 @router.message(F.text == BTN_PING)
@@ -4225,16 +4262,27 @@ async def ping_handler(message: Message) -> None:
         mtproto_note = "подключён" if authorized else "нет авторизации"
     handler_ms = (time.perf_counter() - started) * 1000
 
+    card_pause = scanner.status_updater.retry_after_remaining
     lines = [
         "🏓 <b>PONG</b>",
+        f"Версия: <b>{APP_NAME} {APP_VERSION}</b>",
         f"Бот: <b>работает</b>",
         f"MTProto: <b>{mtproto_note}</b>",
         f"Сканер: <b>{'активен' if runtime.active else 'остановлен'}</b>",
-        (
-            f"Карточка: <b>пауза Telegram {int(scanner.status_updater.retry_after_remaining + 0.999)}с</b>"
-            if scanner.status_updater.retry_after_remaining > 0
-            else f"Карточка: <b>раз в {int(LIVE_STATUS_INTERVAL_SECONDS)}с · ручной перевыпуск доступен</b>"
-        ),
+    ]
+    if card_pause > 0:
+        unblock_at = msk_now() + timedelta(seconds=card_pause)
+        reason = scanner.status_updater.pause_reason or "ограничение Telegram"
+        lines.extend([
+            f"Карточка: <b>пауза Telegram</b> · {html.escape(reason)}",
+            f"До окончания: <b>{format_duration(card_pause)}</b>",
+            f"Ориентировочно до: <b>{unblock_at.strftime('%d.%m %H:%M:%S')} МСК</b>",
+        ])
+    else:
+        lines.append(
+            f"Карточка: <b>раз в {int(LIVE_STATUS_INTERVAL_SECONDS)}с + сразу при смене номера</b>"
+        )
+    lines.extend([
         f"Стресс-тест: <b>{'идёт' if runtime.stress_active else 'выключен'}</b>",
         f"Проверок сканера: <b>{runtime.checks}</b>",
         (
@@ -4243,7 +4291,7 @@ async def ping_handler(message: Message) -> None:
             else "Последний цикл: —"
         ),
         f"Обработка Ping: <b>{handler_ms:.1f} мс</b>",
-    ]
+    ])
     if runtime.current_by_slug:
         current_parts = []
         for slug, current in runtime.current_by_slug.items():
