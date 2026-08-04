@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import gc
 import html
 import inspect
 import json
@@ -14,6 +15,7 @@ import signal
 import statistics
 import socket
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import asdict, dataclass, field
@@ -39,6 +41,16 @@ from aiogram.types import (
     FSInputFile,
 )
 from telethon import TelegramClient, errors, functions, types, utils
+
+from cluster import (
+    ClusterBus,
+    ClusterConfig,
+    MAX_SHOOTERS,
+    ProvisionStore,
+    ShooterStatus,
+    StableConfigGate,
+    campaign_id_for,
+)
 
 from logic import (
     AdaptiveRateController,
@@ -73,7 +85,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0018"
+APP_VERSION = "v0029"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -82,6 +94,7 @@ LOG_PATH = DATA_DIR / f"gift-hunter-{APP_VERSION}.log"
 DIAGNOSTICS_PATH = DATA_DIR / "diagnostics.json"
 STRESS_REPORT_PATH = DATA_DIR / "stress-test-latest.json"
 STRESS_HISTORY_PATH = DATA_DIR / "stress-tests.jsonl"
+CATALOG_REPORT_PATH = DATA_DIR / "catalog-numbers-latest.json"
 RATE_LIMIT_PATH = DATA_DIR / "rate-limit.json"
 PENDING_PAYMENT_HOLD_MESSAGE = (
     "Есть платёж с неподтверждённым результатом. Повторная оплата и изменение "
@@ -89,6 +102,7 @@ PENDING_PAYMENT_HOLD_MESSAGE = (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MT_SESSION = os.getenv("MT_SESSION", "").strip()
 SETUP_PIN = os.getenv("SETUP_PIN", "").strip()
 ADAPTIVE_SCAN = parse_bool(os.getenv("ADAPTIVE_SCAN", "true"), True)
 SCAN_START_INTERVAL_MS = env_int("SCAN_START_INTERVAL_MS", 120, minimum=0)
@@ -102,7 +116,8 @@ FLOOD_WAIT_EXTRA_MS = env_int("FLOOD_WAIT_EXTRA_MS", 150, minimum=0)
 NEAR_TARGET_DISTANCE = env_int("NEAR_TARGET_DISTANCE", 25, minimum=1)
 PREPARE_AHEAD = env_int("PREPARE_AHEAD", 100, minimum=1)
 PREPARE_REFRESH_SECONDS = env_int("PREPARE_REFRESH_SECONDS", 420, minimum=60)
-MAX_UPGRADE_STARS = env_int("MAX_UPGRADE_STARS", 2000, minimum=0)
+DEFAULT_MAX_UPGRADE_STARS = 3000
+MAX_UPGRADE_STARS = env_int("MAX_UPGRADE_STARS", DEFAULT_MAX_UPGRADE_STARS, minimum=0)
 DIAGNOSTICS_INTERVAL_SECONDS = env_float("DIAGNOSTICS_INTERVAL_SECONDS", 1.0, minimum=0.5)
 VERIFY_DELAYS_SECONDS = (0.10, 0.25, 0.50, 1.0, 2.0, 3.0)
 STOP_AFTER_SUCCESS = parse_bool(os.getenv("STOP_AFTER_SUCCESS", "false"), False)
@@ -127,8 +142,32 @@ STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS = env_float("STATUS_TRANSIENT_FAILURE_
 STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS = env_float("STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS", 60.0, minimum=60.0)
 TASK_STOP_TIMEOUT_SECONDS = env_float("TASK_STOP_TIMEOUT_SECONDS", 4.0, minimum=1.0)
 CATALOG_CONCURRENCY = env_int("CATALOG_CONCURRENCY", 6, minimum=1)
+SPECIAL_NUMBER_MAX_DISTANCE = 100
+SPECIAL_NUMBER_LENGTHS = (4, 5, 6)
 EXACT_PROBE_DISTANCE = env_int("EXACT_PROBE_DISTANCE", 100, minimum=2)
 EXACT_COUNTER_REFRESH_SECONDS = env_float("EXACT_COUNTER_REFRESH_SECONDS", 1.0, minimum=0.2)
+MAX_PRIMARY_VOLLEY_SIZE = 15
+MAX_SECONDARY_VOLLEY_SIZE = 3
+DEFAULT_FAST_QUIET_DISTANCE = 10
+FAST_QUIET_DISTANCE = env_int("FAST_QUIET_DISTANCE", DEFAULT_FAST_QUIET_DISTANCE, minimum=1)
+FAST_DISABLE_GC = parse_bool(os.getenv("FAST_DISABLE_GC", "true"), True)
+FAST_CPU_AFFINITY = os.getenv("FAST_CPU_AFFINITY", "").strip()
+SHOOTER_ID = min(MAX_SHOOTERS, max(1, env_int("SHOOTER_ID", 1, minimum=1)))
+PRIMARY_SHOOTER = SHOOTER_ID == 1
+PROVISION_DIR = Path(os.getenv("PROVISION_DIR", "/provision"))
+FIRE_PORT = env_int("FIRE_PORT", 45444, minimum=1024)
+FIRE_SECRET = os.getenv("FIRE_SECRET", "").strip()
+CLUSTER_STATUS_INTERVAL_SECONDS = env_float("CLUSTER_STATUS_INTERVAL_SECONDS", 60.0, minimum=60.0)
+CLUSTER_STALE_SECONDS = env_float("CLUSTER_STALE_SECONDS", 180.0, minimum=120.0)
+CLUSTER_PING_TIMEOUT_MS = env_int("CLUSTER_PING_TIMEOUT_MS", 500, minimum=100)
+CLUSTER_CONFIG_POLL_SECONDS = env_float("CLUSTER_CONFIG_POLL_SECONDS", 2.0, minimum=0.5)
+CLUSTER_CONFIG_STABLE_READS = env_int("CLUSTER_CONFIG_STABLE_READS", 2, minimum=2)
+CLUSTER_RECONFIG_CONFIRM_SECONDS = env_float("CLUSTER_RECONFIG_CONFIRM_SECONDS", 10.0, minimum=3.0)
+WATCHDOG_STALL_SECONDS = env_float("WATCHDOG_STALL_SECONDS", 90.0, minimum=30.0)
+WATCHDOG_CHECK_SECONDS = env_float("WATCHDOG_CHECK_SECONDS", 5.0, minimum=1.0)
+PROCESS_STARTED_MONOTONIC = time.monotonic()
+_EVENT_LOOP_LAST_TICK = time.monotonic()
+_WATCHDOG_STOP = threading.Event()
 
 
 MSK_TIMEZONE = timezone(timedelta(hours=3), name="MSK")
@@ -151,7 +190,166 @@ def format_duration(seconds: float) -> str:
     return f"{secs}с"
 
 
+def format_process_uptime(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}д {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _read_positive_int(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw or raw == "max":
+            return None
+        value = int(raw)
+        return value if value > 0 else None
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+
+
+def _host_memory_total_bytes() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (FileNotFoundError, OSError, IndexError, TypeError, ValueError):
+        return None
+    return None
+
+
+def current_memory_bytes() -> int:
+    """Return current container memory when available, otherwise process RSS."""
+    for path in (
+        Path("/sys/fs/cgroup/memory.current"),
+        Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        value = _read_positive_int(path)
+        if value is not None:
+            return value
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return max(0, int(line.split()[1]) * 1024)
+    except (FileNotFoundError, OSError, IndexError, TypeError, ValueError):
+        pass
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    multiplier = 1 if sys.platform == "darwin" else 1024
+    return max(0, int(max_rss) * multiplier)
+
+
+def memory_limit_bytes() -> int | None:
+    """Return the effective cgroup memory limit, or None when it is unlimited."""
+    for path in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        value = _read_positive_int(path)
+        if value is None:
+            continue
+        host_total = _host_memory_total_bytes()
+        if value >= (1 << 60):
+            return None
+        if host_total is not None and value > host_total * 4:
+            return None
+        return value
+    return None
+
+
+def format_memory_mb(value_bytes: int) -> str:
+    value_mb = max(0, int(round(int(value_bytes) / (1024 * 1024))))
+    return f"{value_mb:,}".replace(",", " ") + " МБ"
+
+
+def nearest_special_number(current: int) -> tuple[int | None, int | None]:
+    """Return the next 4-6 digit repdigit and its forward distance.
+
+    Examples: 4344 -> (4444, 100), 444350 -> (444444, 94).
+    The current number itself is considered near with distance zero.
+    """
+    value = max(0, int(current))
+    candidates = sorted(
+        int(str(digit) * length)
+        for length in SPECIAL_NUMBER_LENGTHS
+        for digit in range(1, 10)
+    )
+    for target in candidates:
+        if target >= value:
+            return target, target - value
+    return None, None
+
+
+def catalog_number_is_near_special(
+    current: int,
+    total: int | None = None,
+) -> tuple[bool, int | None, int | None]:
+    target, distance = nearest_special_number(current)
+    target_is_reachable = total is None or target is None or target <= int(total)
+    highlighted = (
+        target_is_reachable
+        and distance is not None
+        and 0 <= distance <= SPECIAL_NUMBER_MAX_DISTANCE
+    )
+    return highlighted, target, distance
+
+
+def apply_fast_cpu_affinity() -> None:
+    """Optionally pin the process to one allowed CPU core.
+
+    Leave FAST_CPU_AFFINITY empty by default.  On a dedicated-vCPU service it
+    can be set to an integer core index after checking the container's cpuset.
+    """
+    if not FAST_CPU_AFFINITY:
+        return
+    try:
+        core = int(FAST_CPU_AFFINITY)
+        allowed = set(os.sched_getaffinity(0))
+        if core not in allowed:
+            raise ValueError(f"core {core} not in allowed cpuset {sorted(allowed)}")
+        os.sched_setaffinity(0, {core})
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        logger.warning("fast_cpu_affinity_not_applied value=%s error=%s", FAST_CPU_AFFINITY, exc)
+    else:
+        logger.info("fast_cpu_affinity_applied core=%s", core)
+
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+PROVISION_DIR.mkdir(parents=True, exist_ok=True)
+_PROVISION_TOKEN_DIR_RAW = os.getenv("PROVISION_TOKEN_DIR", "").strip()
+PROVISION_TOKEN_DIR = Path(_PROVISION_TOKEN_DIR_RAW) if _PROVISION_TOKEN_DIR_RAW else None
+provision_store = ProvisionStore(PROVISION_DIR, token_root=PROVISION_TOKEN_DIR)
+
+
+def cluster_config() -> ClusterConfig:
+    return provision_store.load_config()
+
+
+def active_shooter_count() -> int:
+    # Once ClusterRuntime exists, use its accepted config from RAM.  This keeps
+    # status/heartbeat code away from the shared volume and cannot affect the
+    # scanner/payment loop.
+    cluster = globals().get("cluster_runtime")
+    applied = getattr(cluster, "applied_config", None) if cluster is not None else None
+    if applied is not None:
+        return int(applied.active_shooters)
+    return cluster_config().active_shooters
+
+
+def max_volley_size_for_shooter(shooter_id: int) -> int:
+    """Return the local account limit without reading shared cluster state.
+
+    This function is safe to call in the payment hot path: it depends only on
+    the immutable process role and performs no filesystem or network work.
+    """
+    return MAX_PRIMARY_VOLLEY_SIZE if int(shooter_id) == 1 else MAX_SECONDARY_VOLLEY_SIZE
+
+
+def effective_max_volley_size() -> int:
+    return max_volley_size_for_shooter(SHOOTER_ID)
+
 
 
 def configure_logging() -> logging.Logger:
@@ -180,6 +378,29 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 
+def record_cluster_event(event: str, **fields: Any) -> None:
+    """Write one safe cross-container event outside the payment hot path."""
+    try:
+        provision_store.append_event(event, version=APP_VERSION, shooter_id=SHOOTER_ID, **fields)
+    except Exception as exc:
+        logger.warning("cluster_event_write_failed event=%s error=%s", event, exc)
+
+
+def safe_save_lifecycle(shooter_id: int, **fields: Any) -> bool:
+    """Persist lifecycle diagnostics without taking the bot down on disk errors."""
+    try:
+        provision_store.save_lifecycle(shooter_id, **fields)
+        return True
+    except Exception as exc:
+        logger.error(
+            "cluster_lifecycle_write_failed shooter_id=%s state=%s error=%s",
+            shooter_id,
+            fields.get("state", "unknown"),
+            exc,
+        )
+        return False
+
+
 @dataclass
 class Settings:
     version: str = APP_VERSION
@@ -194,6 +415,7 @@ class Settings:
     legacy_selected_gift_ids: list[int] = field(default_factory=list)
     target_numbers: list[int] = field(default_factory=list)
     live_upgrades: bool = False
+    volley_size: int = 1
     slug_map: dict[str, str] = field(default_factory=dict)
     payment_hold_saved_ids: list[int] = field(default_factory=list)
     payment_hold_targets: dict[str, int] = field(default_factory=dict)
@@ -246,6 +468,7 @@ class SettingsStore:
             legacy_selected_gift_ids=_unique_ints(nested.get("legacy_selected_gift_ids", old_selected)),
             target_numbers=_unique_ints(nested.get("target_numbers", [])),
             live_upgrades=parse_bool(nested.get("live_upgrades", False), False),
+            volley_size=min(max_volley_size_for_shooter(SHOOTER_ID), max(1, _int_or_none(nested.get("volley_size")) or 1)),
             slug_map={str(k): str(v) for k, v in (nested.get("slug_map", {}) or {}).items() if v},
             payment_hold_saved_ids=_unique_ints(nested.get("payment_hold_saved_ids", [])),
             payment_hold_targets={
@@ -433,6 +656,13 @@ def current_rss_mb() -> float:
 
 
 store = SettingsStore(SETTINGS_PATH)
+
+
+def effective_volley_size() -> int:
+    """Return this Hunter's configured volley clamped to its role limit."""
+    return min(effective_max_volley_size(), max(1, int(store.settings.volley_size)))
+
+
 rate_limit = RateLimitStore(RATE_LIMIT_PATH)
 
 
@@ -469,6 +699,16 @@ class RuntimeState:
     stress_current_rate_per_s: float = 0.0
     stress_max_rate_per_s: float = 0.0
     stress_result: str | None = None
+    fast_quiet: bool = False
+    fast_fired: bool = False
+    fast_volley_size: int = 1
+    fast_trigger_to_submit_ms: float | None = None
+    fast_task_launch_ms: float | None = None
+    fast_first_send_start_ms: float | None = None
+    fast_send_start_offsets_ms: list[float | None] = field(default_factory=list)
+    fast_fire_source: str | None = None
+    fast_udp_peers_sent: int = 0
+    fast_campaign_id: str | None = None
 
 
 runtime = RuntimeState(pending_verification_url=store.settings.payment_verification_url)
@@ -533,6 +773,8 @@ class PreparedUpgrade:
     cost: int
     prepaid: bool
     created_at: float
+    request: Any | None = None
+    fast_send_started_ns: int | None = None
 
 
 @dataclass
@@ -559,6 +801,12 @@ class MTProtoService:
 
     @staticmethod
     def session_base() -> str:
+        if MT_SESSION:
+            explicit = Path(MT_SESSION)
+            if explicit.suffix == ".session":
+                explicit = explicit.with_suffix("")
+            explicit.parent.mkdir(parents=True, exist_ok=True)
+            return str(explicit)
         preferred = DATA_DIR / "user"
         candidates = [
             DATA_DIR / "user.session",
@@ -600,7 +848,7 @@ class MTProtoService:
                     self.session_base(),
                     int(s.api_id),
                     str(s.api_hash),
-                    device_model="Gift Hunter VPS",
+                    device_model=f"Gift Hunter {SHOOTER_ID} VPS",
                     system_version="Linux",
                     app_version=APP_VERSION,
                     lang_code="ru",
@@ -1362,7 +1610,14 @@ class MTProtoService:
         await self.require_authorized()
         input_saved = self.input_saved(peer, info.saved_id)
         if info.prepaid:
-            return PreparedUpgrade(info.saved_id, input_saved, None, None, 0, True, time.monotonic())
+            request = construct(
+                functions.payments.UpgradeStarGiftRequest,
+                stargift=input_saved,
+                keep_original_details=KEEP_ORIGINAL_DETAILS,
+            )
+            return PreparedUpgrade(
+                info.saved_id, input_saved, None, None, 0, True, time.monotonic(), request
+            )
 
         invoice = construct(
             types.InputInvoiceStarGiftUpgrade,
@@ -1374,7 +1629,14 @@ class MTProtoService:
             form = await self.call(form_request)
         except errors.RPCError as exc:
             if "NO_PAYMENT_NEEDED" in str(exc).upper():
-                return PreparedUpgrade(info.saved_id, input_saved, None, None, 0, True, time.monotonic())
+                request = construct(
+                    functions.payments.UpgradeStarGiftRequest,
+                    stargift=input_saved,
+                    keep_original_details=KEEP_ORIGINAL_DETAILS,
+                )
+                return PreparedUpgrade(
+                    info.saved_id, input_saved, None, None, 0, True, time.monotonic(), request
+                )
             raise
         cost = sum_invoice_amount(getattr(form, "invoice", None)) or info.upgrade_cost
         if cost <= 0:
@@ -1384,7 +1646,14 @@ class MTProtoService:
         form_id = _int_or_none(getattr(form, "form_id", None))
         if not form_id:
             raise RuntimeError("Telegram не вернул form_id для оплаты улучшения")
-        return PreparedUpgrade(info.saved_id, input_saved, invoice, form_id, cost, False, time.monotonic())
+        request = construct(
+            functions.payments.SendStarsFormRequest,
+            form_id=int(form_id),
+            invoice=invoice,
+        )
+        return PreparedUpgrade(
+            info.saved_id, input_saved, invoice, form_id, cost, False, time.monotonic(), request
+        )
 
     async def _verify_unique(self, peer: Any, saved_id: int) -> tuple[int | None, str | None]:
         for delay in VERIFY_DELAYS_SECONDS:
@@ -1543,6 +1812,59 @@ class MTProtoService:
                 raise
             return await handle_submit_error(exc)
 
+    async def execute_upgrade_fast(
+        self,
+        peer: Any,
+        info: SavedGiftInfo,
+        prepared: PreparedUpgrade,
+        *,
+        client: TelegramClient,
+    ) -> UpgradeOutcome:
+        """Submit exactly one prebuilt request with no refresh and no retry.
+
+        The caller launches one or more of these coroutines together.  No global
+        request lock is used: the exact-number probe has already completed and
+        Telethon can multiplex the independent payment RPCs on the hot session.
+        All verification and state writes happen only after the first submission.
+        """
+        if prepared.saved_id != info.saved_id or prepared.request is None:
+            return UpgradeOutcome("failed", detail="FAST-план отсутствует или относится к другому подарку")
+        if time.monotonic() - prepared.created_at > 540:
+            return UpgradeOutcome("failed", detail="FAST-платёжная форма устарела; повторный запрос запрещён")
+
+        try:
+            prepared.fast_send_started_ns = time.perf_counter_ns()
+            result = await client(prepared.request)
+            return await self._interpret_upgrade_result(peer, info.saved_id, result)
+        except errors.FloodWaitError as exc:
+            return UpgradeOutcome("failed", detail=f"FLOOD_WAIT_{int(exc.seconds)}: платёж не повторялся")
+        except errors.RPCError as exc:
+            code = self._rpc_code(exc)
+            if code in {"FORM_SUBMIT_DUPLICATE", "STARGIFT_ALREADY_UPGRADED"}:
+                actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+                if actual_num is not None:
+                    return UpgradeOutcome("confirmed", actual_num, actual_slug)
+                return UpgradeOutcome("unknown", detail=f"{code}: результат не удалось подтвердить")
+            if self._is_definitive_upgrade_error(code) or code in {
+                "FORM_EXPIRED",
+                "STARS_FORM_AMOUNT_MISMATCH",
+            }:
+                return UpgradeOutcome("failed", detail=f"{code}: {exc}")
+            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+            if actual_num is not None:
+                return UpgradeOutcome("confirmed", actual_num, actual_slug)
+            return UpgradeOutcome("unknown", detail=f"{code}: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+            if actual_num is not None:
+                return UpgradeOutcome("confirmed", actual_num, actual_slug)
+            return UpgradeOutcome(
+                "unknown",
+                detail=f"{type(exc).__name__}: {exc}; FAST-повтор не отправлялся",
+            )
+
 
 
 def construct(cls: Any, **kwargs: Any) -> Any:
@@ -1557,12 +1879,12 @@ def construct(cls: Any, **kwargs: Any) -> Any:
 
 
 class StatusMessageUpdater:
-    """Edit one live status message without ever coupling UI failures to scanning.
+    """Edit one plain status card without ever coupling UI failures to scanning.
 
-    Telegram UI rate limits are treated as a hard pause.  Automatic replacement
-    is intentionally disabled: repeated SendMessage fallbacks caused the v0017
-    flood loop.  A fresh static card can still be requested manually, while the
-    stored edit pause is preserved and future edits resume only after it expires.
+    Telegram RetryAfter values are obeyed as hard pauses. The exact permanent
+    ``message can't be edited`` error replaces the stale card once with a plain
+    message; other failures never start a SendMessage retry loop. A manual
+    refresh can also publish one full RAM snapshot without touching MTProto.
     """
 
     def __init__(
@@ -1650,11 +1972,11 @@ class StatusMessageUpdater:
         chat_id: int | None = None,
         reply_markup: Any = None,
     ) -> int:
-        """Send one fresh snapshot and switch future edits to it.
+        """Send one fresh RAM snapshot and switch future edits to it.
 
-        The existing edit pause is deliberately preserved.  Thus the button can
-        show current state through a new static card, but it cannot restart a
-        flood loop or force edits before Telegram's ban expires.
+        The existing edit pause is deliberately preserved. Thus the button can
+        show current state through a new plain card, but it cannot restart an
+        edit loop or force edits before Telegram's RetryAfter expires.
         """
         async with self._lock:
             target_chat_id = int(chat_id) if chat_id is not None else self.chat_id
@@ -1754,8 +2076,45 @@ class StatusMessageUpdater:
                     self._last_text = text
                     self._last_edit_at = now
                     return True
+                if "message can't be edited" in lowered or "message can not be edited" in lowered:
+                    # The old card is no longer editable. Replace it once with a
+                    # plain status message; never attach the control keyboard to
+                    # the card and never turn this exact error into a 15-minute
+                    # local cooldown. The scanner does not await this UI path.
+                    try:
+                        replacement = await bot.send_message(
+                            chat_id=self.chat_id,
+                            text=text,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except TelegramRetryAfter as send_exc:
+                        self._apply_retry_after(
+                            getattr(send_exc, "retry_after", 1.0), error=send_exc
+                        )
+                        return False
+                    except Exception as send_exc:
+                        retry_after = getattr(send_exc, "retry_after", None)
+                        if retry_after is not None:
+                            self._apply_retry_after(retry_after, error=send_exc)
+                        else:
+                            self._apply_pause(
+                                STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS,
+                                reason="не удалось заменить карточку",
+                                error=send_exc,
+                            )
+                        return False
+                    old_message_id = self.message_id
+                    self.message_id = int(getattr(replacement, "message_id"))
+                    self._last_text = text
+                    self._last_edit_at = time.monotonic()
+                    self._pause_reason = None
+                    logger.warning(
+                        "%s_status_message_replaced_after_uneditable chat_id=%s old_message_id=%s new_message_id=%s",
+                        self.name, self.chat_id, old_message_id, self.message_id,
+                    )
+                    return True
                 self._apply_pause(
-                    STATUS_BAD_REQUEST_COOLDOWN_SECONDS,
+                    STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS,
                     reason="EditMessageText отклонён",
                     error=exc,
                 )
@@ -1802,8 +2161,17 @@ class Scanner:
         self._plan_dirty = True
         self._groups: dict[str, list[SavedGiftInfo]] = {}
         self._counter_meta: dict[str, GiftCounter] = {}
+        self._campaign_ids_by_slug: dict[str, str] = {}
+        self._slug_by_campaign_id: dict[str, str] = {}
         self._exact_probe_cursor: dict[str, int] = {}
         self._last_exact_regular_refresh: dict[str, float] = {}
+        self._fast_fired = False
+        self._fast_client: TelegramClient | None = None
+        self._fast_peer: Any | None = None
+        self._fast_trigger_detected_at: float | None = None
+        self._gc_disabled_by_scanner = False
+        self._quiet_mode = False
+        self._quiet_final_task: asyncio.Task[None] | None = None
         self.rate = AdaptiveRateController(
             min_interval_ms=SCAN_MIN_INTERVAL_MS,
             max_interval_ms=SCAN_MAX_INTERVAL_MS,
@@ -1814,12 +2182,53 @@ class Scanner:
             backoff_floor_ms=SCAN_BACKOFF_FLOOR_MS,
         )
 
+    def _enter_fast_quiet(self) -> None:
+        if self._quiet_mode:
+            return
+        self._quiet_mode = True
+        runtime.fast_quiet = True
+        monitor = self.monitor_task
+        if monitor and monitor is not asyncio.current_task():
+            monitor.cancel()
+        self.monitor_task = None
+        # Publish one final full card with the quiet-mode line. This task is
+        # detached from the scanner; after it runs, automatic edits stay off.
+        if self.status_chat_id is not None:
+            self._quiet_final_task = asyncio.create_task(
+                self._publish_quiet_entry_card(),
+                name="gift-scanner-quiet-card",
+            )
+        if FAST_DISABLE_GC and runtime.active and gc.isenabled():
+            gc.disable()
+            self._gc_disabled_by_scanner = True
+
+    async def _publish_quiet_entry_card(self) -> None:
+        try:
+            await asyncio.sleep(self.status_updater.urgent_min_interval_seconds)
+            if self._quiet_mode and runtime.active and not self.stop_event.is_set():
+                await self.refresh_status_message(force=True)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("quiet_entry_card_failed error=%s", exc)
+
+    def _leave_fast_quiet(self) -> None:
+        runtime.fast_quiet = False
+        self._quiet_mode = False
+        quiet_task = self._quiet_final_task
+        if quiet_task and not quiet_task.done():
+            quiet_task.cancel()
+        self._quiet_final_task = None
+        if self._gc_disabled_by_scanner:
+            gc.enable()
+            self._gc_disabled_by_scanner = False
+
     def attach_status_message(self, chat_id: int, message_id: int) -> None:
         self.status_chat_id = int(chat_id)
         self.status_message_id = int(message_id)
         self.status_updater.attach(chat_id, message_id)
         self._status_wakeup.set()
-        if runtime.active and (self.monitor_task is None or self.monitor_task.done()):
+        if runtime.active and not runtime.fast_quiet and (self.monitor_task is None or self.monitor_task.done()):
             self.monitor_task = asyncio.create_task(self._monitor_loop(), name="gift-scanner-monitor")
 
     async def refresh_status_message(self, *, force: bool = False) -> bool:
@@ -1835,7 +2244,7 @@ class Scanner:
         *,
         reply_markup: Any = None,
     ) -> int:
-        """Abandon the old card and continue monitoring through a new message."""
+        """Send a new full card from RAM without probing MTProto or adding a keyboard."""
         async with self._manual_status_refresh_lock:
             now = time.monotonic()
             remaining = (
@@ -1857,7 +2266,7 @@ class Scanner:
             self.status_message_id = new_message_id
             self._last_manual_status_refresh_at = time.monotonic()
             self._status_wakeup.clear()
-            if runtime.active and (self.monitor_task is None or self.monitor_task.done()):
+            if runtime.active and not runtime.fast_quiet and (self.monitor_task is None or self.monitor_task.done()):
                 self.monitor_task = asyncio.create_task(
                     self._monitor_loop(),
                     name="gift-scanner-monitor",
@@ -1964,7 +2373,7 @@ class Scanner:
             store.settings.target_numbers = future_targets
             await store.save()
         if not future_targets:
-            raise RuntimeError(f"Все цели уже прошли. Текущий номер: {current}")
+            raise RuntimeError(f"Все номера выстрела уже прошли. Текущий номер: {current}")
 
         for slug, counter in counters.items():
             runtime.current_by_slug[slug] = counter.current
@@ -1972,6 +2381,13 @@ class Scanner:
 
         self._groups = groups
         self._counter_meta = counters
+        self._campaign_ids_by_slug = {
+            slug: campaign_id_for(slug, counter.base_gift_id)
+            for slug, counter in counters.items()
+        }
+        self._slug_by_campaign_id = {
+            campaign_id: slug for slug, campaign_id in self._campaign_ids_by_slug.items()
+        }
         self._plan_dirty = False
 
         # Keep only plans that still belong to selected gifts. For consecutive
@@ -1983,7 +2399,11 @@ class Scanner:
             for slug, group in groups.items():
                 current = counters[slug].current
                 future_targets = sorted({target for target in store.settings.target_numbers if target > current})
-                required = min(len(group), len(future_targets))
+                required = min(len(group), effective_volley_size())
+                if len(group) < effective_volley_size():
+                    raise RuntimeError(
+                        f"Для залпа {effective_volley_size()} выбрано только {len(group)} подарков"
+                    )
                 for candidate in group[:required]:
                     existing = self.prepared.get(candidate.saved_id)
                     if existing is not None and time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS:
@@ -2002,11 +2422,13 @@ class Scanner:
         if not store.settings.selected_saved_ids:
             raise RuntimeError("Подарки не выбраны")
         if not store.settings.target_numbers:
-            raise RuntimeError("Целевые номера не заданы")
+            raise RuntimeError("Номера выстрела не заданы")
         rate_limit.clear_if_expired()
         rate_limit.assert_available()
         if not await self.service.is_authorized():
             raise RuntimeError("Telegram-аккаунт не авторизован")
+        if active_shooter_count() > 1:
+            await cluster_runtime.verify_active_peers()
 
         # Reset the visible state first, but do not mark the scanner active until
         # channel, gifts, slug/counter and (for LIVE) payment forms have all been
@@ -2018,9 +2440,16 @@ class Scanner:
         self._plan_dirty = True
         self._groups.clear()
         self._counter_meta.clear()
+        self._campaign_ids_by_slug.clear()
+        self._slug_by_campaign_id.clear()
         self._exact_probe_cursor.clear()
         self._last_exact_regular_refresh.clear()
         self._last_poll_started = None
+        self._fast_fired = False
+        self._fast_trigger_detected_at = None
+        self._fast_client = None
+        self._fast_peer = None
+        self._leave_fast_quiet()
         self.rate.reset()
         runtime.active = False
         runtime.started_at = None
@@ -2039,10 +2468,22 @@ class Scanner:
         runtime.flood_count = 0
         runtime.last_flood_wait_s = None
         runtime.rate_cooldown_cycles = 0
+        runtime.fast_quiet = False
+        runtime.fast_fired = False
+        runtime.fast_volley_size = effective_volley_size()
+        runtime.fast_trigger_to_submit_ms = None
+        runtime.fast_task_launch_ms = None
+        runtime.fast_first_send_start_ms = None
+        runtime.fast_send_start_offsets_ms.clear()
+        runtime.fast_fire_source = None
+        runtime.fast_udp_peers_sent = 0
+        runtime.fast_campaign_id = None
 
         try:
             peer = await self.service.resolve_channel()
             await self._load_plan(peer)
+            self._fast_client = await self.service.require_authorized()
+            self._fast_peer = peer
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
                 raise
@@ -2060,15 +2501,35 @@ class Scanner:
         self._plan_dirty = False
         self.task = asyncio.create_task(self._run(peer), name="gift-scanner")
         self.monitor_task = None
+        first_target = min(store.settings.target_numbers)
+        cluster_runtime.disarm()
+        for campaign_id in self._campaign_ids_by_slug.values():
+            cluster_runtime.arm(campaign_id, first_target)
+        cluster_runtime.notify_state_changed()
         logger.info(
-            "scanner_started version=%s saved_ids=%s targets=%s live=%s adaptive=%s start_ms=%s min_ms=%s",
+            "scanner_started version=%s shooter_id=%s mode=%s active_shooters=%s saved_ids=%s targets=%s live=%s volley=%s volley_limit=%s adaptive=%s start_ms=%s min_ms=%s",
             APP_VERSION,
+            SHOOTER_ID,
+            "sniper" if effective_volley_size() == 1 else "volley",
+            active_shooter_count(),
             store.settings.selected_saved_ids,
             store.settings.target_numbers,
             store.settings.live_upgrades,
+            effective_volley_size(),
+            effective_max_volley_size(),
             ADAPTIVE_SCAN,
             SCAN_START_INTERVAL_MS,
             SCAN_MIN_INTERVAL_MS,
+        )
+        record_cluster_event(
+            "scanner_started",
+            mode="sniper" if effective_volley_size() == 1 else "volley",
+            active_shooters=active_shooter_count(),
+            saved_ids=list(store.settings.selected_saved_ids),
+            targets=list(store.settings.target_numbers),
+            live=bool(store.settings.live_upgrades),
+            volley=effective_volley_size(),
+            volley_limit=effective_max_volley_size(),
         )
 
     async def stop(self, reason: str = "manual") -> None:
@@ -2091,6 +2552,9 @@ class Scanner:
         self.monitor_task = None
         runtime.active = False
         runtime.started_at = None
+        self._leave_fast_quiet()
+        cluster_runtime.disarm()
+        cluster_runtime.notify_state_changed()
         await self._maybe_write_diagnostics(force=True)
         await self.refresh_status_message(force=True)
         logger.info("scanner_stopped reason=%s", reason)
@@ -2135,6 +2599,9 @@ class Scanner:
                 )
             return self._counter_with_current(raw, current), False, None
 
+        if store.settings.live_upgrades and distance <= FAST_QUIET_DISTANCE:
+            self._enter_fast_quiet()
+
         now = time.monotonic()
         cursor = self._exact_probe_cursor.get(slug)
         if cursor is None:
@@ -2150,7 +2617,7 @@ class Scanner:
 
         last_refresh = self._last_exact_regular_refresh.get(slug, 0.0)
         display_counter = meta
-        if now - last_refresh >= EXACT_COUNTER_REFRESH_SECONDS:
+        if not self._quiet_mode and now - last_refresh >= EXACT_COUNTER_REFRESH_SECONDS:
             raw = await self.service.fetch_counter_fast(
                 slug, expected_gift_id=meta.base_gift_id
             )
@@ -2189,48 +2656,23 @@ class Scanner:
                 total=exact.total if exact.total is not None else display_counter.total,
                 base_gift_id=exact.base_gift_id or display_counter.base_gift_id,
             )
-            logger.info(
-                "exact_number_confirmed slug=%s number=%s target=%s issued_hint=%s",
-                slug, exact.num, target, exact.issued,
-            )
             if exact.num == target:
                 existing_target = target
-            elif exact.num == target - 1:
-                # One immediate exact target check is the final no-payment guard.
-                # STARGIFT_SLUG_INVALID means the target is not issued yet; any
-                # uncertain RPC/network error is raised and therefore cannot pay.
-                target_probe = await self.service.fetch_exact_unique(
-                    slug, target, expected_gift_id=meta.base_gift_id
+                logger.info(
+                    "exact_number_confirmed slug=%s number=%s target=%s issued_hint=%s",
+                    slug, exact.num, target, exact.issued,
                 )
-                if target_probe is not None:
-                    existing_target = target
-                    previous = max(previous, target_probe.num)
-                    display_counter = GiftCounter(
-                        slug=slug,
-                        title=target_probe.title,
-                        current=previous,
-                        total=(
-                            target_probe.total
-                            if target_probe.total is not None
-                            else display_counter.total
-                        ),
-                        base_gift_id=(
-                            target_probe.base_gift_id or display_counter.base_gift_id
-                        ),
-                    )
-                    self._exact_probe_cursor[slug] = max(
-                        self._exact_probe_cursor.get(slug, 0), target_probe.num
-                    )
-                    logger.warning(
-                        "exact_target_already_exists slug=%s target=%s payment_blocked=true",
-                        slug, target,
-                    )
-                else:
-                    predecessor_exact = True
-                    logger.warning(
-                        "exact_target_window_open slug=%s predecessor=%s target=%s",
-                        slug, exact.num, target,
-                    )
+            elif exact.num == target - 1:
+                # FAST deliberately does not spend another network round-trip on
+                # checking target itself. The financial request is launched from
+                # the caller immediately after this exact predecessor response.
+                predecessor_exact = True
+                self._fast_trigger_detected_at = time.perf_counter()
+            else:
+                logger.info(
+                    "exact_number_confirmed slug=%s number=%s target=%s issued_hint=%s",
+                    slug, exact.num, target, exact.issued,
+                )
 
         return self._counter_with_current(display_counter, previous), predecessor_exact, existing_target
 
@@ -2258,6 +2700,21 @@ class Scanner:
                         counter, predecessor_exact, existing_target = await self._poll_counter_for_target(
                             slug, meta
                         )
+                        if (
+                            predecessor_exact
+                            and store.settings.live_upgrades
+                            and not self._fast_fired
+                        ):
+                            hot_target = next_target(store.settings.target_numbers, counter.current)
+                            if hot_target is not None and counter.current == hot_target - 1:
+                                await self._fast_volley(
+                                    peer,
+                                    slug,
+                                    counter,
+                                    hot_target,
+                                    self._groups.get(slug, []),
+                                )
+                                break
                         counters[slug] = counter
                         exact_predecessors[slug] = predecessor_exact
                         exact_existing_targets[slug] = existing_target
@@ -2278,6 +2735,9 @@ class Scanner:
                             )
                             self._status_wakeup.set()
 
+                    if self.stop_event.is_set():
+                        break
+
                     exact_missed_changed = False
                     for slug, existing_target in exact_existing_targets.items():
                         if existing_target is None:
@@ -2286,7 +2746,7 @@ class Scanner:
                         if key not in self.notified_missed:
                             self.notified_missed.add(key)
                             await self.notify(
-                                f"⚠️ Цель <b>{existing_target}</b> для "
+                                f"⚠️ Выстрел <b>{existing_target}</b> для "
                                 f"<b>{html.escape(counters[slug].title)}</b> уже существует. "
                                 "Оплата не отправлена."
                             )
@@ -2300,7 +2760,7 @@ class Scanner:
                     if exact_missed_changed:
                         await store.save()
                         if not store.settings.target_numbers:
-                            runtime.last_error = "Цель уже существует; оплата не отправлена"
+                            runtime.last_error = "Выстрел уже существует; оплата не отправлена"
                             self.stop_event.set()
                             break
 
@@ -2309,9 +2769,9 @@ class Scanner:
                     if not future_targets:
                         store.settings.target_numbers = []
                         await store.save()
-                        runtime.last_error = f"Все цели уже прошли. Текущий номер: {current_max}"
+                        runtime.last_error = f"Все номера выстрела уже прошли. Текущий номер: {current_max}"
                         await self.notify(
-                            f"⚠️ Все цели уже прошли. Текущий номер: <b>{current_max}</b>. Сканер остановлен."
+                            f"⚠️ Все номера выстрела уже прошли. Текущий номер: <b>{current_max}</b>. Сканер остановлен."
                         )
                         self.stop_event.set()
                         break
@@ -2329,9 +2789,9 @@ class Scanner:
                         )
 
                         # LIVE may trigger only after the concrete target-1 slug
-                        # was resolved and the concrete target slug was confirmed
-                        # absent in the same cycle. Aggregate availability alone is
-                        # never sufficient for payment.
+                        # was resolved. FAST intentionally skips a second target
+                        # probe, so aggregate availability alone is still never
+                        # sufficient for payment.
                         if state.should_trigger and exact_predecessors.get(slug, False):
                             key = (slug, target)
                             if key in self.triggered:
@@ -2340,10 +2800,10 @@ class Scanner:
                                 self.triggered.add(key)
                                 await self.notify(
                                     f"🧪 DRY-RUN: <b>{html.escape(counter.title)}</b> сейчас #{counter.current}, "
-                                    f"следующий номер — цель <b>#{target}</b>. Оплата выключена, улучшение не отправлено."
+                                    f"следующий номер — выстрел <b>#{target}</b>. Оплата выключена, улучшение не отправлено."
                                 )
                             else:
-                                await self._upgrade(peer, slug, counter, target, group)
+                                await self._fast_volley(peer, slug, counter, target, group)
                                 self.triggered.add(key)
                             continue
 
@@ -2354,7 +2814,7 @@ class Scanner:
                             if key not in self.notified_missed:
                                 self.notified_missed.add(key)
                                 await self.notify(
-                                    f"⚠️ Цель <b>{missed_target}</b> для <b>{html.escape(counter.title)}</b> уже прошла. "
+                                    f"⚠️ Выстрел <b>{missed_target}</b> для <b>{html.escape(counter.title)}</b> уже прошёл. "
                                     f"Текущий номер: <b>{counter.current}</b>."
                                 )
 
@@ -2363,10 +2823,10 @@ class Scanner:
                             and state.distance is not None
                             and 1 < state.distance <= PREPARE_AHEAD
                         ):
-                            future_targets = sorted(
-                                {value for value in store.settings.target_numbers if value > counter.current}
+                            required = min(
+                                len(group),
+                                effective_volley_size(),
                             )
-                            required = min(len(group), len(future_targets))
                             for candidate in group[:required]:
                                 existing = self.prepared.get(candidate.saved_id)
                                 if existing is not None and time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS:
@@ -2423,7 +2883,8 @@ class Scanner:
                         self.rate.flood_count,
                     )
                     await self._maybe_write_diagnostics(force=True)
-                    await self.refresh_status_message(force=True)
+                    if not self._quiet_mode:
+                        await self.refresh_status_message(force=True)
                     await self._wait(max(0.0, float(exc.seconds)) + FLOOD_WAIT_EXTRA_MS / 1000.0)
 
                 except RateLimitActiveError as exc:
@@ -2444,7 +2905,8 @@ class Scanner:
                     runtime.sleep_ms = max(250.0, self.rate.current_interval_ms)
                     logger.exception("scanner_cycle_failed")
                     await self._maybe_write_diagnostics(force=True)
-                    await self.refresh_status_message(force=True)
+                    if not self._quiet_mode:
+                        await self.refresh_status_message(force=True)
                     await self._wait(runtime.sleep_ms / 1000.0)
 
         except asyncio.CancelledError:
@@ -2456,6 +2918,9 @@ class Scanner:
         finally:
             runtime.active = False
             runtime.started_at = None
+            self._leave_fast_quiet()
+            cluster_runtime.disarm()
+            cluster_runtime.notify_state_changed()
             self.task = None
             await self._maybe_write_diagnostics(force=True)
             await self.refresh_status_message(force=True)
@@ -2465,6 +2930,417 @@ class Scanner:
                 with contextlib.suppress(asyncio.CancelledError):
                     await monitor
             self.monitor_task = None
+
+    def launch_external_fire(self, *, campaign_id: str, shot: int, trigger: int) -> None:
+        """Schedule one follower shot from a validated collection-bound UDP packet.
+
+        This method runs inside the UDP callback and intentionally performs only
+        RAM checks plus task scheduling.  Logging and disk work happen in the
+        scheduled coroutine after the payment launch decision.
+        """
+        if self._fast_fired or not runtime.active or not store.settings.live_upgrades:
+            return
+        if int(shot) not in store.settings.target_numbers or int(trigger) != int(shot) - 1:
+            return
+        campaign_id = str(campaign_id).strip().lower()
+        slug = self._slug_by_campaign_id.get(campaign_id)
+        if slug is None:
+            return
+        peer = self._fast_peer
+        group = self._groups.get(slug)
+        meta = self._counter_meta.get(slug)
+        if peer is None or not group or meta is None:
+            return
+        if self._campaign_ids_by_slug.get(slug) != campaign_id:
+            return
+        counter = GiftCounter(
+            slug=slug,
+            title=meta.title,
+            current=int(trigger),
+            total=meta.total,
+            base_gift_id=meta.base_gift_id,
+        )
+        if self._fast_trigger_detected_at is None:
+            self._fast_trigger_detected_at = time.perf_counter()
+        asyncio.get_running_loop().create_task(
+            self._run_external_fire(peer, campaign_id, slug, counter, int(shot), group),
+            name=f"udp-fire-{SHOOTER_ID}-{campaign_id[:8]}-{shot}",
+        )
+
+    async def _run_external_fire(
+        self,
+        peer: Any,
+        campaign_id: str,
+        slug: str,
+        counter: GiftCounter,
+        target: int,
+        group: list[SavedGiftInfo],
+    ) -> None:
+        try:
+            await self._fast_volley(
+                peer,
+                slug,
+                counter,
+                target,
+                group,
+                campaign_id=campaign_id,
+                broadcast=False,
+                source="udp",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            runtime.last_error = f"UDP fire: {type(exc).__name__}: {exc}"
+            logger.exception(
+                "udp_fire_launch_failed shooter_id=%s campaign_id=%s slug=%s trigger=%s target=%s",
+                SHOOTER_ID,
+                campaign_id,
+                slug,
+                counter.current,
+                target,
+            )
+            record_cluster_event(
+                "udp_fire_launch_failed",
+                campaign_id=campaign_id,
+                slug=slug,
+                trigger=counter.current,
+                target=target,
+                error=f"{type(exc).__name__}: {exc}"[:300],
+            )
+            await self._maybe_write_diagnostics(force=True)
+
+    async def _execute_upgrade_fast_tracked(
+        self,
+        peer: Any,
+        candidate: SavedGiftInfo,
+        plan: PreparedUpgrade,
+        client: TelegramClient,
+    ) -> UpgradeOutcome:
+        # Fallback timestamp for test doubles or future service adapters.  The
+        # production MTProtoService overwrites it immediately before client().
+        plan.fast_send_started_ns = time.perf_counter_ns()
+        return await self.service.execute_upgrade_fast(
+            peer, candidate, plan, client=client
+        )
+
+    async def _fast_volley(
+        self,
+        peer: Any,
+        slug: str,
+        counter: GiftCounter,
+        target: int,
+        group: list[SavedGiftInfo],
+        *,
+        campaign_id: str | None = None,
+        broadcast: bool = True,
+        source: str = "local",
+    ) -> None:
+        """Launch prebuilt requests and relay FIRE without control-plane work.
+
+        A confirmed exact predecessor claims the one-shot latch immediately.  A
+        healthy detector creates its own payment tasks first and then broadcasts
+        the prebuilt HMAC packet with no ``await`` between those operations.  If
+        local RAM preflight fails, the detector still broadcasts so healthy peers
+        are not forced to wait for their own slower Telegram observation.
+        """
+        if self._fast_fired:
+            return
+
+        campaign_id = (campaign_id or self._campaign_ids_by_slug.get(slug) or "").strip().lower()
+        if not campaign_id or self._slug_by_campaign_id.get(campaign_id) != slug:
+            raise RuntimeError("FAST campaign_id не подготовлен для выбранной коллекции")
+
+        # Claim before any branch so duplicate local/UDP detections cannot create
+        # a second volley.  Everything below up to FIRE broadcast is RAM-only.
+        self._fast_fired = True
+        runtime.fast_fired = True
+        runtime.fast_fire_source = source
+        runtime.fast_campaign_id = campaign_id
+        self.triggered.add((slug, target))
+        self.stop_event.set()
+
+        volley_size = effective_volley_size()
+        runtime.fast_volley_size = volley_size
+        candidates: list[SavedGiftInfo] = []
+        plans: list[PreparedUpgrade] = []
+        tasks: list[asyncio.Task[UpgradeOutcome]] = []
+        local_error: BaseException | None = None
+        client = self._fast_client
+
+        try:
+            candidates = [
+                item
+                for item in group
+                if item.saved_id in store.settings.selected_saved_ids and item.can_upgrade
+            ][:volley_size]
+            if len(candidates) != volley_size:
+                raise RuntimeError(
+                    f"FAST-залп {volley_size} невозможен: доступно {len(candidates)} подарков"
+                )
+
+            for candidate in candidates:
+                plan = self.prepared.get(candidate.saved_id)
+                if (
+                    plan is None
+                    or plan.request is None
+                    or plan.saved_id != candidate.saved_id
+                    or time.monotonic() - plan.created_at > 540
+                ):
+                    raise RuntimeError(
+                        f"FAST-форма для saved_id={candidate.saved_id} не готова или устарела; "
+                        "оплата не отправлена"
+                    )
+                plan.fast_send_started_ns = None
+                plans.append(plan)
+
+            if client is None or not client.is_connected():
+                raise RuntimeError("FAST MTProto-соединение не готово; оплата не отправлена")
+            rate_limit.assert_available()
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            local_error = exc
+
+        launch_started = time.perf_counter()
+        if local_error is None and client is not None:
+            tasks = [
+                asyncio.create_task(
+                    self._execute_upgrade_fast_tracked(
+                        peer, candidate, plan, client
+                    ),
+                    name=f"fast-upgrade-{candidate.saved_id}",
+                )
+                for candidate, plan in zip(candidates, plans)
+            ]
+        launch_finished = time.perf_counter()
+        peers_sent = 0
+        if broadcast:
+            peers_sent = cluster_runtime.broadcast_fire_nowait(
+                campaign_id=campaign_id, shot=target, trigger=counter.current
+            )
+        runtime.fast_udp_peers_sent = peers_sent
+        runtime.fast_task_launch_ms = (launch_finished - launch_started) * 1000.0
+
+        if local_error is not None:
+            runtime.fast_trigger_to_submit_ms = None
+            runtime.fast_first_send_start_ms = None
+            runtime.fast_send_start_offsets_ms.clear()
+            runtime.last_error = f"{type(local_error).__name__}: {local_error}"
+            logger.error(
+                "fast_local_preflight_failed_relayed shooter_id=%s source=%s campaign_id=%s "
+                "slug=%s predecessor=%s target=%s volley=%s udp_peers_sent=%s error=%s",
+                SHOOTER_ID,
+                source,
+                campaign_id,
+                slug,
+                counter.current,
+                target,
+                volley_size,
+                peers_sent,
+                runtime.last_error,
+            )
+            record_cluster_event(
+                "fast_local_preflight_failed_relayed",
+                source=source,
+                campaign_id=campaign_id,
+                slug=slug,
+                predecessor=counter.current,
+                target=target,
+                volley=volley_size,
+                udp_peers_sent=peers_sent,
+                error=runtime.last_error[:300],
+            )
+            store.settings.live_upgrades = False
+            with contextlib.suppress(Exception):
+                await store.save()
+            with contextlib.suppress(Exception):
+                await self.notify(
+                    "⚠️ Локальный FAST-залп не отправлен, но сигнал другим стрелкам передан. "
+                    + html.escape(runtime.last_error[:300])
+                )
+            return
+
+        # Yield directly into gather: no logging, disk write or UI work occurs
+        # before the payment coroutines get their first event-loop turn. Once a
+        # financial request is launched, a manual Stop must not cancel it midway.
+        gather_future = asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            raw_results = await asyncio.shield(gather_future)
+        except asyncio.CancelledError:
+            raw_results = await gather_future
+
+        trigger_at = self._fast_trigger_detected_at
+        offsets: list[float | None] = []
+        for plan in plans:
+            if plan.fast_send_started_ns is None or trigger_at is None:
+                offsets.append(None)
+            else:
+                offsets.append(max(0.0, plan.fast_send_started_ns / 1_000_000.0 - trigger_at * 1000.0))
+        runtime.fast_send_start_offsets_ms = offsets
+        valid_offsets = [value for value in offsets if value is not None]
+        runtime.fast_first_send_start_ms = min(valid_offsets) if valid_offsets else None
+        runtime.fast_trigger_to_submit_ms = runtime.fast_first_send_start_ms
+
+        outcomes: list[UpgradeOutcome] = []
+        for result in raw_results:
+            if isinstance(result, UpgradeOutcome):
+                outcomes.append(result)
+            elif isinstance(result, BaseException):
+                outcomes.append(
+                    UpgradeOutcome(
+                        "unknown",
+                        detail=f"{type(result).__name__}: {result}; FAST-повтор не отправлялся",
+                    )
+                )
+            else:
+                outcomes.append(
+                    UpgradeOutcome("unknown", detail="Неожиданный результат FAST-залпа")
+                )
+        outcome_log = [
+            {
+                "saved_id": candidate.saved_id,
+                "status": outcome.status,
+                "actual_num": outcome.actual_num,
+                "send_start_ms": offsets[index],
+                "detail": (outcome.detail or "")[:180],
+            }
+            for index, (candidate, outcome) in enumerate(zip(candidates, outcomes))
+        ]
+        logger.warning(
+            "fast_volley_completed shooter_id=%s source=%s campaign_id=%s slug=%s predecessor=%s target=%s "
+            "volley=%s volley_limit=%s udp_peers_sent=%s first_send_start_ms=%.3f task_launch_ms=%.3f outcomes=%s",
+            SHOOTER_ID,
+            source,
+            campaign_id,
+            slug,
+            counter.current,
+            target,
+            volley_size,
+            effective_max_volley_size(),
+            peers_sent,
+            runtime.fast_first_send_start_ms or 0.0,
+            runtime.fast_task_launch_ms or 0.0,
+            json.dumps(outcome_log, ensure_ascii=False, separators=(",", ":")),
+        )
+        record_cluster_event(
+            "fast_volley_completed",
+            source=source,
+            campaign_id=campaign_id,
+            slug=slug,
+            predecessor=counter.current,
+            target=target,
+            volley=volley_size,
+            volley_limit=effective_max_volley_size(),
+            udp_peers_sent=peers_sent,
+            first_send_start_ms=runtime.fast_first_send_start_ms,
+            task_launch_ms=runtime.fast_task_launch_ms,
+            send_start_offsets_ms=offsets,
+            outcomes=outcome_log,
+        )
+        await self._finish_fast_volley(candidates, counter, target, outcomes)
+
+    async def _finish_fast_volley(
+        self,
+        candidates: list[SavedGiftInfo],
+        counter: GiftCounter,
+        target: int,
+        outcomes: list[UpgradeOutcome],
+    ) -> None:
+        """Persist and report the volley only after every first submission ends."""
+        confirmed: list[tuple[SavedGiftInfo, UpgradeOutcome]] = []
+        pending: list[tuple[SavedGiftInfo, UpgradeOutcome]] = []
+        failed: list[tuple[SavedGiftInfo, UpgradeOutcome]] = []
+
+        for candidate, outcome in zip(candidates, outcomes):
+            if outcome.status == "confirmed" and outcome.actual_num is not None:
+                confirmed.append((candidate, outcome))
+                with contextlib.suppress(ValueError):
+                    store.settings.selected_saved_ids.remove(candidate.saved_id)
+                self.prepared.pop(candidate.saved_id, None)
+            elif outcome.status in {"verification", "unknown"}:
+                pending.append((candidate, outcome))
+            else:
+                failed.append((candidate, outcome))
+
+        if confirmed:
+            highest = max(int(outcome.actual_num or 0) for _candidate, outcome in confirmed)
+            store.settings.target_numbers = [
+                value for value in store.settings.target_numbers if value > highest
+            ]
+            got = sorted(int(outcome.actual_num or 0) for _candidate, outcome in confirmed)
+            runtime.last_success = (
+                f"{counter.title}: выстрел {target}, FAST-залп получил "
+                + ", ".join(f"#{number}" for number in got)
+            )
+            runtime.last_error = None
+
+        holds = set(store.settings.payment_hold_saved_ids)
+        verification_url: str | None = None
+        for candidate, outcome in pending:
+            holds.add(candidate.saved_id)
+            store.settings.payment_hold_targets[str(candidate.saved_id)] = int(target)
+            if outcome.verification_url and verification_url is None:
+                verification_url = outcome.verification_url
+        store.settings.payment_hold_saved_ids = sorted(holds)
+        if pending:
+            store.settings.payment_hold_reason = (
+                f"FAST-залп отправлен, но результат {len(pending)} платежей не подтверждён; "
+                "автоматического повтора не было"
+            )
+            store.settings.payment_verification_url = verification_url
+            runtime.pending_verification_url = verification_url
+        elif not store.settings.payment_hold_saved_ids:
+            store.settings.payment_hold_reason = None
+            store.settings.payment_verification_url = None
+            runtime.pending_verification_url = None
+
+        store.settings.live_upgrades = False
+        if not confirmed:
+            details = [outcome.detail or outcome.status for _candidate, outcome in pending + failed]
+            runtime.last_error = "; ".join(details)[:500] or "FAST-залп не подтверждён"
+
+        save_error: Exception | None = None
+        try:
+            await store.save()
+        except Exception as exc:
+            save_error = exc
+            logger.exception("fast_volley_state_save_failed")
+
+        lines = [
+            f"⚡ <b>{APP_NAME} {APP_VERSION}: залп завершён</b>",
+            f"Подарок: <b>{html.escape(counter.title)}</b>",
+            f"Выстрел: <b>#{target}</b>",
+            f"Выстрелов: <b>{len(candidates)}</b>",
+            (
+                f"Реакция после точного #{target - 1}: "
+                f"<b>{runtime.fast_trigger_to_submit_ms:.3f} мс</b>"
+                if runtime.fast_trigger_to_submit_ms is not None
+                else "Реакция: —"
+            ),
+        ]
+        for candidate, outcome in zip(candidates, outcomes):
+            if outcome.status == "confirmed" and outcome.actual_num is not None:
+                mark = "✅" if outcome.actual_num == target else "⚠️"
+                lines.append(
+                    f"{mark} <code>{candidate.saved_id}</code> → <b>#{outcome.actual_num}</b>"
+                )
+            elif outcome.status == "verification":
+                lines.append(f"🔐 <code>{candidate.saved_id}</code> → требуется подтверждение")
+            elif outcome.status == "unknown":
+                lines.append(f"❔ <code>{candidate.saved_id}</code> → результат не подтверждён")
+            else:
+                lines.append(
+                    f"❌ <code>{candidate.saved_id}</code> → "
+                    f"{html.escape((outcome.detail or 'ошибка')[:180])}"
+                )
+        if pending:
+            lines.append(
+                "⚠️ Неподтверждённые экземпляры поставлены на сверку после залпа; "
+                "повторная оплата не отправляется."
+            )
+        if save_error is not None:
+            lines.append("⚠️ Не удалось сохранить итог на диск; проверь подарки вручную перед перезапуском.")
+        await self.notify("\n".join(lines))
 
     async def _upgrade(
         self,
@@ -2498,7 +3374,7 @@ class Scanner:
             store.settings.payment_hold_saved_ids = sorted(holds)
             store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
             store.settings.payment_hold_reason = (
-                f"LIVE-запрос отправляется: {counter.title}, цель #{target}, saved_id={chosen.saved_id}"
+                f"LIVE-запрос отправляется: {counter.title}, выстрел #{target}, saved_id={chosen.saved_id}"
             )
             store.settings.payment_verification_url = None
             try:
@@ -2563,7 +3439,7 @@ class Scanner:
     ) -> None:
         if outcome.status == "confirmed" and outcome.actual_num is not None:
             actual_num = outcome.actual_num
-            runtime.last_success = f"{counter.title}: цель {target}, получен {actual_num}"
+            runtime.last_success = f"{counter.title}: выстрел {target}, получен {actual_num}"
             runtime.last_error = None
             runtime.pending_verification_url = None
             if actual_num == target:
@@ -2576,7 +3452,7 @@ class Scanner:
             await self.notify(
                 f"{icon} <b>{html.escape(verdict)}</b>\n"
                 f"Подарок: <b>{html.escape(counter.title)}</b>\n"
-                f"Цель: <b>#{target}</b>\n"
+                f"Выстрел: <b>#{target}</b>\n"
                 f"Получен: <b>#{actual_num}</b>"
                 + (f"\nSlug: <code>{html.escape(outcome.actual_slug)}</code>" if outcome.actual_slug else "")
             )
@@ -2691,7 +3567,7 @@ class Scanner:
         if outcome.status == "verification":
             text = (
                 "⚠️ <b>Нужно подтверждение Telegram</b>\n"
-                "Подарок и цель сохранены, повторная оплата не отправлялась."
+                "Подарок и выстрел сохранены, повторная оплата не отправлялась."
             )
             if outcome.verification_url:
                 text += f"\nОткрой: <code>{html.escape(outcome.verification_url)}</code>"
@@ -2699,13 +3575,13 @@ class Scanner:
             text = (
                 "❌ <b>Улучшение не выполнено</b>\n"
                 f"Причина: <code>{html.escape(detail[:500])}</code>\n"
-                "Подарок и цель сохранены."
+                "Подарок и выстрел сохранены."
             )
         else:
             text = (
                 "⚠️ <b>Результат улучшения не подтверждён</b>\n"
                 f"Детали: <code>{html.escape(detail[:500])}</code>\n"
-                "Бот остановлен и не отправляет повторную оплату. Подарок и цель сохранены."
+                "Бот остановлен и не отправляет повторную оплату. Подарок и выстрел сохранены."
             )
         if save_error is not None:
             text += "\n⚠️ Дополнительно не удалось обновить файл настроек; защитная блокировка до отправки сохранена."
@@ -3196,12 +4072,782 @@ class StressTester:
 
 
 _bot_instance: Bot | None = None
+_dispatcher_instance: Dispatcher | None = None
 scanner = Scanner(mtproto, lambda: _bot_instance)
 stress_tester = StressTester(mtproto, lambda: _bot_instance)
 
 
+class ClusterRuntime:
+    """Control-plane status plus local UDP fire transport.
+
+    Status work is deliberately outside the scanner hot path. The only hot-path
+    call is ``broadcast_fire_nowait`` after local payment tasks are created.
+    """
+
+    def __init__(self) -> None:
+        self.bus: ClusterBus | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.stop_event = asyncio.Event()
+        self.wakeup = asyncio.Event()
+        self.aggregate_wakeup = asyncio.Event()
+        self.remote_statuses: dict[int, ShooterStatus] = {}
+        self.last_local_status: ShooterStatus | None = None
+        self.last_ready = False
+        initial_read = provision_store.read_config()
+        self.applied_config: ClusterConfig | None = initial_read.config if initial_read.valid else None
+        self.config_gate = StableConfigGate(
+            current=self.applied_config,
+            required_reads=CLUSTER_CONFIG_STABLE_READS,
+            require_new_generation=True,
+        )
+        self.config_check_requested = False
+        self.last_config_error = ""
+        self.deactivation_in_progress = False
+        self.deactivation_quiesce_task: asyncio.Task[None] | None = None
+        self.last_quiesced_generation = 0
+        self.aggregate_updater = StatusMessageUpdater(
+            lambda: _bot_instance,
+            name="cluster",
+            min_interval_seconds=CLUSTER_STATUS_INTERVAL_SECONDS,
+            urgent_min_interval_seconds=CLUSTER_STATUS_INTERVAL_SECONDS,
+        )
+
+    async def start(self) -> None:
+        self.stop_event.clear()
+        if FIRE_SECRET:
+            self.bus = ClusterBus(
+                shooter_id=SHOOTER_ID,
+                secret=FIRE_SECRET,
+                port=FIRE_PORT,
+                provision=provision_store,
+                on_fire=self._on_fire,
+                on_status=self._on_status,
+                on_config_notice=self._on_config_notice,
+            )
+            await self.bus.start()
+            if self.applied_config is not None:
+                await self.bus.refresh_config_and_peers(self.applied_config)
+            logger.info(
+                "cluster_udp_started shooter_id=%s port=%s active_shooters=%s resolved_peers=%s expected_peers=%s fully_connected=%s",
+                SHOOTER_ID,
+                FIRE_PORT,
+                self.bus.config.active_shooters,
+                sorted(self.bus.resolved_peer_ids),
+                sorted(self.bus.expected_peer_ids),
+                self.bus.fully_connected,
+            )
+        else:
+            logger.warning("cluster_udp_disabled FIRE_SECRET_is_empty shooter_id=%s", SHOOTER_ID)
+        self.task = asyncio.create_task(self._loop(), name=f"cluster-runtime-{SHOOTER_ID}")
+
+    def _on_config_notice(self, generation: int, active_shooters: int) -> None:
+        """RAM-only UDP callback; durable audit is deferred off the event loop."""
+        asyncio.get_running_loop().create_task(
+            asyncio.to_thread(
+                self._log_config_notice_received, generation, active_shooters
+            ),
+            name=f"config-notice-log-{SHOOTER_ID}",
+        )
+        current_generation = self.applied_config.generation if self.applied_config else 0
+        if (
+            not PRIMARY_SHOOTER
+            and generation > current_generation
+            and generation > self.last_quiesced_generation
+            and (self.deactivation_quiesce_task is None or self.deactivation_quiesce_task.done())
+        ):
+            self.deactivation_quiesce_task = asyncio.create_task(
+                self._quiesce_for_config_notice(generation, active_shooters),
+                name=f"cluster-quiesce-{SHOOTER_ID}",
+            )
+        self.config_check_requested = True
+        self.wakeup.set()
+
+
+    @staticmethod
+    def _log_config_notice_received(generation: int, active_shooters: int) -> None:
+        logger.info(
+            "cluster_config_notice_received shooter_id=%s generation=%s active_shooters=%s",
+            SHOOTER_ID,
+            generation,
+            active_shooters,
+        )
+        record_cluster_event(
+            "cluster_config_notice_received",
+            generation=generation,
+            active_shooters=active_shooters,
+        )
+
+    async def _quiesce_for_config_notice(
+        self,
+        generation: int,
+        active_shooters: int,
+    ) -> None:
+        """Disarm a participant immediately, but never sleep on UDP alone."""
+        if generation <= self.last_quiesced_generation:
+            return
+        self.last_quiesced_generation = generation
+        removed = active_shooters < SHOOTER_ID
+        logger.warning(
+            "cluster_config_notice_quiesce shooter_id=%s generation=%s active_shooters=%s removed=%s",
+            SHOOTER_ID,
+            generation,
+            active_shooters,
+            removed,
+        )
+        record_cluster_event(
+            "cluster_config_notice_quiesce",
+            generation=generation,
+            active_shooters=active_shooters,
+            removed=removed,
+        )
+        with contextlib.suppress(Exception):
+            if runtime.active:
+                await scanner.stop("cluster_config_notice")
+        with contextlib.suppress(Exception):
+            if runtime.stress_active:
+                await stress_tester.stop("cluster_config_notice")
+        store.settings.live_upgrades = False
+        scanner.prepared.clear()
+        self.disarm()
+        with contextlib.suppress(Exception):
+            await store.save()
+        safe_save_lifecycle(
+            SHOOTER_ID,
+            state="deactivating" if removed else "reconfiguring",
+            generation=generation,
+            active_shooters=active_shooters,
+            reason="awaiting_stable_config",
+            version=APP_VERSION,
+            pid=os.getpid(),
+        )
+
+    async def _apply_config(
+        self,
+        config: ClusterConfig,
+        *,
+        trusted: bool = False,
+        broadcast_notice: bool = False,
+    ) -> None:
+        previous = self.applied_config or (self.bus.config if self.bus is not None else ClusterConfig())
+        notice_sent = 0
+        if broadcast_notice and self.bus is not None:
+            notice_sent = self.bus.broadcast_config_notice_nowait(config)
+            logger.info(
+                "cluster_config_notice_sent generation=%s active_shooters=%s peers=%s",
+                config.generation,
+                config.active_shooters,
+                notice_sent,
+            )
+            record_cluster_event(
+                "cluster_config_notice_sent",
+                generation=config.generation,
+                active_shooters=config.active_shooters,
+                peers=notice_sent,
+            )
+        self.applied_config = config
+        self.config_gate.current = config
+        if self.bus is not None:
+            await self.bus.refresh_config_and_peers(config)
+        if PRIMARY_SHOOTER:
+            self.remote_statuses = {
+                shooter_id: status
+                for shooter_id, status in self.remote_statuses.items()
+                if shooter_id <= config.active_shooters
+            }
+        if SHOOTER_ID <= config.active_shooters:
+            safe_save_lifecycle(
+                SHOOTER_ID,
+                state="active",
+                generation=config.generation,
+                active_shooters=config.active_shooters,
+                reason="config_applied",
+                version=APP_VERSION,
+                pid=os.getpid(),
+            )
+        logger.info(
+            "cluster_config_applied shooter_id=%s previous_generation=%s generation=%s previous_active_shooters=%s active_shooters=%s trusted=%s",
+            SHOOTER_ID,
+            previous.generation,
+            config.generation,
+            previous.active_shooters,
+            config.active_shooters,
+            trusted,
+        )
+        record_cluster_event(
+            "cluster_config_applied",
+            previous_generation=previous.generation,
+            generation=config.generation,
+            previous_active_shooters=previous.active_shooters,
+            active_shooters=config.active_shooters,
+            trusted=trusted,
+        )
+        self.notify_state_changed()
+
+    async def refresh_config(
+        self,
+        config: ClusterConfig | None = None,
+        *,
+        broadcast_notice: bool = False,
+    ) -> None:
+        if config is None:
+            result = provision_store.read_config()
+            if not result.valid:
+                logger.warning(
+                    "cluster_config_refresh_rejected shooter_id=%s error=%s",
+                    SHOOTER_ID,
+                    result.error,
+                )
+                return
+            config = result.config
+        await self._apply_config(
+            config,
+            trusted=True,
+            broadcast_notice=broadcast_notice,
+        )
+
+    async def _graceful_deactivate(self, config: ClusterConfig) -> None:
+        global _dispatcher_instance
+        if self.deactivation_in_progress:
+            return
+        self.deactivation_in_progress = True
+        logger.warning(
+            "cluster_participant_deactivation_started shooter_id=%s active_shooters=%s generation=%s",
+            SHOOTER_ID,
+            config.active_shooters,
+            config.generation,
+        )
+        record_cluster_event(
+            "cluster_participant_deactivation_started",
+            active_shooters=config.active_shooters,
+            generation=config.generation,
+        )
+        safe_save_lifecycle(
+            SHOOTER_ID,
+            state="deactivating",
+            generation=config.generation,
+            active_shooters=config.active_shooters,
+            reason="removed_from_active_set",
+            version=APP_VERSION,
+            pid=os.getpid(),
+        )
+        with contextlib.suppress(Exception):
+            if runtime.active:
+                await scanner.stop("cluster_deactivated")
+        with contextlib.suppress(Exception):
+            if runtime.stress_active:
+                await stress_tester.stop("cluster_deactivated")
+        store.settings.live_upgrades = False
+        scanner.prepared.clear()
+        self.disarm()
+        with contextlib.suppress(Exception):
+            await store.save()
+        with contextlib.suppress(Exception):
+            await self._publish_local_status()
+        safe_save_lifecycle(
+            SHOOTER_ID,
+            state="sleeping",
+            generation=config.generation,
+            active_shooters=config.active_shooters,
+            reason="deactivation_ack",
+            version=APP_VERSION,
+            pid=os.getpid(),
+        )
+        logger.warning(
+            "cluster_participant_deactivated shooter_id=%s active_shooters=%s generation=%s",
+            SHOOTER_ID,
+            config.active_shooters,
+            config.generation,
+        )
+        record_cluster_event(
+            "cluster_participant_deactivated",
+            active_shooters=config.active_shooters,
+            generation=config.generation,
+        )
+        dispatcher = _dispatcher_instance
+        if dispatcher is not None:
+            try:
+                await asyncio.wait_for(dispatcher.stop_polling(), timeout=3.0)
+                return
+            except Exception as exc:
+                logger.error("cluster_deactivation_stop_polling_failed error=%s", exc)
+        os._exit(75)
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+        self.wakeup.set()
+        self.aggregate_wakeup.set()
+        task = self.task
+        if task and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self.task = None
+        quiesce_task = self.deactivation_quiesce_task
+        if quiesce_task and quiesce_task is not asyncio.current_task() and not quiesce_task.done():
+            quiesce_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await quiesce_task
+        self.deactivation_quiesce_task = None
+        if self.bus is not None:
+            self.bus.close()
+        self.bus = None
+
+    def notify_state_changed(self) -> None:
+        self.wakeup.set()
+
+    def arm(self, campaign_id: str, shot: int) -> None:
+        if self.bus is not None:
+            self.bus.arm(campaign_id, int(shot))
+
+    def disarm(self) -> None:
+        if self.bus is not None:
+            self.bus.disarm()
+
+    def broadcast_fire_nowait(
+        self, *, campaign_id: str, shot: int, trigger: int
+    ) -> int:
+        if self.bus is None:
+            return 0
+        return self.bus.broadcast_fire_nowait(
+            campaign_id=campaign_id, shot=shot, trigger=trigger
+        )
+
+    def _on_fire(self, campaign_id: str, shot: int, trigger: int) -> None:
+        scanner.launch_external_fire(
+            campaign_id=campaign_id, shot=shot, trigger=trigger
+        )
+
+    async def verify_active_peers(
+        self, *, timeout_seconds: float | None = None
+    ) -> dict[int, float | None]:
+        """One-shot authenticated liveness check used before LIVE/Start.
+
+        No background heartbeat is introduced.  Results stay in ClusterBus RAM
+        and are reused by readiness cards until the cluster generation changes.
+        """
+        config = self.applied_config or (self.bus.config if self.bus is not None else ClusterConfig())
+        if self.bus is None or not self.bus.ready:
+            raise RuntimeError("UDP-сокет между стрелками не готов")
+        if not self.bus.fully_connected:
+            missing = sorted(self.bus.expected_peer_ids - self.bus.resolved_peer_ids)
+            raise RuntimeError(
+                "Не найдены UDP-адреса стрелков: " + ", ".join(f"Hunter {value}" for value in missing)
+            )
+        timeout = (
+            max(0.05, CLUSTER_PING_TIMEOUT_MS / 1000.0)
+            if timeout_seconds is None
+            else max(0.05, float(timeout_seconds))
+        )
+        results = await self.bus.ping_active_shooters(timeout_seconds=timeout)
+        missing = [
+            shooter_id
+            for shooter_id in range(1, config.active_shooters + 1)
+            if results.get(shooter_id) is None
+        ]
+        logger.info(
+            "cluster_preflight_ping generation=%s active_shooters=%s results=%s",
+            config.generation,
+            config.active_shooters,
+            json.dumps(results, ensure_ascii=False, separators=(",", ":")),
+        )
+        record_cluster_event(
+            "cluster_preflight_ping",
+            generation=config.generation,
+            active_shooters=config.active_shooters,
+            results=results,
+            missing=missing,
+        )
+        if missing:
+            raise RuntimeError(
+                "Не ответили по UDP: " + ", ".join(f"Hunter {value}" for value in missing)
+            )
+        return results
+
+    def _on_status(self, status: ShooterStatus) -> None:
+        """RAM-only UDP callback; file logging is deferred to a worker thread."""
+        if not PRIMARY_SHOOTER:
+            return
+        config = self.applied_config
+        expected_campaign = next(iter(scanner._campaign_ids_by_slug.values()), None)
+        reject_reason: str | None = None
+        if config is None:
+            reject_reason = "config_missing"
+        elif status.shooter_id == 1 or status.shooter_id > config.active_shooters:
+            reject_reason = "shooter_outside_active_set"
+        elif status.generation != config.generation:
+            reject_reason = "generation_mismatch"
+        elif expected_campaign and status.campaign_id != expected_campaign:
+            reject_reason = "campaign_mismatch"
+        if reject_reason is not None:
+            asyncio.get_running_loop().create_task(
+                asyncio.to_thread(
+                    self._log_status_rejected,
+                    status,
+                    reject_reason,
+                    config,
+                    expected_campaign,
+                ),
+                name=f"status-reject-log-{status.shooter_id}",
+            )
+            return
+        previous = self.remote_statuses.get(status.shooter_id)
+        changed = previous is None or previous.payload() != status.payload()
+        was_ready = bool(previous and previous.ready)
+        self.remote_statuses[status.shooter_id] = status
+        if changed:
+            asyncio.get_running_loop().create_task(
+                asyncio.to_thread(
+                    self._log_remote_status_change, status, was_ready
+                ),
+                name=f"status-change-log-{status.shooter_id}",
+            )
+        self.aggregate_wakeup.set()
+
+    @staticmethod
+    def _log_status_rejected(
+        status: ShooterStatus,
+        reason: str,
+        config: ClusterConfig | None,
+        expected_campaign: str | None,
+    ) -> None:
+        logger.warning(
+            "cluster_status_rejected shooter_id=%s reason=%s status_generation=%s "
+            "active_generation=%s status_campaign=%s expected_campaign=%s",
+            status.shooter_id,
+            reason,
+            status.generation,
+            config.generation if config else 0,
+            status.campaign_id,
+            expected_campaign,
+        )
+        record_cluster_event(
+            "cluster_status_rejected",
+            participant_id=status.shooter_id,
+            reason=reason,
+            status_generation=status.generation,
+            active_generation=config.generation if config else 0,
+            status_campaign=status.campaign_id,
+            expected_campaign=expected_campaign,
+        )
+
+    @staticmethod
+    def _log_remote_status_change(status: ShooterStatus, was_ready: bool) -> None:
+        logger.info(
+            "cluster_remote_status_changed shooter_id=%s generation=%s campaign_id=%s "
+            "bot=%s mtproto=%s gift=%s shot=%s plan=%s signal=%s live=%s active=%s ready=%s",
+            status.shooter_id,
+            status.generation,
+            status.campaign_id,
+            status.bot,
+            status.mtproto,
+            status.gift,
+            status.shot,
+            status.plan,
+            status.signal,
+            status.live,
+            status.active,
+            status.ready,
+        )
+        record_cluster_event(
+            "cluster_remote_status_changed",
+            participant_id=status.shooter_id,
+            generation=status.generation,
+            campaign_id=status.campaign_id,
+            status=status.payload(),
+            ready=status.ready,
+        )
+        if status.ready and not was_ready:
+            logger.info("cluster_remote_ready shooter_id=%s shot=%s", status.shooter_id, status.shot)
+            record_cluster_event(
+                "cluster_remote_ready",
+                participant_id=status.shooter_id,
+                shot=status.shot,
+                generation=status.generation,
+                campaign_id=status.campaign_id,
+            )
+        elif was_ready and not status.ready:
+            logger.warning("cluster_remote_not_ready shooter_id=%s", status.shooter_id)
+            record_cluster_event(
+                "cluster_remote_not_ready", participant_id=status.shooter_id
+            )
+
+    async def local_status(self) -> ShooterStatus:
+        if runtime.active:
+            authorized = True
+        elif mtproto._authorized is not None:
+            authorized = bool(mtproto._authorized)
+        else:
+            authorized = await mtproto.is_authorized()
+        shot = min(store.settings.target_numbers) if store.settings.target_numbers else None
+        required = effective_volley_size()
+        plan_ready = required > 0 and len(scanner.prepared) >= required
+        config = self.applied_config or getattr(self.bus, "config", None) or ClusterConfig(
+            active_shooters=active_shooter_count(), configured=True, generation=1
+        )
+        campaign_id = next(iter(scanner._campaign_ids_by_slug.values()), None)
+        return ShooterStatus(
+            shooter_id=SHOOTER_ID,
+            bot=_bot_instance is not None,
+            mtproto=authorized,
+            gift=bool(store.settings.selected_saved_ids),
+            shot=shot,
+            plan=plan_ready,
+            signal=(
+                bool(getattr(self.bus, "peers_ready", getattr(self.bus, "fully_connected", False)))
+                if self.bus is not None else config.active_shooters == 1
+            ),
+            live=bool(store.settings.live_upgrades),
+            active=bool(runtime.active),
+            generation=config.generation,
+            campaign_id=campaign_id,
+            updated_monotonic=time.monotonic(),
+        )
+
+    @staticmethod
+    def _mark(value: bool) -> str:
+        return "✅" if value else "❌"
+
+    def shooter_card(self, status: ShooterStatus, *, title: str | None = None) -> str:
+        shot = f"✅ #{status.shot}" if status.shot is not None else "❌"
+        lines = [
+            title or f"Hunter {status.shooter_id}",
+            f"BOT:       {self._mark(status.bot)}",
+            f"MTProto:   {self._mark(status.mtproto)}",
+            f"Подарок:   {self._mark(status.gift)}",
+            f"Выстрел:   {shot}",
+            f"План:      {self._mark(status.plan)}",
+            f"Сигнал:    {self._mark(status.signal)} UDP",
+            f"LIVE:      {self._mark(status.live and status.active)}",
+        ]
+        return "\n".join(lines)
+
+    async def aggregate_text(self) -> str:
+        config = self.applied_config or ClusterConfig()
+        local = await self.local_status()
+        statuses: dict[int, ShooterStatus] = {1: local} if PRIMARY_SHOOTER else {}
+        statuses.update(self.remote_statuses)
+        now = time.monotonic()
+        lines = [
+            f"🎯 <b>Стрелки {APP_VERSION}</b>",
+            f"Выбрано стрелков: <b>{config.active_shooters}</b>",
+            "",
+        ]
+        ready_count = 0
+        for shooter_id in range(1, config.active_shooters + 1):
+            status = statuses.get(shooter_id)
+            if status is None or (shooter_id != 1 and now - status.updated_monotonic > CLUSTER_STALE_SECONDS):
+                lines.extend([
+                    f"Hunter {shooter_id}",
+                    "BOT:       ❌",
+                    "MTProto:   ❌",
+                    "Подарок:   ❌",
+                    "Выстрел:   ❌",
+                    "План:      ❌",
+                    "Сигнал:    ❌ UDP",
+                    "LIVE:      ❌",
+                    "",
+                ])
+                continue
+            if status.ready:
+                ready_count += 1
+            lines.append(self.shooter_card(status))
+            lines.append("")
+        if ready_count == config.active_shooters:
+            lines.append(f"🟢 <b>ПОЛНОСТЬЮ ГОТОВО: {ready_count}/{config.active_shooters}</b>")
+        else:
+            lines.append(f"🟡 <b>ГОТОВО: {ready_count}/{config.active_shooters}</b>")
+        return "\n".join(lines).rstrip()
+
+    async def _send_ready_transition(self, status: ShooterStatus) -> None:
+        if status.ready and not self.last_ready:
+            logger.info("cluster_local_ready shooter_id=%s shot=%s", SHOOTER_ID, status.shot)
+            record_cluster_event("cluster_local_ready", shot=status.shot)
+            bot = _bot_instance
+            owner = store.settings.owner_user_id
+            if bot is not None and owner is not None:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        owner,
+                        self.shooter_card(
+                            status, title=f"🟢 HUNTER {SHOOTER_ID} ПОЛНОСТЬЮ ГОТОВ"
+                        ),
+                    )
+        elif self.last_ready and not status.ready:
+            logger.warning("cluster_local_not_ready shooter_id=%s", SHOOTER_ID)
+            record_cluster_event("cluster_local_not_ready")
+        self.last_ready = status.ready
+
+    async def _publish_local_status(self) -> None:
+        status = await self.local_status()
+        changed = self.last_local_status is None or status.payload() != self.last_local_status.payload()
+        self.last_local_status = status
+        if self.bus is not None:
+            self.bus.send_status_nowait(status)
+        elif PRIMARY_SHOOTER:
+            self._on_status(status)
+        if changed:
+            logger.info(
+                "cluster_local_status_changed shooter_id=%s bot=%s mtproto=%s gift=%s shot=%s plan=%s signal=%s live=%s active=%s ready=%s",
+                status.shooter_id,
+                status.bot,
+                status.mtproto,
+                status.gift,
+                status.shot,
+                status.plan,
+                status.signal,
+                status.live,
+                status.active,
+                status.ready,
+            )
+            record_cluster_event(
+                "cluster_local_status_changed",
+                status=status.payload(),
+                ready=status.ready,
+            )
+            await self._send_ready_transition(status)
+            if PRIMARY_SHOOTER:
+                self.aggregate_wakeup.set()
+
+    async def _refresh_aggregate_card(self) -> None:
+        if not PRIMARY_SHOOTER:
+            return
+        config = provision_store.load_config()
+        if not config.configured:
+            return
+        owner = store.settings.owner_user_id
+        bot = _bot_instance
+        if owner is None or bot is None:
+            return
+        text = await self.aggregate_text()
+        if self.aggregate_updater.message_id is None:
+            replacement = await bot.send_message(owner, text)
+            self.aggregate_updater.attach(owner, int(replacement.message_id))
+            self.aggregate_updater._last_text = text
+            self.aggregate_updater._last_edit_at = time.monotonic()
+            return
+        await self.aggregate_updater.update(text, force=True)
+
+    async def _loop(self) -> None:
+        next_status = 0.0
+        next_peer_refresh = 0.0
+        next_config_poll = 0.0
+        next_aggregate = 0.0
+        try:
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                timeout = max(0.1, min(1.0, next_status - now if next_status > now else 0.0))
+                try:
+                    await asyncio.wait_for(self.wakeup.wait(), timeout=timeout)
+                    self.wakeup.clear()
+                    next_status = 0.0
+                except asyncio.TimeoutError:
+                    pass
+
+                now = time.monotonic()
+                if self.config_check_requested:
+                    self.config_check_requested = False
+                    next_config_poll = 0.0
+                if now >= next_config_poll:
+                    # Shared-volume reads are control-plane work. Keep them off the
+                    # asyncio loop so a slow filesystem cannot add jitter to the
+                    # scanner/payment path.
+                    result = await asyncio.to_thread(provision_store.read_config)
+                    if not result.valid:
+                        error = result.error or "unknown"
+                        if error != self.last_config_error:
+                            self.last_config_error = error
+                            logger.error(
+                                "cluster_config_invalid_ignored shooter_id=%s error=%s",
+                                SHOOTER_ID,
+                                error,
+                            )
+                            record_cluster_event(
+                                "cluster_config_invalid_ignored",
+                                error=error,
+                                retained_generation=(self.applied_config.generation if self.applied_config else 0),
+                                retained_active_shooters=(self.applied_config.active_shooters if self.applied_config else 1),
+                            )
+                    else:
+                        self.last_config_error = ""
+                    accepted = self.config_gate.observe(result)
+                    if accepted is not None:
+                        if not PRIMARY_SHOOTER and accepted.generation > self.last_quiesced_generation:
+                            await self._quiesce_for_config_notice(
+                                accepted.generation,
+                                accepted.active_shooters,
+                            )
+                        await self._apply_config(accepted)
+                        if not PRIMARY_SHOOTER and accepted.active_shooters < SHOOTER_ID:
+                            await self._graceful_deactivate(accepted)
+                            return
+                    next_config_poll = now + CLUSTER_CONFIG_POLL_SECONDS
+
+                if self.bus is not None and now >= next_peer_refresh:
+                    before = (
+                        self.bus.config.active_shooters,
+                        self.bus.config.generation,
+                        tuple(sorted(self.bus.resolved_peer_ids)),
+                    )
+                    await self.bus.refresh_config_and_peers(self.applied_config or self.bus.config)
+                    after = (
+                        self.bus.config.active_shooters,
+                        self.bus.config.generation,
+                        tuple(sorted(self.bus.resolved_peer_ids)),
+                    )
+                    if after != before:
+                        logger.info(
+                            "cluster_peers_changed shooter_id=%s active_shooters=%s generation=%s resolved_peers=%s expected_peers=%s fully_connected=%s",
+                            SHOOTER_ID,
+                            self.bus.config.active_shooters,
+                            self.bus.config.generation,
+                            sorted(self.bus.resolved_peer_ids),
+                            sorted(self.bus.expected_peer_ids),
+                            self.bus.fully_connected,
+                        )
+                    next_peer_refresh = now + CLUSTER_STATUS_INTERVAL_SECONDS
+
+                if now >= next_status:
+                    await self._publish_local_status()
+                    next_status = now + CLUSTER_STATUS_INTERVAL_SECONDS
+
+                if PRIMARY_SHOOTER and self.aggregate_wakeup.is_set():
+                    self.aggregate_wakeup.clear()
+                    next_aggregate = min(next_aggregate or now, now)
+                if PRIMARY_SHOOTER and now >= next_aggregate:
+                    await self._refresh_aggregate_card()
+                    next_aggregate = now + CLUSTER_STATUS_INTERVAL_SECONDS
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.exception("cluster_runtime_failed error=%s", exc)
+            if not self.stop_event.is_set():
+                config = self.applied_config or provision_store.load_config()
+                safe_save_lifecycle(
+                    SHOOTER_ID,
+                    state="error",
+                    generation=config.generation,
+                    active_shooters=config.active_shooters,
+                    reason="cluster_runtime_failed",
+                    version=APP_VERSION,
+                    pid=os.getpid(),
+                    error_type=type(exc).__name__,
+                )
+                record_cluster_event(
+                    "cluster_runtime_failed",
+                    generation=config.generation,
+                    active_shooters=config.active_shooters,
+                    error_type=type(exc).__name__,
+                )
+                os._exit(71)
+
+
+cluster_runtime = ClusterRuntime()
+
+
 class SetupStates(StatesGroup):
     pin = State()
+    shooter_count = State()
+    shooter_token = State()
     api_id = State()
     api_hash = State()
     phone = State()
@@ -3214,12 +4860,14 @@ router = Router()
 BTN_CHANNEL = "📣 Канал"
 BTN_GIFTS = "🎁 Подарки"
 BTN_CHECK = "🔢 Проверить номера"
-BTN_TARGETS = "🎯 Задать номера"
+BTN_TARGETS = "🎯 Задать выстрел"
 BTN_START = "▶️ Запустить"
 BTN_STOP = "⛔ Остановить"
 BTN_PAYMENT_OFF = "🛡 Оплата: ВЫКЛ"
 BTN_PAYMENT_ON = "💳 Оплата: ВКЛ"
+BTN_VOLLEY_PREFIX = "💥 Залп:"
 BTN_PING = "📡 Ping"
+BTN_SHOOTER_COUNT_PREFIX = "👥 Количество стрелков:"
 BTN_REFRESH_CARD = "♻️ Обновить карточку"
 BTN_STRESS_OFF = "🧪 Стресс-тест: ВЫКЛ"
 BTN_STRESS_ON = "🧪 Стресс-тест: ВКЛ"
@@ -3227,19 +4875,31 @@ BTN_LOG = "📄 Log"
 BTN_RESET = "🗑 Сброс"
 
 
+def volley_button_text() -> str:
+    size = effective_volley_size()
+    return f"{BTN_VOLLEY_PREFIX} {size}"
+
+
+def shooter_count_button_text() -> str:
+    return f"{BTN_SHOOTER_COUNT_PREFIX} {active_shooter_count()}"
+
+
 def main_keyboard() -> ReplyKeyboardMarkup:
     payment = BTN_PAYMENT_ON if store.settings.live_upgrades else BTN_PAYMENT_OFF
     start_stop = BTN_STOP if runtime.active else BTN_START
     stress_button = BTN_STRESS_ON if runtime.stress_active else BTN_STRESS_OFF
+    keyboard = [
+        [KeyboardButton(text=BTN_CHANNEL), KeyboardButton(text=BTN_GIFTS)],
+        [KeyboardButton(text=BTN_CHECK), KeyboardButton(text=BTN_TARGETS)],
+        [KeyboardButton(text=start_stop), KeyboardButton(text=payment)],
+        [KeyboardButton(text=volley_button_text()), KeyboardButton(text=BTN_PING)],
+        [KeyboardButton(text=BTN_REFRESH_CARD), KeyboardButton(text=BTN_LOG)],
+        [KeyboardButton(text=stress_button), KeyboardButton(text=BTN_RESET)],
+    ]
+    if PRIMARY_SHOOTER:
+        keyboard.insert(4, [KeyboardButton(text=shooter_count_button_text())])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_CHANNEL), KeyboardButton(text=BTN_GIFTS)],
-            [KeyboardButton(text=BTN_CHECK), KeyboardButton(text=BTN_TARGETS)],
-            [KeyboardButton(text=start_stop), KeyboardButton(text=payment)],
-            [KeyboardButton(text=BTN_REFRESH_CARD), KeyboardButton(text=BTN_PING)],
-            [KeyboardButton(text=stress_button), KeyboardButton(text=BTN_LOG)],
-            [KeyboardButton(text=BTN_RESET)],
-        ],
+        keyboard=keyboard,
         resize_keyboard=True,
         input_field_placeholder=f"{APP_NAME} {APP_VERSION}",
     )
@@ -3322,9 +4982,12 @@ async def owner_guard_callback(callback: CallbackQuery) -> bool:
     return True
 
 
-async def safe_delete(message: Message) -> None:
-    with contextlib.suppress(Exception):
+async def safe_delete(message: Message) -> bool:
+    try:
         await message.delete()
+        return True
+    except Exception:
+        return False
 
 
 async def safe_edit_markup(message: Message, markup: InlineKeyboardMarkup) -> None:
@@ -3400,7 +5063,7 @@ async def ensure_channel_and_show(message: Message) -> None:
                 f"✅ Аккаунт подключён\n"
                 f"📣 Канал: <b>{html.escape(store.settings.channel_title or 'выбран')}</b>\n"
                 f"🎁 Доступно для улучшения: <b>{len(infos)}</b>\n\n"
-                "Открой «🎁 Подарки», выбери конкретный экземпляр и задай цель.",
+                "Открой «🎁 Подарки», выбери конкретный экземпляр и задай выстрел.",
                 reply_markup=main_keyboard(),
             )
         else:
@@ -3431,6 +5094,210 @@ async def migrate_legacy_selection(infos: list[SavedGiftInfo]) -> None:
     await store.save()
 
 
+async def confirm_cluster_reconfigure(
+    message: Message,
+    config: ClusterConfig,
+    previous_count: int,
+) -> None:
+    """One-time post-change check; no background Ping is started."""
+    deadline = time.monotonic() + CLUSTER_RECONFIG_CONFIRM_SECONDS
+    old_max = max(int(previous_count), config.active_shooters)
+    snapshots: dict[int, dict[str, Any] | None] = {}
+
+    def lifecycle_ready(shooter_id: int, expected_state: str) -> bool:
+        life = snapshots.get(shooter_id)
+        if not life:
+            return False
+        try:
+            generation = int(life.get("generation", 0))
+        except (TypeError, ValueError):
+            return False
+        state = str(life.get("state", ""))
+        return generation >= config.generation and state == expected_state
+
+    while True:
+        snapshots = {
+            shooter_id: provision_store.load_lifecycle(shooter_id)
+            for shooter_id in range(1, old_max + 1)
+        }
+        active_ok = all(
+            lifecycle_ready(shooter_id, "active")
+            for shooter_id in range(1, config.active_shooters + 1)
+        )
+        sleeping_ok = all(
+            lifecycle_ready(shooter_id, "sleeping")
+            for shooter_id in range(config.active_shooters + 1, old_max + 1)
+        )
+        if active_ok and sleeping_ok:
+            break
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.5)
+
+    ping_results: dict[int, float | None]
+    if cluster_runtime.bus is not None:
+        with contextlib.suppress(Exception):
+            await cluster_runtime.bus.refresh_config_and_peers(config)
+        try:
+            ping_results = await cluster_runtime.bus.ping_active_shooters(
+                timeout_seconds=CLUSTER_PING_TIMEOUT_MS / 1000.0
+            )
+        except Exception as exc:
+            logger.warning("cluster_confirmation_ping_failed error=%s", exc)
+            ping_results = {
+                shooter_id: None
+                for shooter_id in range(1, config.active_shooters + 1)
+            }
+    else:
+        ping_results = {
+            shooter_id: None
+            for shooter_id in range(1, config.active_shooters + 1)
+        }
+
+    lines = [
+        f"🔄 <b>Проверка состава {config.active_shooters}/{MAX_SHOOTERS}</b>",
+        f"Поколение: <b>{config.generation}</b>",
+        "",
+    ]
+    confirmed_active = 0
+    confirmed_sleeping = 0
+    for shooter_id in range(1, config.active_shooters + 1):
+        life = snapshots.get(shooter_id) or provision_store.load_lifecycle(shooter_id)
+        token_missing = shooter_id > 1 and not provision_store.load_token(shooter_id)
+        rtt = ping_results.get(shooter_id)
+        state = str((life or {}).get("state", ""))
+        reason = str((life or {}).get("reason", ""))
+        try:
+            generation = int((life or {}).get("generation", 0))
+        except (TypeError, ValueError):
+            generation = 0
+        if token_missing:
+            lines.append(f"Hunter {shooter_id} — ❌ токен отсутствует")
+        elif generation >= config.generation and state == "error":
+            lines.append(
+                f"Hunter {shooter_id} — ❌ ошибка запуска: {html.escape(reason or 'неизвестно')}"
+            )
+        elif generation >= config.generation and state == "active" and rtt is not None:
+            local = " (локальный)" if shooter_id == 1 else ""
+            lines.append(f"Hunter {shooter_id} — ✅ UDP {rtt:.2f} мс{local}")
+            confirmed_active += 1
+        elif generation >= config.generation and state in {"starting", "waiting"}:
+            detail = reason or state
+            lines.append(f"Hunter {shooter_id} — ⚠️ {html.escape(detail)}")
+        elif generation >= config.generation and state == "active":
+            lines.append(f"Hunter {shooter_id} — ❌ UDP не ответил")
+        else:
+            lines.append(f"Hunter {shooter_id} — ❌ контейнер не подтвердил запуск")
+
+    for shooter_id in range(config.active_shooters + 1, old_max + 1):
+        life = snapshots.get(shooter_id) or provision_store.load_lifecycle(shooter_id)
+        state = str((life or {}).get("state", ""))
+        try:
+            generation = int((life or {}).get("generation", 0))
+        except (TypeError, ValueError):
+            generation = 0
+        if generation >= config.generation and state == "sleeping":
+            lines.append(f"Hunter {shooter_id} — 💤 отключён")
+            confirmed_sleeping += 1
+        elif generation >= config.generation and state == "deactivating":
+            lines.append(f"Hunter {shooter_id} — 🟡 завершает работу")
+        else:
+            lines.append(f"Hunter {shooter_id} — ⚠️ нет подтверждения сна")
+
+    lines.extend([
+        "",
+        f"Активны и отвечают: <b>{confirmed_active}/{config.active_shooters}</b>",
+    ])
+    if old_max > config.active_shooters:
+        lines.append(
+            f"Отключены: <b>{confirmed_sleeping}/{old_max - config.active_shooters}</b>"
+        )
+    logger.info(
+        "cluster_reconfigure_confirmed generation=%s active_shooters=%s active_confirmed=%s sleeping_confirmed=%s",
+        config.generation,
+        config.active_shooters,
+        confirmed_active,
+        confirmed_sleeping,
+    )
+    record_cluster_event(
+        "cluster_reconfigure_confirmed",
+        generation=config.generation,
+        active_shooters=config.active_shooters,
+        active_confirmed=confirmed_active,
+        sleeping_confirmed=confirmed_sleeping,
+    )
+    await message.answer("\n".join(lines), reply_markup=main_keyboard())
+
+
+async def continue_initial_setup(message: Message, state: FSMContext) -> None:
+    if PRIMARY_SHOOTER and not provision_store.load_config().configured:
+        await state.set_state(SetupStates.shooter_count)
+        await message.answer(
+            "Сколько стрелков будем использовать? Отправь число от <b>1</b> до <b>6</b>."
+        )
+        return
+    await continue_setup(message, state)
+
+
+async def validate_bot_token(token: str) -> tuple[bool, str]:
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", token):
+        return False, "Токен выглядит неверно"
+    probe = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        me = await probe.get_me()
+        username = getattr(me, "username", None) or str(getattr(me, "id", "бот"))
+        return True, f"@{username}" if not str(username).startswith("@") else str(username)
+    except Exception:
+        return False, "Telegram не принял токен"
+    finally:
+        await probe.session.close()
+
+
+async def ask_next_shooter_token(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    total = min(MAX_SHOOTERS, max(1, int(data.get("shooter_total", 1))))
+    current = max(2, int(data.get("shooter_current", 2)))
+    while current <= total and provision_store.load_token(current):
+        current += 1
+    if current > total:
+        previous_count = max(1, int(data.get("shooter_previous_count", total)))
+        generation = max(1, int(data.get("shooter_generation", provision_store.load_config().generation)))
+        config = provision_store.load_config()
+        if config.generation != generation or config.active_shooters != total:
+            logger.warning(
+                "cluster_confirmation_config_changed expected_generation=%s actual_generation=%s expected_active=%s actual_active=%s",
+                generation,
+                config.generation,
+                total,
+                config.active_shooters,
+            )
+        await state.clear()
+        await cluster_runtime.refresh_config(config)
+        logger.info(
+            "cluster_token_setup_complete active_shooters=%s configured_token_ids=%s",
+            total,
+            provision_store.configured_token_ids(),
+        )
+        record_cluster_event(
+            "cluster_token_setup_complete",
+            active_shooters=total,
+            configured_token_ids=provision_store.configured_token_ids(),
+        )
+        await message.answer(
+            f"✅ Токены стрелков настроены: <b>{total}</b>. "
+            "Открой каждого нового бота, нажми /start и настрой его отдельно."
+        )
+        await confirm_cluster_reconfigure(message, config, previous_count)
+        await continue_setup(message, state)
+        return
+    await state.update_data(shooter_current=current, shooter_total=total)
+    await state.set_state(SetupStates.shooter_token)
+    await message.answer(
+        f"Отправь Telegram Bot API token для <b>Hunter {current}</b>. "
+        "Сообщение с токеном будет сразу удалено."
+    )
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     if not message.from_user:
@@ -3445,7 +5312,7 @@ async def start_handler(message: Message, state: FSMContext) -> None:
     elif owner != message.from_user.id:
         await message.answer("Доступ запрещён.")
         return
-    await continue_setup(message, state)
+    await continue_initial_setup(message, state)
 
 
 @router.message(SetupStates.pin)
@@ -3458,7 +5325,165 @@ async def pin_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Неверный PIN.")
         return
     await bind_owner(message.from_user.id)
-    await continue_setup(message, state)
+    await continue_initial_setup(message, state)
+
+
+@router.message(F.text.startswith(BTN_SHOOTER_COUNT_PREFIX))
+async def shooter_count_button_handler(message: Message, state: FSMContext) -> None:
+    if not await owner_guard_message(message):
+        return
+    if not PRIMARY_SHOOTER:
+        await message.answer("Количество стрелков меняется только в Hunter 1.", reply_markup=main_keyboard())
+        return
+
+    previous_count = active_shooter_count()
+    scanner_was_active = bool(runtime.active)
+    stress_was_active = bool(runtime.stress_active)
+    live_was_enabled = bool(store.settings.live_upgrades)
+    if scanner_was_active:
+        await scanner.stop("cluster_reconfigure")
+    if stress_was_active:
+        await stress_tester.stop("cluster_reconfigure")
+    store.settings.live_upgrades = False
+    scanner.prepared.clear()
+    cluster_runtime.disarm()
+    cluster_runtime.notify_state_changed()
+    await store.save()
+    await state.set_state(SetupStates.shooter_count)
+    logger.info(
+        "cluster_reconfigure_requested previous_active_shooters=%s scanner_stopped=%s stress_stopped=%s live_disabled=%s",
+        previous_count,
+        scanner_was_active,
+        stress_was_active,
+        live_was_enabled,
+    )
+    record_cluster_event(
+        "cluster_reconfigure_requested",
+        previous_active_shooters=previous_count,
+        scanner_stopped=scanner_was_active,
+        stress_stopped=stress_was_active,
+        live_disabled=live_was_enabled,
+    )
+    await message.answer(
+        f"Сейчас выбрано стрелков: <b>{previous_count}</b>. "
+        "Отправь новое число от <b>1</b> до <b>6</b>. "
+        "В Hunter 1 сканер и стресс-тест остановлены, LIVE выключен.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(SetupStates.shooter_count)
+async def shooter_count_handler(message: Message, state: FSMContext) -> None:
+    if not await owner_guard_message(message):
+        return
+    value = (message.text or "").strip()
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if not 1 <= count <= MAX_SHOOTERS:
+        await message.answer("Нужно отправить число от 1 до 6.")
+        return
+    previous_count = active_shooter_count()
+    config = provision_store.configure(count)
+    settings_changed = False
+    # Volley size belongs to each Hunter and is never copied or flattened when
+    # the cluster size changes. Hunter 1 keeps 1-15; Hunter 2-6 keep 1-3.
+    if store.settings.live_upgrades:
+        store.settings.live_upgrades = False
+        settings_changed = True
+    if scanner.prepared:
+        scanner.prepared.clear()
+    if settings_changed:
+        await store.save()
+    logger.info(
+        "cluster_configured previous_active_shooters=%s active_shooters=%s generation=%s local_volley=%s local_volley_limit=%s",
+        previous_count, config.active_shooters, config.generation,
+        effective_volley_size(), effective_max_volley_size(),
+    )
+    record_cluster_event(
+        "cluster_configured",
+        previous_active_shooters=previous_count,
+        active_shooters=config.active_shooters,
+        generation=config.generation,
+        local_volley=effective_volley_size(),
+        local_volley_limit=effective_max_volley_size(),
+    )
+    await state.update_data(
+        shooter_previous_count=previous_count,
+        shooter_generation=config.generation,
+    )
+    await cluster_runtime.refresh_config(config, broadcast_notice=True)
+    if count == 1:
+        await state.clear()
+        await message.answer(
+            "✅ Выбран <b>1 стрелок</b>. Залп одного аккаунта доступен от 1 до 15."
+        )
+        await confirm_cluster_reconfigure(message, config, previous_count)
+        await continue_setup(message, state)
+        return
+    await state.update_data(shooter_total=count, shooter_current=2)
+    await ask_next_shooter_token(message, state)
+
+
+@router.message(SetupStates.shooter_token)
+async def shooter_token_handler(message: Message, state: FSMContext) -> None:
+    if not await owner_guard_message(message):
+        return
+    token = (message.text or "").strip()
+    message_deleted = await safe_delete(message)
+    data = await state.get_data()
+    current = max(2, int(data.get("shooter_current", 2)))
+    total = min(MAX_SHOOTERS, max(1, int(data.get("shooter_total", current))))
+    logger.info(
+        "shooter_token_received shooter_id=%s message_deleted=%s token_length=%s",
+        current,
+        message_deleted,
+        len(token),
+    )
+    if not message_deleted:
+        logger.warning("shooter_token_message_delete_failed shooter_id=%s", current)
+    known_tokens = {
+        value
+        for value in (
+            BOT_TOKEN,
+            *(provision_store.load_token(i) for i in range(2, MAX_SHOOTERS + 1)),
+        )
+        if value
+    }
+    if token and token in known_tokens:
+        logger.warning("shooter_token_duplicate_rejected shooter_id=%s", current)
+        await message.answer(f"Этот токен уже используется. Отправь другой токен для Hunter {current}.")
+        return
+    valid, identity = await validate_bot_token(token)
+    if not valid:
+        logger.warning(
+            "shooter_token_validation_failed shooter_id=%s reason=%s message_deleted=%s",
+            current,
+            identity,
+            message_deleted,
+        )
+        await message.answer(f"❌ {html.escape(identity)}. Отправь токен Hunter {current} ещё раз.")
+        return
+    token_path = provision_store.save_token(current, token)
+    logger.info(
+        "shooter_token_provisioned shooter_id=%s bot=%s message_deleted=%s token_file=%s mode=%o",
+        current,
+        identity,
+        message_deleted,
+        token_path.name,
+        token_path.stat().st_mode & 0o777,
+    )
+    record_cluster_event(
+        "shooter_token_provisioned",
+        participant_id=current,
+        bot=identity,
+        message_deleted=message_deleted,
+        token_file=token_path.name,
+    )
+    await message.answer(f"✅ Hunter {current} подключён: <b>{html.escape(identity)}</b>")
+    await state.update_data(shooter_current=current + 1, shooter_total=total)
+    await ask_next_shooter_token(message, state)
 
 
 @router.message(SetupStates.api_id)
@@ -3513,6 +5538,7 @@ async def auth_check_handler(callback: CallbackQuery) -> None:
         return
     await callback.answer("Проверяю…")
     if await mtproto.is_authorized(reload=True):
+        cluster_runtime.notify_state_changed()
         if callback.message:
             await ensure_channel_and_show(callback.message)
     else:
@@ -3568,6 +5594,7 @@ async def channel_callback_handler(callback: CallbackQuery) -> None:
             return
         choice = await mtproto.select_channel(int(action))
         scanner.prepared.clear()
+        cluster_runtime.notify_state_changed()
         await callback.answer("Канал выбран", show_alert=True)
         if callback.message:
             await callback.message.answer(
@@ -3635,6 +5662,7 @@ async def toggle_gift_selection(saved_id: int, valid_ids: set[int]) -> None:
     scanner.prepared.clear()
     store.settings.live_upgrades = False
     await store.save()
+    cluster_runtime.notify_state_changed()
 
 
 @router.callback_query(F.data.startswith("gift:"))
@@ -3684,7 +5712,7 @@ async def targets_prompt_handler(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(SetupStates.targets)
     await message.answer(
-        "Отправь целевые номера через запятую, пробел или с новой строки.\n"
+        "Отправь номера выстрела через запятую, пробел или с новой строки.\n"
         "Пример: <code>12842, 13000</code>\n\n"
         "Новый ввод полностью заменяет старый список."
     )
@@ -3701,7 +5729,7 @@ async def targets_value_handler(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(
             PENDING_PAYMENT_HOLD_MESSAGE
-            + " Цели не изменены; сначала дождись сверки в «🎁 Подарки»."
+            + " Номера выстрела не изменены; сначала дождись сверки в «🎁 Подарки»."
         )
         return
     targets = parse_target_numbers(message.text or "")
@@ -3712,9 +5740,10 @@ async def targets_value_handler(message: Message, state: FSMContext) -> None:
     store.settings.live_upgrades = False
     scanner.prepared.clear()
     await store.save()
+    cluster_runtime.notify_state_changed()
     await state.clear()
     await message.answer(
-        "🎯 Целевые номера: " + ", ".join(map(str, targets)) + "\n🛡 LIVE выключен — включи его заново после проверки цели.",
+        "🎯 Номера выстрела: " + ", ".join(map(str, targets)) + "\n🛡 LIVE выключен — включи его заново после проверки выстрела.",
         reply_markup=main_keyboard(),
     )
 
@@ -3753,11 +5782,13 @@ def build_channel_gifts_text(infos: list[SavedGiftInfo]) -> str:
 
 
 async def build_global_gift_numbers_text(service: MTProtoService) -> str:
-    """Return the global Telegram collectible catalog, independent of channels."""
+    """Return the global collectible catalog with issued and maximum totals."""
     results, elapsed_ms = await service.fetch_global_catalog_numbers()
     results = sorted(results, key=lambda item: item.title.casefold())
     resolved = sum(1 for item in results if item.issued is not None)
     errors_count = len(results) - resolved
+    highlighted_count = 0
+    snapshot_items: list[dict[str, Any]] = []
     lines = [
         f"🔢 <b>Последние выданные номера · {APP_VERSION}</b>",
         f"Проверено коллекций: <b>{len(results)}</b> · {elapsed_ms:.0f} мс",
@@ -3766,10 +5797,73 @@ async def build_global_gift_numbers_text(service: MTProtoService) -> str:
         lines.append(f"Получено номеров: <b>{resolved}</b> · ошибок: <b>{errors_count}</b>")
     lines.append("")
     for item in results:
+        highlighted = False
+        special_target: int | None = None
+        special_distance: int | None = None
         if item.issued is None:
-            lines.append(f"{html.escape(item.title)} — не определён")
+            issued_text = "не определён"
         else:
-            lines.append(f"{html.escape(item.title)} — {item.issued}")
+            highlighted, special_target, special_distance = catalog_number_is_near_special(item.issued, item.total)
+            if highlighted:
+                highlighted_count += 1
+                issued_text = f"<b>{item.issued}</b>"
+                logger.info(
+                    "catalog_number_near_special gift_id=%s title=%s issued=%s special_target=%s distance=%s total=%s",
+                    item.gift_id,
+                    item.title,
+                    item.issued,
+                    special_target,
+                    special_distance,
+                    item.total,
+                )
+            else:
+                issued_text = str(item.issued)
+        total_text = str(item.total) if item.total is not None else "не определён"
+        lines.append(f"{html.escape(item.title)} — {issued_text} — {total_text}")
+        snapshot_items.append(
+            {
+                "gift_id": item.gift_id,
+                "title": item.title,
+                "issued": item.issued,
+                "total": item.total,
+                "slug": item.slug,
+                "error": item.error,
+                "highlighted": highlighted,
+                "special_target": special_target,
+                "special_distance": special_distance,
+            }
+        )
+
+    snapshot = {
+        "version": APP_VERSION,
+        "generated_at": msk_now().isoformat(),
+        "elapsed_ms": round(float(elapsed_ms), 3),
+        "collections": len(results),
+        "resolved": resolved,
+        "errors": errors_count,
+        "highlighted": highlighted_count,
+        "special_number_max_distance": SPECIAL_NUMBER_MAX_DISTANCE,
+        "items": snapshot_items,
+    }
+    try:
+        temp = CATALOG_REPORT_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(temp, 0o600)
+        temp.replace(CATALOG_REPORT_PATH)
+        os.chmod(CATALOG_REPORT_PATH, 0o600)
+    except OSError as exc:
+        logger.warning("catalog_numbers_snapshot_write_failed path=%s error=%s", CATALOG_REPORT_PATH, exc)
+    else:
+        logger.info(
+            "catalog_numbers_render_complete collections=%s resolved=%s errors=%s with_total=%s highlighted=%s elapsed_ms=%.1f snapshot=%s",
+            len(results),
+            resolved,
+            errors_count,
+            sum(1 for item in results if item.total is not None),
+            highlighted_count,
+            elapsed_ms,
+            CATALOG_REPORT_PATH,
+        )
     return "\n".join(lines)
 
 
@@ -3821,16 +5915,31 @@ def build_full_log_export() -> Path:
         ),
         key=lambda path: (path.stat().st_mtime, path.name),
     )
+    extra_candidates = [
+        STRESS_REPORT_PATH,
+        STRESS_HISTORY_PATH,
+        DIAGNOSTICS_PATH,
+        CATALOG_REPORT_PATH,
+        RATE_LIMIT_PATH,
+        provision_store.config_path,
+        provision_store.generation_path,
+        provision_store.event_path,
+        *sorted(provision_store.root.glob("hunter-*.lifecycle.json")),
+    ]
     extras = [
         path
-        for path in (STRESS_REPORT_PATH, STRESS_HISTORY_PATH, DIAGNOSTICS_PATH, RATE_LIMIT_PATH)
+        for path in extra_candidates
         if path.exists() and path.is_file()
     ]
+    included_names = [path.name for path in candidates + extras]
     manifest = (
         f"{APP_NAME} {APP_VERSION} full log export\n"
         f"generated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+        f"shooter_id={SHOOTER_ID}\n"
+        f"active_shooters={active_shooter_count()}\n"
         f"log_files={len(candidates)}\n"
         f"extra_files={len(extras)}\n"
+        f"included={','.join(included_names)}\n"
     )
     with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("MANIFEST.txt", manifest)
@@ -3860,14 +5969,14 @@ async def current_status_text() -> str:
                 "",
                 f"🎁 <b>{html.escape(counter.title)}</b>",
                 f"Текущий номер: <b>{counter.current}</b>",
-                f"Цель: <b>{target if target is not None else 'не задана'}</b>",
+                f"Выстрел: <b>{target if target is not None else 'не задан'}</b>",
             ]
         )
         if state.distance is not None:
             if state.distance > 0:
-                lines.append(f"До цели: <b>{state.distance}</b>")
+                lines.append(f"До выстрела: <b>{state.distance}</b>")
             else:
-                lines.append("Статус: <b>цель уже прошла</b>")
+                lines.append("Статус: <b>выстрел уже прошёл</b>")
     return "\n".join(lines)
 
 
@@ -3889,7 +5998,15 @@ async def check_numbers_handler(message: Message) -> None:
         return
     try:
         text = await build_global_gift_numbers_text(mtproto)
+        chunks = split_message_text(text)
+        logger.info(
+            "check_numbers_ready collections_report=%s chunks=%s chars=%s",
+            CATALOG_REPORT_PATH,
+            len(chunks),
+            len(text),
+        )
         await send_text_chunks(message, text, reply_markup=main_keyboard())
+        logger.info("check_numbers_sent chunks=%s chars=%s", len(chunks), len(text))
     except Exception as exc:
         logger.exception("check_numbers_failed")
         await message.answer(f"❌ {html.escape(str(exc))}", reply_markup=main_keyboard())
@@ -3912,10 +6029,9 @@ async def scanner_start_handler(message: Message) -> None:
             await asyncio.sleep(0.1)
         sent = await message.answer(
             (await status_text())
-            + ("\n\n💳 <b>LIVE:</b> бот отправит оплату при текущем номере = цель − 1."
+            + ("\n\n💳 <b>LIVE:</b> бот отправит оплату при текущем номере = выстрел − 1."
                if store.settings.live_upgrades
                else "\n\n🧪 <b>DRY-RUN:</b> Stars не списываются."),
-            reply_markup=main_keyboard(),
         )
         scanner.attach_status_message(sent.chat.id, sent.message_id)
     except Exception as exc:
@@ -3953,18 +6069,24 @@ async def live_preflight(*, prepare: bool) -> str:
     if len(base_ids) != 1:
         raise RuntimeError("Для LIVE выбери подарки только одного типа")
     if not store.settings.target_numbers:
-        raise RuntimeError("Целевые номера не заданы")
+        raise RuntimeError("Номера выстрела не заданы")
     if any(not info.can_upgrade for info in infos):
         raise RuntimeError("Один из выбранных подарков больше нельзя улучшить. Обнови список подарков.")
 
     counter = await mtproto.counter_for_info(infos[0], peer=peer, cache_seconds=0)
     future_targets = sorted({target for target in store.settings.target_numbers if target > counter.current})
     if not future_targets:
-        raise RuntimeError(f"Все цели уже прошли. Текущий номер: {counter.current}")
+        raise RuntimeError(f"Все номера выстрела уже прошли. Текущий номер: {counter.current}")
 
-    operation_count = min(len(infos), len(future_targets))
+    if active_shooter_count() > 1:
+        await cluster_runtime.verify_active_peers()
+    operation_count = effective_volley_size()
+    if len(infos) < operation_count:
+        raise RuntimeError(
+            f"Для залпа {operation_count} выбрано только {len(infos)} подарков"
+        )
     planned_infos = infos[:operation_count]
-    planned_targets = future_targets[:operation_count]
+    planned_targets = [future_targets[0]] * operation_count
     plans: list[PreparedUpgrade | None] = []
     for candidate in planned_infos:
         plan = scanner.prepared.get(candidate.saved_id)
@@ -4000,12 +6122,11 @@ async def live_preflight(*, prepare: bool) -> str:
     else:
         payment_text = f"до {paid_total} ⭐ суммарно"
     limit_text = f"{MAX_UPGRADE_STARS} ⭐" if MAX_UPGRADE_STARS else "без лимита"
-    target_text = ", ".join(str(value) for value in planned_targets)
     warning = ""
-    if len(future_targets) > len(infos):
+    if operation_count > 1:
         warning = (
-            f"\n⚠️ Подарков меньше, чем будущих целей: подготовлено {operation_count} из "
-            f"{len(future_targets)} операций."
+            f"\n⚠️ Залп {operation_count}: все запросы уйдут почти одновременно по одному номеру выстрела. "
+            f"Максимальное списание — {paid_total} ⭐; часть подарков может получить следующие номера."
         )
 
     return (
@@ -4014,15 +6135,58 @@ async def live_preflight(*, prepare: bool) -> str:
         f"Подарок: <b>{html.escape(counter.title)}</b>\n"
         f"Выбранных экземпляров: <b>{len(infos)}</b>\n"
         f"Текущий номер: <b>{counter.current}</b>\n"
-        f"Подготовленные цели: <b>{target_text}</b>\n"
-        f"Подготовлено операций: <b>{operation_count}</b>\n"
+        f"Выстрел FAST-залпа: <b>#{future_targets[0]}</b>\n"
+        f"Размер залпа: <b>{operation_count}</b>\n"
         f"Возможное списание: <b>{payment_text}</b>\n"
         f"Лимит одной операции: <b>{limit_text}</b>"
         f"{warning}\n\n"
-        "Платёжные формы подготовлены заранее. Бот отправит улучшение, когда текущий номер "
-        "станет равен ближайшей цели минус один. Точный номер не гарантируется из-за "
-        "одновременных запросов других пользователей."
+        "Платёжные формы и сами MTProto-запросы подготовлены заранее. После точного появления "
+        "номера выстрела минус один FAST отправит залп без дополнительной проверки выстрела, без записи на диск "
+        "и без автоматического повтора. Точный номер не гарантируется."
     )
+
+
+@router.message(F.text.startswith(BTN_VOLLEY_PREFIX))
+async def volley_toggle_handler(message: Message) -> None:
+    if not await owner_guard_message(message):
+        return
+    if await reject_changes_while_running_message(message):
+        return
+    if store.settings.payment_hold_saved_ids:
+        await message.answer(PENDING_PAYMENT_HOLD_MESSAGE, reply_markup=main_keyboard())
+        return
+
+    maximum = effective_max_volley_size()
+    current = min(maximum, max(1, int(store.settings.volley_size)))
+    store.settings.volley_size = 1 if current >= maximum else current + 1
+    live_was_enabled = store.settings.live_upgrades
+    if live_was_enabled:
+        store.settings.live_upgrades = False
+        scanner.prepared.clear()
+    await store.save()
+    logger.info(
+        "volley_size_changed shooter_id=%s volley=%s volley_limit=%s live_disabled=%s",
+        SHOOTER_ID, store.settings.volley_size, maximum, live_was_enabled,
+    )
+    record_cluster_event(
+        "volley_size_changed",
+        volley=int(store.settings.volley_size),
+        volley_limit=int(maximum),
+        live_disabled=bool(live_was_enabled),
+    )
+    cluster_runtime.notify_state_changed()
+    text = (
+        f"💥 Размер FAST-залпа Hunter {SHOOTER_ID}: <b>{store.settings.volley_size}</b> из <b>{maximum}</b>. "
+        f"Нужно выбрать минимум {store.settings.volley_size} одинаковых неулучшенных подарков."
+    )
+    if live_was_enabled:
+        text += "\n🛡 LIVE выключен: включи оплату заново, чтобы подтвердить новый максимальный расход."
+    if store.settings.volley_size > 1:
+        text += (
+            f"\n⚠️ При полной стоимости одного улучшения возможное списание — "
+            f"до {store.settings.volley_size} × цена подарка."
+        )
+    await message.answer(text, reply_markup=main_keyboard())
 
 
 @router.message(F.text.in_({BTN_PAYMENT_OFF, BTN_PAYMENT_ON}))
@@ -4040,6 +6204,7 @@ async def payment_toggle_handler(message: Message) -> None:
         store.settings.live_upgrades = False
         scanner.prepared.clear()
         await store.save()
+        cluster_runtime.notify_state_changed()
         logger.info("live_disabled_by_toggle")
         await message.answer("🛡 Оплата выключена. Режим DRY-RUN.", reply_markup=main_keyboard())
         return
@@ -4047,6 +6212,7 @@ async def payment_toggle_handler(message: Message) -> None:
         summary = await live_preflight(prepare=True)
         store.settings.live_upgrades = True
         await store.save()
+        cluster_runtime.notify_state_changed()
         logger.info("live_enabled_by_toggle")
         await message.answer(
             "💳 <b>Оплата включена — режим LIVE активирован.</b>\n"
@@ -4056,6 +6222,7 @@ async def payment_toggle_handler(message: Message) -> None:
     except Exception as exc:
         store.settings.live_upgrades = False
         await store.save()
+        cluster_runtime.notify_state_changed()
         logger.exception("live_preflight_failed")
         await message.answer(f"LIVE не включён: {html.escape(str(exc))}", reply_markup=main_keyboard())
 
@@ -4064,7 +6231,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    v0018 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0029 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -4154,10 +6321,14 @@ async def status_text() -> str:
     # Avoid an extra MTProto authorization request from the live status editor.
     authorized = True if (runtime.active or runtime.stress_active) else await mtproto.is_authorized()
     uptime = int(time.monotonic() - runtime.started_at) if runtime.started_at else 0
-    lines = [
+    lines = []
+    if runtime.fast_quiet:
+        lines.append("🔕 <b>Бот в тихом режиме</b>")
+    lines.extend([
         f"🎯 <b>{APP_NAME} {APP_VERSION}</b>",
         f"Сканер: {'🟢 активен' if runtime.active else '⚪ остановлен'}",
         f"Режим: {'LIVE' if store.settings.live_upgrades else 'DRY-RUN'}",
+        f"FAST-залп: {effective_volley_size()}",
         f"MTProto: {'подключён' if authorized else 'не подключён'}",
         f"Канал: {html.escape(store.settings.channel_title or 'не выбран')}",
         f"Проверок: {runtime.checks}",
@@ -4168,7 +6339,12 @@ async def status_text() -> str:
         f"Cooldown: {runtime.rate_cooldown_cycles} циклов" if runtime.rate_cooldown_cycles else "Cooldown: нет",
         f"Uptime сканера: {uptime}с" if runtime.started_at else "Uptime сканера: —",
         f"Обновлено: <b>{msk_time_str()}</b>",
-    ]
+    ])
+    if runtime.fast_trigger_to_submit_ms is not None:
+        lines.append(
+            f"⚡ Последняя реакция: <b>{runtime.fast_trigger_to_submit_ms:.3f} мс</b> · "
+            f"создание задач {runtime.fast_task_launch_ms or 0.0:.3f} мс"
+        )
     cooldown = rate_limit.remaining_seconds()
     if cooldown > 0:
         lines.append(f"⏳ MTProto cooldown: <b>{int(cooldown + 0.999)}с</b>")
@@ -4195,9 +6371,9 @@ async def status_text() -> str:
             target = next_target(store.settings.target_numbers, current)
             if target is None and store.settings.target_numbers:
                 target = max(store.settings.target_numbers)
-            lines.append(f"• {html.escape(title)}: текущий <b>{current}</b> · цель <b>{target or '—'}</b>")
+            lines.append(f"• {html.escape(title)}: текущий <b>{current}</b> · выстрел <b>{target or '—'}</b>")
     elif store.settings.target_numbers:
-        lines.append("Цели: " + ", ".join(map(str, store.settings.target_numbers)))
+        lines.append("Выстрел: " + ", ".join(map(str, store.settings.target_numbers)))
     if runtime.last_error:
         lines.append(f"Ошибка: <code>{html.escape(runtime.last_error[:300])}</code>")
     if runtime.last_success:
@@ -4226,10 +6402,7 @@ async def refresh_card_handler(message: Message) -> None:
         )
         return
     try:
-        await scanner.manually_replace_status_message(
-            message.chat.id,
-            reply_markup=main_keyboard(),
-        )
+        await scanner.manually_replace_status_message(message.chat.id)
     except TelegramRetryAfter as exc:
         # SendMessage itself is rate-limited, so do not answer with yet another
         # SendMessage and do not schedule retries. Ping will show the remainder.
@@ -4249,55 +6422,124 @@ async def refresh_card_handler(message: Message) -> None:
 
 @router.message(F.text == BTN_PING)
 async def ping_handler(message: Message) -> None:
-    """Return a compact health reply instead of duplicating the live status card."""
+    """Return local health and, in Hunter 1, an on-demand UDP RTT check."""
     if not await owner_guard_message(message):
         return
 
-    started = time.perf_counter()
+    local_started = time.perf_counter()
     if runtime.active or runtime.stress_active:
-        authorized = True
-        mtproto_note = "подключён (без лишнего запроса во время скана)"
+        mtproto_note = "подключён"
     else:
-        authorized = await mtproto.is_authorized()
-        mtproto_note = "подключён" if authorized else "нет авторизации"
-    handler_ms = (time.perf_counter() - started) * 1000
+        try:
+            authorized = await mtproto.is_authorized()
+            mtproto_note = "подключён" if authorized else "нет авторизации"
+        except Exception as exc:
+            mtproto_note = "ошибка подключения"
+            logger.warning("ping_mtproto_check_failed shooter_id=%s error=%s", SHOOTER_ID, exc)
+    memory_current = current_memory_bytes()
+    memory_limit = memory_limit_bytes()
+    process_uptime_seconds = max(0.0, time.monotonic() - PROCESS_STARTED_MONOTONIC)
+    local_handler_ms = (time.perf_counter() - local_started) * 1000
 
-    card_pause = scanner.status_updater.retry_after_remaining
+    logger.info(
+        "ping_started shooter_id=%s primary=%s memory_current_mb=%.1f memory_limit_mb=%s process_uptime_sec=%s scanner_checks=%s last_cycle_ms=%s",
+        SHOOTER_ID,
+        PRIMARY_SHOOTER,
+        memory_current / (1024 * 1024),
+        None if memory_limit is None else round(memory_limit / (1024 * 1024), 1),
+        int(process_uptime_seconds),
+        runtime.checks,
+        runtime.last_cycle_ms,
+    )
+
     lines = [
         "🏓 <b>PONG</b>",
         f"Версия: <b>{APP_NAME} {APP_VERSION}</b>",
-        f"Бот: <b>работает</b>",
+        "Бот: <b>работает</b>",
         f"MTProto: <b>{mtproto_note}</b>",
         f"Сканер: <b>{'активен' if runtime.active else 'остановлен'}</b>",
-    ]
-    if card_pause > 0:
-        unblock_at = msk_now() + timedelta(seconds=card_pause)
-        reason = scanner.status_updater.pause_reason or "ограничение Telegram"
-        lines.extend([
-            f"Карточка: <b>пауза Telegram</b> · {html.escape(reason)}",
-            f"До окончания: <b>{format_duration(card_pause)}</b>",
-            f"Ориентировочно до: <b>{unblock_at.strftime('%d.%m %H:%M:%S')} МСК</b>",
-        ])
-    else:
-        lines.append(
-            f"Карточка: <b>раз в {int(LIVE_STATUS_INTERVAL_SECONDS)}с + сразу при смене номера</b>"
-        )
-    lines.extend([
-        f"Стресс-тест: <b>{'идёт' if runtime.stress_active else 'выключен'}</b>",
-        f"Проверок сканера: <b>{runtime.checks}</b>",
         (
-            f"Последний цикл: <b>{runtime.last_cycle_ms:.0f} мс</b>"
-            if runtime.last_cycle_ms is not None
-            else "Последний цикл: —"
+            f"RAM: <b>{format_memory_mb(memory_current)} / {format_memory_mb(memory_limit)}</b>"
+            if memory_limit is not None
+            else f"RAM: <b>{format_memory_mb(memory_current)} / без лимита</b>"
         ),
-        f"Обработка Ping: <b>{handler_ms:.1f} мс</b>",
-    ])
-    if runtime.current_by_slug:
-        current_parts = []
-        for slug, current in runtime.current_by_slug.items():
-            title = runtime.title_by_slug.get(slug, slug)
-            current_parts.append(f"{html.escape(title)}: <b>{current}</b>")
-        lines.append("Текущие номера: " + " · ".join(current_parts))
+        f"Время работы: <b>{format_process_uptime(process_uptime_seconds)}</b>",
+        f"Обработка Ping: <b>{local_handler_ms:.1f} мс</b>",
+    ]
+
+    ping_results: dict[int, float | None] = {}
+    if PRIMARY_SHOOTER:
+        config = cluster_runtime.applied_config or provision_store.load_config()
+        logger.info(
+            "ping_check_started active_shooters=%s timeout_ms=%s",
+            config.active_shooters,
+            CLUSTER_PING_TIMEOUT_MS,
+        )
+        record_cluster_event(
+            "ping_check_started",
+            active_shooters=config.active_shooters,
+            timeout_ms=CLUSTER_PING_TIMEOUT_MS,
+        )
+        cluster_ping_started = time.perf_counter()
+        if cluster_runtime.bus is not None:
+            try:
+                ping_results = await cluster_runtime.bus.ping_active_shooters(
+                    timeout_seconds=CLUSTER_PING_TIMEOUT_MS / 1000.0
+                )
+            except Exception as exc:
+                logger.exception("ping_check_failed error=%s", exc)
+                ping_results = {peer_id: None for peer_id in range(1, config.active_shooters + 1)}
+        else:
+            ping_results = {peer_id: None for peer_id in range(1, config.active_shooters + 1)}
+
+        cluster_ping_elapsed_ms = (time.perf_counter() - cluster_ping_started) * 1000
+        lines.extend(["", "👥 <b>Стрелки:</b>"])
+        answered = 0
+        for peer_id in range(1, config.active_shooters + 1):
+            rtt_ms = ping_results.get(peer_id)
+            local_suffix = " (локальный)" if peer_id == SHOOTER_ID else ""
+            if rtt_ms is None:
+                lines.append(f"Hunter {peer_id} — 🔴 нет ответа{local_suffix}")
+                logger.warning("peer_timeout shooter_id=%s timeout_ms=%s", peer_id, CLUSTER_PING_TIMEOUT_MS)
+                record_cluster_event(
+                    "peer_timeout",
+                    participant_id=peer_id,
+                    timeout_ms=CLUSTER_PING_TIMEOUT_MS,
+                    local=peer_id == SHOOTER_ID,
+                )
+            else:
+                answered += 1
+                lines.append(f"Hunter {peer_id} — 🟢 UDP {rtt_ms:.2f} мс{local_suffix}")
+                logger.info("peer_pong shooter_id=%s rtt_ms=%.3f local=%s", peer_id, rtt_ms, peer_id == SHOOTER_ID)
+                record_cluster_event(
+                    "peer_pong",
+                    participant_id=peer_id,
+                    rtt_ms=round(rtt_ms, 3),
+                    local=peer_id == SHOOTER_ID,
+                )
+        lines.extend(["", f"Ответили: <b>{answered}/{config.active_shooters}</b>"])
+        logger.info(
+            "ping_check_completed active_shooters=%s answered=%s timed_out=%s elapsed_ms=%.3f",
+            config.active_shooters,
+            answered,
+            config.active_shooters - answered,
+            cluster_ping_elapsed_ms,
+        )
+        record_cluster_event(
+            "ping_check_completed",
+            active_shooters=config.active_shooters,
+            answered=answered,
+            timed_out=config.active_shooters - answered,
+            elapsed_ms=round(cluster_ping_elapsed_ms, 3),
+        )
+        cluster_runtime.notify_state_changed()
+
+    logger.info(
+        "ping_completed shooter_id=%s local_processing_ms=%.3f cluster_checked=%s",
+        SHOOTER_ID,
+        local_handler_ms,
+        PRIMARY_SHOOTER,
+    )
     await message.answer("\n".join(lines), reply_markup=main_keyboard())
 
 
@@ -4330,7 +6572,7 @@ async def reset_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
     await message.answer(
-        "Сбросить канал, выбранные подарки, цели, LIVE, slug-привязки и временное состояние?\n\n"
+        "Сбросить канал, выбранные подарки, номера выстрела, LIVE, slug-привязки и временное состояние?\n\n"
         "Сохранятся авторизация владельца бота, TG_API_ID/TG_API_HASH/телефон и MTProto-сессия.",
         reply_markup=reset_confirm_keyboard(),
     )
@@ -4380,7 +6622,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         if callback.message:
             await callback.message.answer(
                 "🗑 Все рабочие настройки сброшены. Авторизация бота и Telegram-сессия сохранены.\n"
-                "Сначала выбери канал, затем подарок и цели.",
+                "Сначала выбери канал, затем подарок и номер выстрела.",
                 reply_markup=main_keyboard(),
             )
     else:
@@ -4454,20 +6696,91 @@ async def gift_name_lookup_handler(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ {html.escape(str(exc))}")
 
 
+def _watchdog_worker() -> None:
+    """Exit the process when the asyncio loop stops advancing.
+
+    Docker's restart policy then starts bootstrap/main again. The thread is
+    intentionally independent from asyncio, so a blocked event loop cannot
+    keep reporting a healthy process forever.
+    """
+    global _EVENT_LOOP_LAST_TICK
+    emergency_path = DATA_DIR / f"gift-hunter-{APP_VERSION}-watchdog.log"
+    while not _WATCHDOG_STOP.wait(WATCHDOG_CHECK_SECONDS):
+        age = time.monotonic() - _EVENT_LOOP_LAST_TICK
+        if age <= WATCHDOG_STALL_SECONDS:
+            continue
+        line = (
+            f"{time.strftime('%Y-%m-%d %H:%M:%S%z')} watchdog_stall "
+            f"version={APP_VERSION} shooter_id={SHOOTER_ID} age_seconds={age:.3f}\n"
+        )
+        try:
+            fd = os.open(
+                emergency_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                os.write(fd, line.encode("utf-8", errors="replace"))
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        try:
+            config = cluster_runtime.applied_config or provision_store.load_config()
+            safe_save_lifecycle(
+                SHOOTER_ID,
+                state="error",
+                generation=config.generation,
+                active_shooters=config.active_shooters,
+                reason="event_loop_watchdog_timeout",
+                version=APP_VERSION,
+                pid=os.getpid(),
+                stalled_seconds=round(age, 3),
+            )
+            provision_store.append_event(
+                "watchdog_stall",
+                shooter_id=SHOOTER_ID,
+                version=APP_VERSION,
+                stalled_seconds=round(age, 3),
+            )
+        except Exception:
+            pass
+        try:
+            os.write(2, line.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+        os._exit(70)
+
+
+async def event_loop_tick_loop() -> None:
+    global _EVENT_LOOP_LAST_TICK
+    while True:
+        _EVENT_LOOP_LAST_TICK = time.monotonic()
+        await asyncio.sleep(1.0)
+
+
+def _write_heartbeat_payload(payload: dict[str, Any]) -> None:
+    temp = HEARTBEAT_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload), encoding="utf-8")
+    temp.replace(HEARTBEAT_PATH)
+
+
 async def heartbeat_loop() -> None:
     while True:
+        config = cluster_runtime.applied_config or ClusterConfig()
         payload = {
             "timestamp": time.time(),
             "version": APP_VERSION,
+            "shooter_id": SHOOTER_ID,
+            "active_shooters": config.active_shooters,
+            "generation": config.generation,
             "scanner_active": runtime.active,
             "stress_test_active": runtime.stress_active,
             "rate_limit_remaining_seconds": rate_limit.remaining_seconds(),
             "rate_limit_blocked_until": rate_limit.blocked_until or None,
         }
         try:
-            temp = HEARTBEAT_PATH.with_suffix(".tmp")
-            temp.write_text(json.dumps(payload), encoding="utf-8")
-            temp.replace(HEARTBEAT_PATH)
+            await asyncio.to_thread(_write_heartbeat_payload, payload)
         except OSError as exc:
             # Keep the task alive so a transient filesystem error cannot silently
             # kill heartbeat updates forever. A persistent error still makes the
@@ -4477,10 +6790,57 @@ async def heartbeat_loop() -> None:
 
 
 async def write_diagnostics() -> None:
+    config = cluster_runtime.applied_config or ClusterConfig()
+    bus = cluster_runtime.bus
+    now_monotonic = time.monotonic()
+    remote_statuses = {
+        str(shooter_id): {
+            **status.payload(),
+            "ready": status.ready,
+            "age_seconds": max(0.0, now_monotonic - status.updated_monotonic),
+        }
+        for shooter_id, status in sorted(cluster_runtime.remote_statuses.items())
+    }
     payload = {
         "version": APP_VERSION,
+        "shooter_id": SHOOTER_ID,
+        "active_shooters": active_shooter_count(),
+        "cluster_udp_ready": bool(bus and bus.ready),
+        "cluster_signal_ready": (
+            bool(getattr(bus, "peers_ready", getattr(bus, "fully_connected", False)))
+            if bus is not None else config.active_shooters == 1
+        ),
+        "cluster": {
+            "configured": config.configured,
+            "generation": config.generation,
+            "active_shooters": config.active_shooters,
+            "configured_token_ids": (
+                await asyncio.to_thread(provision_store.configured_token_ids)
+                if PRIMARY_SHOOTER else []
+            ),
+            "resolved_peer_ids": sorted(bus.resolved_peer_ids) if bus is not None else [],
+            "expected_peer_ids": sorted(bus.expected_peer_ids) if bus is not None else [],
+            "fully_connected": bool(bus and bus.fully_connected),
+            "live_peer_ids": sorted(getattr(bus, "live_peer_ids", set())) if bus is not None else [],
+            "peers_ready": bool(getattr(bus, "peers_ready", getattr(bus, "fully_connected", False))),
+            "last_ping_age_seconds": (
+                max(0.0, now_monotonic - float(getattr(bus, "last_ping_monotonic", 0.0)))
+                if bus is not None and float(getattr(bus, "last_ping_monotonic", 0.0)) else None
+            ),
+            "remote_statuses": remote_statuses,
+            "last_local_status": (
+                {
+                    **cluster_runtime.last_local_status.payload(),
+                    "ready": cluster_runtime.last_local_status.ready,
+                }
+                if cluster_runtime.last_local_status is not None
+                else None
+            ),
+        },
         "live_upgrades": store.settings.live_upgrades,
         "max_upgrade_stars": MAX_UPGRADE_STARS,
+        "fast_quiet_distance": FAST_QUIET_DISTANCE,
+        "fast_disable_gc": FAST_DISABLE_GC,
         "adaptive_scan": ADAPTIVE_SCAN,
         "scan_start_interval_ms": SCAN_START_INTERVAL_MS,
         "scan_min_interval_ms": SCAN_MIN_INTERVAL_MS,
@@ -4507,6 +6867,7 @@ async def write_diagnostics() -> None:
             "channel_title": store.settings.channel_title,
             "selected_saved_ids": store.settings.selected_saved_ids,
             "target_numbers": store.settings.target_numbers,
+            "volley_size": store.settings.volley_size,
             "api_id_present": bool(store.settings.api_id),
             "api_hash_present": bool(store.settings.api_hash),
             "phone_present": bool(store.settings.phone),
@@ -4526,26 +6887,106 @@ async def write_diagnostics() -> None:
 
 
 async def run_bot() -> None:
-    global _bot_instance
+    global _bot_instance, _dispatcher_instance, _EVENT_LOOP_LAST_TICK
     if not BOT_TOKEN:
         raise RuntimeError("Environment variable BOT_TOKEN is required")
-    logger.info("application_start version=%s", APP_VERSION)
+    logger.info("application_start version=%s shooter_id=%s", APP_VERSION, SHOOTER_ID)
     await store.save()
+    config = cluster_runtime.applied_config or provision_store.load_config()
+    safe_save_lifecycle(
+        SHOOTER_ID,
+        state="starting",
+        generation=config.generation,
+        active_shooters=config.active_shooters,
+        reason="application_start",
+        version=APP_VERSION,
+        pid=os.getpid(),
+    )
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     _bot_instance = bot
     dispatcher = Dispatcher()
+    _dispatcher_instance = dispatcher
     dispatcher.include_router(router)
-    heartbeat_task = asyncio.create_task(heartbeat_loop(), name="heartbeat")
+    heartbeat_task: asyncio.Task[None] | None = None
+    tick_task: asyncio.Task[None] | None = None
+    cluster_started = False
+    failed = False
+    _WATCHDOG_STOP.clear()
+    _EVENT_LOOP_LAST_TICK = time.monotonic()
+    watchdog_thread = threading.Thread(
+        target=_watchdog_worker,
+        name=f"gift-hunter-watchdog-{SHOOTER_ID}",
+        daemon=True,
+    )
+    watchdog_thread.start()
     try:
+        tick_task = asyncio.create_task(event_loop_tick_loop(), name="event-loop-tick")
+        heartbeat_task = asyncio.create_task(heartbeat_loop(), name="heartbeat")
+        await cluster_runtime.start()
+        cluster_started = True
+        config = cluster_runtime.applied_config or provision_store.load_config()
+        safe_save_lifecycle(
+            SHOOTER_ID,
+            state="active",
+            generation=config.generation,
+            active_shooters=config.active_shooters,
+            reason="bot_and_udp_started",
+            version=APP_VERSION,
+            pid=os.getpid(),
+        )
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+    except Exception as exc:
+        failed = True
+        config = cluster_runtime.applied_config or provision_store.load_config()
+        with contextlib.suppress(Exception):
+            safe_save_lifecycle(
+                SHOOTER_ID,
+                state="error",
+                generation=config.generation,
+                active_shooters=config.active_shooters,
+                reason=type(exc).__name__,
+                version=APP_VERSION,
+                pid=os.getpid(),
+            )
+            record_cluster_event(
+                "application_failed",
+                error_type=type(exc).__name__,
+                generation=config.generation,
+                active_shooters=config.active_shooters,
+            )
+        raise
     finally:
-        await scanner.stop("shutdown")
-        await stress_tester.stop("shutdown")
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        await mtproto.disconnect()
-        await bot.session.close()
+        _WATCHDOG_STOP.set()
+        watchdog_thread.join(timeout=1.0)
+        with contextlib.suppress(Exception):
+            await scanner.stop("shutdown")
+        with contextlib.suppress(Exception):
+            await stress_tester.stop("shutdown")
+        if cluster_started:
+            with contextlib.suppress(Exception):
+                await cluster_runtime.stop()
+        for task in (heartbeat_task, tick_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        with contextlib.suppress(Exception):
+            await mtproto.disconnect()
+        with contextlib.suppress(Exception):
+            await bot.session.close()
+        if not cluster_runtime.deactivation_in_progress and not failed:
+            config = cluster_runtime.applied_config or provision_store.load_config()
+            with contextlib.suppress(Exception):
+                safe_save_lifecycle(
+                    SHOOTER_ID,
+                    state="stopped",
+                    generation=config.generation,
+                    active_shooters=config.active_shooters,
+                    reason="process_shutdown",
+                    version=APP_VERSION,
+                    pid=os.getpid(),
+                )
+        _dispatcher_instance = None
         _bot_instance = None
 
 
@@ -4560,7 +7001,7 @@ def run_auth() -> None:
         session,
         int(s.api_id),
         str(s.api_hash),
-        device_model="Gift Hunter VPS",
+        device_model=f"Gift Hunter {SHOOTER_ID} VPS",
         system_version="Linux",
         app_version=APP_VERSION,
         lang_code="ru",
@@ -4579,6 +7020,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    apply_fast_cpu_affinity()
     args = parse_args()
     if args.command == "auth":
         run_auth()

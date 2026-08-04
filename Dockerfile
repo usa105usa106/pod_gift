@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    DATA_DIR=/app/data
+    DATA_DIR=/app/data \
+    PROVISION_DIR=/provision
 
 WORKDIR /app
 
@@ -13,10 +14,10 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
-COPY main.py logic.py healthcheck.py ./
+COPY main.py logic.py cluster.py bootstrap.py healthcheck.py ./
 
-RUN mkdir -p /app/data \
-    && chown -R appuser:appuser /app
+RUN mkdir -p /app/data /provision \
+    && chown -R appuser:appuser /app /provision
 
 USER appuser
 STOPSIGNAL SIGTERM

@@ -13,3 +13,6 @@ logs/
 *.zip
 .DS_Store
 .pytest_cache/
+.venv/
+provision/
+*.sha256

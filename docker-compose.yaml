@@ -1,44 +1,147 @@
+x-hunter-common: &hunter-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+x-hunter-env: &hunter-env
+  SETUP_PIN: ${SETUP_PIN:?SETUP_PIN is required}
+  DATA_DIR: /app/data
+  MT_SESSION: /app/data/account
+  PROVISION_DIR: /provision
+  FIRE_PORT: ${FIRE_PORT:-45444}
+  FIRE_SECRET: ${FIRE_SECRET:?FIRE_SECRET is required}
+  CLUSTER_STATUS_INTERVAL_SECONDS: ${CLUSTER_STATUS_INTERVAL_SECONDS:-60}
+  CLUSTER_STALE_SECONDS: ${CLUSTER_STALE_SECONDS:-180}
+  CLUSTER_PING_TIMEOUT_MS: ${CLUSTER_PING_TIMEOUT_MS:-500}
+  CLUSTER_CONFIG_POLL_SECONDS: ${CLUSTER_CONFIG_POLL_SECONDS:-2.0}
+  CLUSTER_CONFIG_STABLE_READS: ${CLUSTER_CONFIG_STABLE_READS:-2}
+  CLUSTER_RECONFIG_CONFIRM_SECONDS: ${CLUSTER_RECONFIG_CONFIRM_SECONDS:-10.0}
+  BOOTSTRAP_POLL_SECONDS: ${BOOTSTRAP_POLL_SECONDS:-2.0}
+  WATCHDOG_STALL_SECONDS: ${WATCHDOG_STALL_SECONDS:-90.0}
+  WATCHDOG_CHECK_SECONDS: ${WATCHDOG_CHECK_SECONDS:-5.0}
+  ADAPTIVE_SCAN: ${ADAPTIVE_SCAN:-true}
+  SCAN_START_INTERVAL_MS: ${SCAN_START_INTERVAL_MS:-120}
+  SCAN_MIN_INTERVAL_MS: ${SCAN_MIN_INTERVAL_MS:-0}
+  SCAN_MAX_INTERVAL_MS: ${SCAN_MAX_INTERVAL_MS:-2000}
+  SCAN_ACCELERATE_EVERY: ${SCAN_ACCELERATE_EVERY:-4}
+  SCAN_ACCELERATE_FACTOR: ${SCAN_ACCELERATE_FACTOR:-0.75}
+  SCAN_BACKOFF_FACTOR: ${SCAN_BACKOFF_FACTOR:-2.0}
+  SCAN_BACKOFF_FLOOR_MS: ${SCAN_BACKOFF_FLOOR_MS:-100}
+  FLOOD_WAIT_EXTRA_MS: ${FLOOD_WAIT_EXTRA_MS:-150}
+  NEAR_TARGET_DISTANCE: ${NEAR_TARGET_DISTANCE:-25}
+  EXACT_PROBE_DISTANCE: ${EXACT_PROBE_DISTANCE:-100}
+  EXACT_COUNTER_REFRESH_SECONDS: ${EXACT_COUNTER_REFRESH_SECONDS:-1.0}
+  FAST_QUIET_DISTANCE: ${FAST_QUIET_DISTANCE:-10}
+  FAST_DISABLE_GC: ${FAST_DISABLE_GC:-true}
+  PREPARE_AHEAD: ${PREPARE_AHEAD:-100}
+  PREPARE_REFRESH_SECONDS: ${PREPARE_REFRESH_SECONDS:-420}
+  MAX_UPGRADE_STARS: ${MAX_UPGRADE_STARS:-3000}
+  KEEP_ORIGINAL_DETAILS: ${KEEP_ORIGINAL_DETAILS:-true}
+  STOP_AFTER_SUCCESS: ${STOP_AFTER_SUCCESS:-false}
+  DIAGNOSTICS_INTERVAL_SECONDS: ${DIAGNOSTICS_INTERVAL_SECONDS:-1.0}
+  LIVE_STATUS_INTERVAL_SECONDS: ${LIVE_STATUS_INTERVAL_SECONDS:-60.0}
+  STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS: ${STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS:-60.0}
+  STATUS_URGENT_MIN_INTERVAL_SECONDS: ${STATUS_URGENT_MIN_INTERVAL_SECONDS:-1.0}
+  STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS: ${STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS:-60.0}
+  HEALTHCHECK_MAX_AGE_SECONDS: ${HEALTHCHECK_MAX_AGE_SECONDS:-45}
+  TASK_STOP_TIMEOUT_SECONDS: ${TASK_STOP_TIMEOUT_SECONDS:-4.0}
+  CATALOG_CONCURRENCY: ${CATALOG_CONCURRENCY:-6}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
 services:
-  gift-hunter:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
+  hunter-1:
+    <<: *hunter-common
     environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      SETUP_PIN: ${SETUP_PIN:-}
-      DATA_DIR: /app/data
-      ADAPTIVE_SCAN: ${ADAPTIVE_SCAN:-true}
-      SCAN_START_INTERVAL_MS: ${SCAN_START_INTERVAL_MS:-120}
-      SCAN_MIN_INTERVAL_MS: ${SCAN_MIN_INTERVAL_MS:-0}
-      SCAN_MAX_INTERVAL_MS: ${SCAN_MAX_INTERVAL_MS:-2000}
-      SCAN_ACCELERATE_EVERY: ${SCAN_ACCELERATE_EVERY:-4}
-      SCAN_ACCELERATE_FACTOR: ${SCAN_ACCELERATE_FACTOR:-0.75}
-      SCAN_BACKOFF_FACTOR: ${SCAN_BACKOFF_FACTOR:-2.0}
-      SCAN_BACKOFF_FLOOR_MS: ${SCAN_BACKOFF_FLOOR_MS:-100}
-      FLOOD_WAIT_EXTRA_MS: ${FLOOD_WAIT_EXTRA_MS:-150}
-      NEAR_TARGET_DISTANCE: ${NEAR_TARGET_DISTANCE:-25}
-      EXACT_PROBE_DISTANCE: ${EXACT_PROBE_DISTANCE:-100}
-      EXACT_COUNTER_REFRESH_SECONDS: ${EXACT_COUNTER_REFRESH_SECONDS:-1.0}
-      PREPARE_AHEAD: ${PREPARE_AHEAD:-100}
-      PREPARE_REFRESH_SECONDS: ${PREPARE_REFRESH_SECONDS:-420}
-      MAX_UPGRADE_STARS: ${MAX_UPGRADE_STARS:-2000}
-      KEEP_ORIGINAL_DETAILS: ${KEEP_ORIGINAL_DETAILS:-true}
-      STOP_AFTER_SUCCESS: ${STOP_AFTER_SUCCESS:-false}
-      DIAGNOSTICS_INTERVAL_SECONDS: ${DIAGNOSTICS_INTERVAL_SECONDS:-1.0}
-      LIVE_STATUS_INTERVAL_SECONDS: ${LIVE_STATUS_INTERVAL_SECONDS:-60.0}
-      STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS: ${STATUS_MANUAL_REFRESH_COOLDOWN_SECONDS:-60.0}
-      STATUS_URGENT_MIN_INTERVAL_SECONDS: ${STATUS_URGENT_MIN_INTERVAL_SECONDS:-1.0}
-      STRESS_STATUS_INTERVAL_SECONDS: ${STRESS_STATUS_INTERVAL_SECONDS:-3.0}
-      STATUS_BAD_REQUEST_COOLDOWN_SECONDS: ${STATUS_BAD_REQUEST_COOLDOWN_SECONDS:-900.0}
-      STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS: ${STATUS_TRANSIENT_FAILURE_COOLDOWN_SECONDS:-60.0}
-      HEALTHCHECK_MAX_AGE_SECONDS: ${HEALTHCHECK_MAX_AGE_SECONDS:-45}
-      TASK_STOP_TIMEOUT_SECONDS: ${TASK_STOP_TIMEOUT_SECONDS:-4.0}
-      CATALOG_CONCURRENCY: ${CATALOG_CONCURRENCY:-6}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      <<: *hunter-env
+      SHOOTER_ID: 1
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      PROVISION_TOKEN_DIR: /provision-tokens
+      FAST_CPU_AFFINITY: ${HUNTER_1_CPU:-}
     volumes:
-      - gift_hunter_data:/app/data
+      - hunter_1_data:/app/data
+      - hunter_provision:/provision
+      - hunter_2_token:/provision-tokens/hunter-2
+      - hunter_3_token:/provision-tokens/hunter-3
+      - hunter_4_token:/provision-tokens/hunter-4
+      - hunter_5_token:/provision-tokens/hunter-5
+      - hunter_6_token:/provision-tokens/hunter-6
+
+  hunter-2:
+    <<: *hunter-common
+    command: ["python", "-u", "/app/bootstrap.py"]
+    environment:
+      <<: *hunter-env
+      SHOOTER_ID: 2
+      BOT_TOKEN_FILE: /app/provision-token/bot.token
+      FAST_CPU_AFFINITY: ${HUNTER_2_CPU:-}
+    volumes:
+      - hunter_2_data:/app/data
+      - hunter_provision:/provision
+      - hunter_2_token:/app/provision-token:ro
+
+  hunter-3:
+    <<: *hunter-common
+    command: ["python", "-u", "/app/bootstrap.py"]
+    environment:
+      <<: *hunter-env
+      SHOOTER_ID: 3
+      BOT_TOKEN_FILE: /app/provision-token/bot.token
+      FAST_CPU_AFFINITY: ${HUNTER_3_CPU:-}
+    volumes:
+      - hunter_3_data:/app/data
+      - hunter_provision:/provision
+      - hunter_3_token:/app/provision-token:ro
+
+  hunter-4:
+    <<: *hunter-common
+    command: ["python", "-u", "/app/bootstrap.py"]
+    environment:
+      <<: *hunter-env
+      SHOOTER_ID: 4
+      BOT_TOKEN_FILE: /app/provision-token/bot.token
+      FAST_CPU_AFFINITY: ${HUNTER_4_CPU:-}
+    volumes:
+      - hunter_4_data:/app/data
+      - hunter_provision:/provision
+      - hunter_4_token:/app/provision-token:ro
+
+  hunter-5:
+    <<: *hunter-common
+    command: ["python", "-u", "/app/bootstrap.py"]
+    environment:
+      <<: *hunter-env
+      SHOOTER_ID: 5
+      BOT_TOKEN_FILE: /app/provision-token/bot.token
+      FAST_CPU_AFFINITY: ${HUNTER_5_CPU:-}
+    volumes:
+      - hunter_5_data:/app/data
+      - hunter_provision:/provision
+      - hunter_5_token:/app/provision-token:ro
+
+  hunter-6:
+    <<: *hunter-common
+    command: ["python", "-u", "/app/bootstrap.py"]
+    environment:
+      <<: *hunter-env
+      SHOOTER_ID: 6
+      BOT_TOKEN_FILE: /app/provision-token/bot.token
+      FAST_CPU_AFFINITY: ${HUNTER_6_CPU:-}
+    volumes:
+      - hunter_6_data:/app/data
+      - hunter_provision:/provision
+      - hunter_6_token:/app/provision-token:ro
 
 volumes:
-  gift_hunter_data:
-    name: pod_gift_data
+  hunter_1_data:
+  hunter_2_data:
+  hunter_3_data:
+  hunter_4_data:
+  hunter_5_data:
+  hunter_6_data:
+  hunter_provision:
+  hunter_2_token:
+  hunter_3_token:
+  hunter_4_token:
+  hunter_5_token:
+  hunter_6_token:
