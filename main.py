@@ -50,6 +50,7 @@ from cluster import (
     ShooterStatus,
     StableConfigGate,
     campaign_id_for,
+    resolve_fire_secret,
 )
 
 from logic import (
@@ -85,7 +86,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0029"
+APP_VERSION = "v0030"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -156,7 +157,11 @@ SHOOTER_ID = min(MAX_SHOOTERS, max(1, env_int("SHOOTER_ID", 1, minimum=1)))
 PRIMARY_SHOOTER = SHOOTER_ID == 1
 PROVISION_DIR = Path(os.getenv("PROVISION_DIR", "/provision"))
 FIRE_PORT = env_int("FIRE_PORT", 45444, minimum=1024)
-FIRE_SECRET = os.getenv("FIRE_SECRET", "").strip()
+FIRE_SECRET, FIRE_SECRET_SOURCE = resolve_fire_secret(
+    PROVISION_DIR,
+    SHOOTER_ID,
+    os.getenv("FIRE_SECRET", ""),
+)
 CLUSTER_STATUS_INTERVAL_SECONDS = env_float("CLUSTER_STATUS_INTERVAL_SECONDS", 60.0, minimum=60.0)
 CLUSTER_STALE_SECONDS = env_float("CLUSTER_STALE_SECONDS", 180.0, minimum=120.0)
 CLUSTER_PING_TIMEOUT_MS = env_int("CLUSTER_PING_TIMEOUT_MS", 500, minimum=100)
@@ -4128,16 +4133,21 @@ class ClusterRuntime:
             if self.applied_config is not None:
                 await self.bus.refresh_config_and_peers(self.applied_config)
             logger.info(
-                "cluster_udp_started shooter_id=%s port=%s active_shooters=%s resolved_peers=%s expected_peers=%s fully_connected=%s",
+                "cluster_udp_started shooter_id=%s port=%s secret_source=%s active_shooters=%s resolved_peers=%s expected_peers=%s fully_connected=%s",
                 SHOOTER_ID,
                 FIRE_PORT,
+                FIRE_SECRET_SOURCE,
                 self.bus.config.active_shooters,
                 sorted(self.bus.resolved_peer_ids),
                 sorted(self.bus.expected_peer_ids),
                 self.bus.fully_connected,
             )
         else:
-            logger.warning("cluster_udp_disabled FIRE_SECRET_is_empty shooter_id=%s", SHOOTER_ID)
+            logger.warning(
+                "cluster_udp_disabled fire_secret_unavailable shooter_id=%s secret_source=%s",
+                SHOOTER_ID,
+                FIRE_SECRET_SOURCE,
+            )
         self.task = asyncio.create_task(self._loop(), name=f"cluster-runtime-{SHOOTER_ID}")
 
     def _on_config_notice(self, generation: int, active_shooters: int) -> None:
@@ -4467,12 +4477,16 @@ class ClusterRuntime:
         """RAM-only UDP callback; file logging is deferred to a worker thread."""
         if not PRIMARY_SHOOTER:
             return
+        if status.shooter_id == 1:
+            # Local Hunter 1 state is tracked by ``last_local_status`` and is
+            # never a remote participant. Ignore a looped-back status silently.
+            return
         config = self.applied_config
         expected_campaign = next(iter(scanner._campaign_ids_by_slug.values()), None)
         reject_reason: str | None = None
         if config is None:
             reject_reason = "config_missing"
-        elif status.shooter_id == 1 or status.shooter_id > config.active_shooters:
+        elif status.shooter_id > config.active_shooters:
             reject_reason = "shooter_outside_active_set"
         elif status.generation != config.generation:
             reject_reason = "generation_mismatch"
@@ -6231,7 +6245,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0029 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0030 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):

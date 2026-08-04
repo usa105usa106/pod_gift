@@ -1,11 +1,21 @@
-# Аудит логирования v0029
+# Аудит логирования v0030
+
+## Автоматический UDP-секрет
+
+При успешном старте UDP обычный лог содержит только источник ключа, но не значение:
+
+```text
+cluster_udp_started shooter_id=... port=... secret_source=generated|provision|environment ...
+```
+
+`fire-secret.txt` намеренно не включается в `/log_full`. Hunter 1 не отправляет собственный служебный статус в таблицу удалённых участников, поэтому штатный локальный heartbeat больше не создаёт `cluster_status_rejected shooter_id=1`.
 
 ## FAST-снайпер и залп
 
 При запуске каждого Hunter:
 
 ```text
-scanner_started version=v0029 shooter_id=... mode=sniper|volley active_shooters=...
+scanner_started version=v0030 shooter_id=... mode=sniper|volley active_shooters=...
 saved_ids=... targets=... live=... volley=... volley_limit=...
 ```
 

@@ -6,10 +6,10 @@ import sys
 import time
 from pathlib import Path
 
-from cluster import MAX_SHOOTERS, ProvisionStore, StableConfigGate
+from cluster import MAX_SHOOTERS, ProvisionStore, StableConfigGate, resolve_fire_secret
 
 
-APP_VERSION = "v0029"
+APP_VERSION = "v0030"
 
 
 def append_bootstrap_log(path: Path, event: str, **fields: object) -> None:
@@ -177,6 +177,21 @@ def main() -> None:
                 config.generation,
                 config.active_shooters,
                 "not_selected",
+            )
+            time.sleep(poll_seconds)
+            continue
+
+        fire_secret, _fire_secret_source = resolve_fire_secret(
+            provision_dir,
+            shooter_id,
+            os.getenv("FIRE_SECRET", ""),
+        )
+        if not fire_secret:
+            publish_state(
+                "waiting",
+                config.generation,
+                config.active_shooters,
+                "fire_secret_missing",
             )
             time.sleep(poll_seconds)
             continue

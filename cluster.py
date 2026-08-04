@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import fcntl
 import hmac
 import json
 import os
@@ -25,6 +26,88 @@ def _atomic_write(path: Path, data: str, mode: int = 0o600) -> None:
     os.chmod(tmp, mode)
     tmp.replace(path)
     os.chmod(path, mode)
+
+
+FIRE_SECRET_FILENAME = "fire-secret.txt"
+MIN_FIRE_SECRET_LENGTH = 32
+
+
+def _read_fire_secret(path: Path) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return ""
+    return value if len(value) >= MIN_FIRE_SECRET_LENGTH else ""
+
+
+def resolve_fire_secret(
+    root: Path,
+    shooter_id: int,
+    environment_secret: str = "",
+) -> tuple[str, str]:
+    """Return the shared UDP secret without requiring a Coolify variable.
+
+    A non-empty environment value remains an optional migration override. When
+    it is absent, Hunter 1 creates one random secret exactly once in the shared
+    provision volume. A process lock plus O_EXCL protects rolling redeploys
+    where old and new Hunter 1 overlap. Secondary Hunters only read the
+    persisted value and never invent a different cluster key.
+    """
+
+    override = str(environment_secret or "").strip()
+    if override:
+        return override, "environment"
+
+    root = Path(root)
+    path = root / FIRE_SECRET_FILENAME
+    existing = _read_fire_secret(path)
+    if existing:
+        return existing, "provision"
+    if int(shooter_id) != 1:
+        return "", "missing"
+
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".fire-secret.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return "", "missing"
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        existing = _read_fire_secret(path)
+        if existing:
+            return existing, "provision"
+
+        # Recover automatically if a previous process died after creating an
+        # empty/partial file but before completing the first write.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            return "", "missing"
+
+        generated = secrets.token_hex(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError:
+            existing = _read_fire_secret(path)
+            return (existing, "provision") if existing else ("", "missing")
+
+        try:
+            os.write(fd, (generated + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return generated, "generated"
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 @dataclass(frozen=True)
@@ -755,7 +838,9 @@ class ClusterBus:
         if transport is None:
             return False
         if self.shooter_id == 1:
-            self.on_status(status)
+            # Hunter 1 already keeps its local status in RAM. Feeding it back
+            # through the remote-status callback caused a false
+            # shooter_outside_active_set rejection every minute.
             return True
         address = self.primary_address
         if address is None:
