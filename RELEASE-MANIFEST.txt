@@ -1,32 +1,36 @@
-Gift Hunter v0030 release manifest
-Validation target: Python compile/AST, Compose structure, 174 unittest cases, UDP packet fuzz
-Volley roles: Hunter 1 = 1-15; Hunter 2-6 = 1-3, independent per container
-FIRE secret: generated once by Hunter 1 in persistent provision volume; Coolify variable optional
-FIRE secret race safety: process lock + O_EXCL; partial first-write recovery
-FIRE identity: generation + collection campaign_id + shot + exact predecessor
-FAST ordering: local payment tasks are created before prebuilt HMAC UDP FIRE; no await/log/disk between
-Hunter 1 status: local state is not fed into remote participant validation
-Live Telegram/Coolify/Stars validation: not performed
+Gift Hunter v0033 — Release Manifest — Final audited release
 
-e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4	166	.dockerignore
-30543de1711d047a218c10dfbee03e7c241a1564859e8741a4ed5a11492414ee	1941	.env.example
-8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6	153	.gitignore
-6f8ef1b6430e79944eb292f8a6c7ba92cbaf739e354c1fa2f57098a2708b452e	6155	AUDIT-LOGGING.md
-2e5d604f39b93959d9677f6d36848f2d07ae0b22443d0dc518d3afd13b02b896	17418	CHANGELOG.md
-ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795	722	Dockerfile
-4b1adb657a3be98909fe57861c30a42940d6c217a5406d0681742d3c334433e2	22253	README.md
-3b5e6840821a14393e88799d340a1e66ca59306433c130385401246a35d6608d	7584	VALIDATION.md
-852019847a7b618718b58b879a3872dfbceb87f79daec9804c65f63e81adcf7e	7663	bootstrap.py
-050ea91da9268b266ba63357d682ec057b3bafb3702bf622a329c46a9b05120c	35383	cluster.py
-5f5903fec3eb7198921c1096964fd496dfd0976ea2a1a67de72d27e0c0ecbb13	5160	docker-compose.yaml
-72f90371bf29d271d3ed61211b4e7f56a477a32e854fd262f87d6813fcb300dd	1533	healthcheck.py
-8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d	10781	logic.py
-a852aae176d1a09e4858c814b987b4be505d7096ab97b9938e563bcd5804c070	315386	main.py
-7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4	85	requirements.txt
-959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398	54	tests/__init__.py
-591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922	4020	tests/stub_modules.py
-3ecef914ccb6f16802deab67c98ac2c01ae1d219bc151325ad76fe9534dcfd11	2109	tests/test_bootstrap.py
-4012f2bc18ba5a31bf810e7a54e5eb3b1cd6308a13f36f3bf74a973a42e0a353	19099	tests/test_cluster.py
-fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530	4494	tests/test_logic.py
-d0f0c9b563c72422fd76ec9387f7f954b87e46c69965f9feb045a22c3581e95c	145380	tests/test_runtime.py
-fe6485a352be641267eb57b7dfe114eb75148ce650ee786d6bb5ddebad328f9f	16075	tests/test_source_guards.py
+Validation summary:
+- 192 tests pass in the updated release tree.
+- Python sources compile successfully; AST parsing succeeds; asyncio debug-run completed without RuntimeWarning.
+- docker-compose.yaml parses with 6 services.
+- Version identifiers in application, bootstrap, healthcheck, user-facing strings, tests and documentation are synchronized to v0033; no previous-version identifiers remain.
+- Critical payment-safety fix A: an existing but unreadable/corrupt payment-submit-guard.json now fails closed and cannot be silently treated as absent before a Stars submission.
+- Critical payment-safety fix B: every durable payment-guard mutation receives a fresh random generation token, preventing a previously persisted confirmation token from matching a later armed submission after stale-guard cleanup failure.
+- Previous Stage 1–4 fixes remain intact.
+- No live Telegram/Stars payment was executed as part of this offline validation.
+
+Files (SHA256  bytes  path):
+e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
+300000ca9db0adae182d21dd4cd858a365a9fa679548e71847da9b9bfccd20f8        2313  .env.example
+8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
+08c7eaa6bc933356c4febab23d75d94a09acdd668b491e3816be4bfad1511b29        8257  AUDIT-LOGGING.md
+c71d73029d37b0552e6c7408cb8ee8a7a3f61ecd66673735d18fe58f46021ae6       29351  CHANGELOG.md
+ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
+70dea47d539de341aa17fb9ddcef42c7c56659a48b62f15759a7a0f1616a0c24        1597  PAYMENT-DIAGNOSTIC-PATCH.md
+cf23ae03cb8aa4bc89f0b0bbad24368629b51b6fcf9f97f144005e2a300a8478       27258  README.md
+dc7aef5038f0deb0cfc8d4015ecc330c60e658ca65ab849e64ea0b59daeccdfb       16711  VALIDATION.md
+f19d141f98f29a356a9bee260c70b2453d653743818624be739329430660ec47        7663  bootstrap.py
+5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
+394005f428faf1878d62c538b3720b478208450a00c935c35b42ee0cf956d173        5565  docker-compose.yaml
+0ecf49bd42010a2e32071c4b73e600a11d53be2b8b13a5b0ba517075f6b9a5bb        1533  healthcheck.py
+8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
+9822a33693cbf3f91573efbc7a02fa7d47f0b25146860abe87682e89e9720fa2      368055  main.py
+7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
+959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
+591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
+81e6188306eab3953032990327165f6a7379b5f115c0d316af72c10f4b4d54f1        2109  tests/test_bootstrap.py
+6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
+fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
+ee250c2b142a96df94280ad0bcbc202e784d5164e7b5e7879cccf9d7ee12be75      159821  tests/test_runtime.py
+49eccd87416f60412ddcf6e6b8e9dff71c987de14b08401b72d12a5dce17e9d5       20630  tests/test_source_guards.py

@@ -199,6 +199,7 @@ class ProvisionStore:
         self.config_path = self.root / "cluster.json"
         self.generation_path = self.root / "cluster-generation.json"
         self.event_path = self.root / "cluster-events.jsonl"
+        self.event_lock_path = self.root / ".cluster-events.lock"
         self._last_valid_config: ClusterConfig | None = None
 
     def read_config(self) -> ConfigRead:
@@ -394,17 +395,58 @@ class ProvisionStore:
             },
         }
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(
-            self.event_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
+        lock_fd = os.open(self.event_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            os.write(fd, line.encode("utf-8", errors="replace"))
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            fd = os.open(
+                self.event_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                os.write(fd, line.encode("utf-8", errors="replace"))
+            finally:
+                os.close(fd)
+            os.chmod(self.event_path, 0o600)
         finally:
-            os.close(fd)
-        os.chmod(self.event_path, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         return self.event_path
+
+    def prune_events_before(self, cutoff_epoch: float) -> tuple[bool, bool]:
+        """Keep shared cluster events at or after cutoff under the append lock.
+
+        Returns (changed, deleted). The file is removed when no recent events remain.
+        """
+        lock_fd = os.open(self.event_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if not self.event_path.exists():
+                return False, False
+            kept: list[str] = []
+            changed = False
+            with self.event_path.open("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        payload = json.loads(line)
+                        timestamp = float(payload.get("timestamp"))
+                    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+                        # Preserve malformed/new-format data rather than deleting evidence.
+                        kept.append(line)
+                        continue
+                    if timestamp >= float(cutoff_epoch):
+                        kept.append(line)
+                    else:
+                        changed = True
+            if not kept:
+                self.event_path.unlink(missing_ok=True)
+                return True, True
+            if changed:
+                _atomic_write(self.event_path, "".join(kept))
+            return changed, False
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 @dataclass(frozen=True)

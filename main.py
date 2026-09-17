@@ -11,12 +11,14 @@ import logging
 import os
 import re
 import resource
+import shutil
 import signal
 import statistics
 import socket
 import sys
 import threading
 import time
+import tempfile
 import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -86,17 +88,19 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0030"
+APP_VERSION = "v0033"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
 HEARTBEAT_PATH = DATA_DIR / "heartbeat.json"
 LOG_PATH = DATA_DIR / f"gift-hunter-{APP_VERSION}.log"
+PAYMENT_AUDIT_PATH = DATA_DIR / f"gift-hunter-{APP_VERSION}-payment-audit.jsonl"
 DIAGNOSTICS_PATH = DATA_DIR / "diagnostics.json"
 STRESS_REPORT_PATH = DATA_DIR / "stress-test-latest.json"
 STRESS_HISTORY_PATH = DATA_DIR / "stress-tests.jsonl"
 CATALOG_REPORT_PATH = DATA_DIR / "catalog-numbers-latest.json"
 RATE_LIMIT_PATH = DATA_DIR / "rate-limit.json"
+PAYMENT_GUARD_PATH = DATA_DIR / "payment-submit-guard.json"
 PENDING_PAYMENT_HOLD_MESSAGE = (
     "Есть платёж с неподтверждённым результатом. Повторная оплата и изменение "
     "связанных настроек заблокированы до сверки с Telegram."
@@ -116,7 +120,29 @@ SCAN_BACKOFF_FLOOR_MS = max(SCAN_MIN_INTERVAL_MS, env_int("SCAN_BACKOFF_FLOOR_MS
 FLOOD_WAIT_EXTRA_MS = env_int("FLOOD_WAIT_EXTRA_MS", 150, minimum=0)
 NEAR_TARGET_DISTANCE = env_int("NEAR_TARGET_DISTANCE", 25, minimum=1)
 PREPARE_AHEAD = env_int("PREPARE_AHEAD", 100, minimum=1)
-PREPARE_REFRESH_SECONDS = env_int("PREPARE_REFRESH_SECONDS", 420, minimum=60)
+# Telegram Stars payment forms expire after 10 minutes. Keep a generous safety
+# margin and continuously refresh prepared forms while the scanner is active.
+TELEGRAM_PAYMENT_FORM_TTL_SECONDS = 600
+PAYMENT_FORM_MAX_AGE_SECONDS = min(
+    540, env_int("PAYMENT_FORM_MAX_AGE_SECONDS", 480, minimum=120)
+)
+PREPARE_REFRESH_SECONDS = min(
+    PAYMENT_FORM_MAX_AGE_SECONDS - 60,
+    env_int("PREPARE_REFRESH_SECONDS", 300, minimum=60),
+)
+FORM_REFRESH_TICK_SECONDS = env_float("FORM_REFRESH_TICK_SECONDS", 1.0, minimum=0.25)
+FORM_REFRESH_BATCH_SIZE = min(50, env_int("FORM_REFRESH_BATCH_SIZE", 1, minimum=1))
+FORM_REFRESH_MAX_BATCH_SIZE = max(
+    FORM_REFRESH_BATCH_SIZE,
+    min(50, env_int("FORM_REFRESH_MAX_BATCH_SIZE", 50, minimum=1)),
+)
+FORM_REFRESH_LATENCY_INITIAL_SECONDS = env_float(
+    "FORM_REFRESH_LATENCY_INITIAL_SECONDS", 0.5, minimum=0.05
+)
+FORM_REFRESH_LATENCY_EWMA_ALPHA = min(
+    1.0,
+    max(0.05, env_float("FORM_REFRESH_LATENCY_EWMA_ALPHA", 0.25, minimum=0.0)),
+)
 DEFAULT_MAX_UPGRADE_STARS = 3000
 MAX_UPGRADE_STARS = env_int("MAX_UPGRADE_STARS", DEFAULT_MAX_UPGRADE_STARS, minimum=0)
 DIAGNOSTICS_INTERVAL_SECONDS = env_float("DIAGNOSTICS_INTERVAL_SECONDS", 1.0, minimum=0.5)
@@ -124,6 +150,18 @@ VERIFY_DELAYS_SECONDS = (0.10, 0.25, 0.50, 1.0, 2.0, 3.0)
 STOP_AFTER_SUCCESS = parse_bool(os.getenv("STOP_AFTER_SUCCESS", "false"), False)
 KEEP_ORIGINAL_DETAILS = parse_bool(os.getenv("KEEP_ORIGINAL_DETAILS", "true"), True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_MAX_BYTES = env_int("LOG_MAX_BYTES", 25_000_000, minimum=1_000_000)
+LOG_BACKUP_COUNT = env_int("LOG_BACKUP_COUNT", 12, minimum=1)
+PAYMENT_AUDIT_MAX_BYTES = env_int("PAYMENT_AUDIT_MAX_BYTES", 25_000_000, minimum=1_000_000)
+PAYMENT_AUDIT_BACKUP_COUNT = env_int("PAYMENT_AUDIT_BACKUP_COUNT", 12, minimum=1)
+PAYMENT_AUDIT_HEALTHCHECK_SECONDS = env_float(
+    "PAYMENT_AUDIT_HEALTHCHECK_SECONDS", 60.0, minimum=10.0
+)
+LOG_FULL_WINDOW_SECONDS = 24 * 60 * 60
+# Keep a little room below Telegram's nominal 50 MB document ceiling.
+LOG_FULL_TELEGRAM_LIMIT_BYTES = 49_000_000
+LOG_FULL_PART_TARGET_BYTES = 45_000_000
+LOG_FULL_FRAGMENT_BYTES = 20_000_000
 
 STRESS_TEST_DURATION_SECONDS = 300.0
 STRESS_FIRST_PHASE_SECONDS = 60.0
@@ -147,10 +185,22 @@ SPECIAL_NUMBER_MAX_DISTANCE = 100
 SPECIAL_NUMBER_LENGTHS = (4, 5, 6)
 EXACT_PROBE_DISTANCE = env_int("EXACT_PROBE_DISTANCE", 100, minimum=2)
 EXACT_COUNTER_REFRESH_SECONDS = env_float("EXACT_COUNTER_REFRESH_SECONDS", 1.0, minimum=0.2)
-MAX_PRIMARY_VOLLEY_SIZE = 15
-MAX_SECONDARY_VOLLEY_SIZE = 3
+MAX_PRIMARY_VOLLEY_SIZE = 50
+MAX_SECONDARY_VOLLEY_SIZE = 50
 DEFAULT_FAST_QUIET_DISTANCE = 10
 FAST_QUIET_DISTANCE = env_int("FAST_QUIET_DISTANCE", DEFAULT_FAST_QUIET_DISTANCE, minimum=1)
+# Refresh the entire FAST payment set before the scanner reaches the quiet/hot
+# zone, then stop all background form maintenance until the shot.  This keeps a
+# slow getPaymentForm request from owning the shared MTProto request lock while
+# the exact-number scanner is trying to read the frontier.
+FAST_FORM_FREEZE_DISTANCE = max(
+    FAST_QUIET_DISTANCE + 1,
+    env_int(
+        "FAST_FORM_FREEZE_DISTANCE",
+        max(NEAR_TARGET_DISTANCE, FAST_QUIET_DISTANCE + 1),
+        minimum=FAST_QUIET_DISTANCE + 1,
+    ),
+)
 FAST_DISABLE_GC = parse_bool(os.getenv("FAST_DISABLE_GC", "true"), True)
 FAST_CPU_AFFINITY = os.getenv("FAST_CPU_AFFINITY", "").strip()
 SHOOTER_ID = min(MAX_SHOOTERS, max(1, env_int("SHOOTER_ID", 1, minimum=1)))
@@ -357,16 +407,32 @@ def effective_max_volley_size() -> int:
 
 
 
+LOG_ROTATION_COORD_LOCK = threading.RLock()
+
+
+class CoordinatedRotatingFileHandler(RotatingFileHandler):
+    """Rotating handler whose namespace changes are coordinated with /log_full.
+
+    Normal emits do not take the coordination lock. Only rollover renames do,
+    so background pruning can detach numbered backups without ever replacing a
+    file that a concurrent rollover has just created.
+    """
+
+    def doRollover(self) -> None:  # noqa: N802 - logging API
+        with LOG_ROTATION_COORD_LOCK:
+            super().doRollover()
+
+
 def configure_logging() -> logging.Logger:
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     root = logging.getLogger()
     root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
     if not any(isinstance(handler, RotatingFileHandler) for handler in root.handlers):
-        file_handler = RotatingFileHandler(
+        file_handler = CoordinatedRotatingFileHandler(
             LOG_PATH,
-            maxBytes=2_000_000,
-            backupCount=3,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
             encoding="utf-8",
         )
         file_handler.setFormatter(formatter)
@@ -381,6 +447,172 @@ def configure_logging() -> logging.Logger:
 
 
 logger = configure_logging()
+
+
+@dataclass
+class PaymentAuditHealth:
+    """Thread-safe health state for the dedicated payment audit file."""
+
+    writable: bool = False
+    last_check_at: str | None = None
+    last_success_at: str | None = None
+    last_error: str | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def mark_success(self) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self.writable = True
+            self.last_check_at = stamp
+            self.last_success_at = stamp
+            self.last_error = None
+
+    def mark_failure(self, error: BaseException | str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self.writable = False
+            self.last_check_at = stamp
+            self.last_error = str(error)[:500]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "writable": self.writable,
+                "last_check_at": self.last_check_at,
+                "last_success_at": self.last_success_at,
+                "last_error": self.last_error,
+            }
+
+
+payment_audit_health = PaymentAuditHealth()
+
+
+class PaymentAuditFileHandler(CoordinatedRotatingFileHandler):
+    """Rotating handler that exposes write failures swallowed by logging.
+
+    ``logging`` normally routes file I/O failures through ``handleError`` and
+    does not re-raise them to the caller.  That makes a try/except around
+    ``logger.info`` insufficient for a financial audit trail.  This handler
+    records both successful writes and hidden handler failures explicitly.
+    """
+
+    def __init__(self, *args: Any, health: PaymentAuditHealth, **kwargs: Any) -> None:
+        self.health = health
+        self._emit_failed = False
+        super().__init__(*args, **kwargs)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._emit_failed = False
+        super().emit(record)
+        if not self._emit_failed:
+            self.health.mark_success()
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802 - logging API
+        self._emit_failed = True
+        error = sys.exc_info()[1] or RuntimeError("unknown payment audit handler error")
+        self.health.mark_failure(error)
+        # Preserve the standard debug-time stderr report without recursively
+        # logging through the same potentially broken filesystem.
+        if logging.raiseExceptions:
+            super().handleError(record)
+
+    def verify_writable(self) -> bool:
+        """Flush + fsync the live audit stream and update the health indicator."""
+        self.acquire()
+        try:
+            if self.stream is None:
+                self.stream = self._open()
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.health.mark_failure(exc)
+            return False
+        finally:
+            self.release()
+        self.health.mark_success()
+        return True
+
+
+def configure_payment_audit_logging() -> logging.Logger:
+    """Create a dedicated structured payment/form audit log.
+
+    It deliberately excludes tokens/session data and is separate from the main
+    log so payment evidence survives long-running scanner sessions and rotation.
+    """
+    audit = logging.getLogger("gift_hunter.payment_audit")
+    audit.setLevel(logging.INFO)
+    audit.propagate = False
+    if not any(isinstance(handler, PaymentAuditFileHandler) for handler in audit.handlers):
+        handler = PaymentAuditFileHandler(
+            PAYMENT_AUDIT_PATH,
+            maxBytes=PAYMENT_AUDIT_MAX_BYTES,
+            backupCount=PAYMENT_AUDIT_BACKUP_COUNT,
+            encoding="utf-8",
+            delay=True,
+            health=payment_audit_health,
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit.addHandler(handler)
+    return audit
+
+
+payment_audit_logger = configure_payment_audit_logging()
+log_full_lock = asyncio.Lock()
+
+
+def record_payment_event(event: str, **fields: Any) -> bool:
+    """Persist one structured, non-secret payment diagnostic event."""
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": APP_VERSION,
+        "shooter_id": SHOOTER_ID,
+        "event": event,
+        **fields,
+    }
+    try:
+        payment_audit_logger.info(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+    except Exception as exc:
+        payment_audit_health.mark_failure(exc)
+        logger.warning("payment_audit_write_failed event=%s error=%s", event, exc)
+        return False
+    return bool(payment_audit_health.snapshot()["writable"])
+
+
+def check_payment_audit_writable() -> bool:
+    """Actively verify that payment audit writes reach the filesystem."""
+    record_payment_event("payment_audit_healthcheck")
+    handlers = [
+        handler
+        for handler in payment_audit_logger.handlers
+        if isinstance(handler, PaymentAuditFileHandler)
+    ]
+    if not handlers:
+        payment_audit_health.mark_failure("payment audit file handler is missing")
+        return False
+    ok = all(handler.verify_writable() for handler in handlers)
+    if not ok:
+        logger.error(
+            "payment_audit_not_writable error=%s",
+            payment_audit_health.snapshot().get("last_error"),
+        )
+    return ok
+
+
+async def payment_audit_health_loop() -> None:
+    """Periodically verify/flush the audit file without blocking asyncio."""
+    while True:
+        try:
+            await asyncio.to_thread(check_payment_audit_writable)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            payment_audit_health.mark_failure(exc)
+            logger.error("payment_audit_healthcheck_failed error=%s", exc)
+        await asyncio.sleep(PAYMENT_AUDIT_HEALTHCHECK_SECONDS)
 
 
 def record_cluster_event(event: str, **fields: Any) -> None:
@@ -426,6 +658,7 @@ class Settings:
     payment_hold_targets: dict[str, int] = field(default_factory=dict)
     payment_hold_reason: str | None = None
     payment_verification_url: str | None = None
+    payment_guard_token: str | None = None
 
 
 class SettingsStore:
@@ -484,6 +717,7 @@ class SettingsStore:
             },
             payment_hold_reason=_str_or_none(nested.get("payment_hold_reason")),
             payment_verification_url=_str_or_none(nested.get("payment_verification_url")),
+            payment_guard_token=_str_or_none(nested.get("payment_guard_token")),
         )
         return settings
 
@@ -492,10 +726,14 @@ class SettingsStore:
             payload = asdict(self.settings)
             payload["version"] = APP_VERSION
             temp = self.path.with_suffix(".tmp")
-            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            with temp.open("w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.chmod(temp, 0o600)
             temp.replace(self.path)
             os.chmod(self.path, 0o600)
+            _fsync_parent(self.path)
 
     async def reset_operational(self) -> None:
         """Reset every user-facing setting while preserving authorization.
@@ -648,6 +886,209 @@ class RateLimitStore:
             logger.warning("rate_limit_state_write_failed error=%s", exc)
 
 
+PAYMENT_GUARD_LOCK = threading.RLock()
+
+
+class PaymentGuardStateError(OSError):
+    """Persistent payment guard exists but cannot be trusted or parsed."""
+
+
+def _fsync_parent(path: Path) -> None:
+    """Best-effort directory fsync for durable atomic state replacement."""
+    flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+    try:
+        fd = os.open(str(path.parent), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _load_payment_submission_guard(path: Path = PAYMENT_GUARD_PATH) -> dict[str, Any] | None:
+    """Load the durable pre-submit guard, failing closed on corruption.
+
+    A missing file means there is no armed submission.  An existing file that
+    cannot be read or validated is different: silently treating it as absent
+    could permit a second Stars payment after an interrupted first submission.
+    """
+    with PAYMENT_GUARD_LOCK:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PaymentGuardStateError(f"cannot read payment guard {path}: {exc}") from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PaymentGuardStateError(f"invalid payment guard JSON {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise PaymentGuardStateError(f"invalid payment guard payload {path}")
+        guard_id = _str_or_none(payload.get("guard_id"))
+        entries = payload.get("entries")
+        if guard_id is None or not isinstance(entries, list):
+            raise PaymentGuardStateError(f"incomplete payment guard payload {path}")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise PaymentGuardStateError(f"invalid payment guard entry {path}")
+            if not str(entry.get("slug", "")).strip():
+                raise PaymentGuardStateError(f"payment guard entry has no slug {path}")
+            if _positive_int_or_none(entry.get("target")) is None:
+                raise PaymentGuardStateError(f"payment guard entry has invalid target {path}")
+            if not _unique_ints(entry.get("saved_ids", [])):
+                raise PaymentGuardStateError(f"payment guard entry has no saved_ids {path}")
+        return payload
+
+
+def add_payment_submission_guard_entry(
+    *,
+    slug: str,
+    target: int,
+    saved_ids: Iterable[int],
+    campaign_id: str | None = None,
+    path: Path = PAYMENT_GUARD_PATH,
+) -> str:
+    """Durably arm a pre-submit guard before any Stars request may be sent.
+
+    The guard intentionally lives outside settings.json. If the process dies or
+    the post-volley settings save fails, startup converts every guarded saved_id
+    into a payment hold instead of risking a duplicate payment after restart.
+    """
+    with PAYMENT_GUARD_LOCK:
+        payload = _load_payment_submission_guard(path) or {}
+        # Every durable mutation gets a fresh generation token.  If clearing an
+        # already-confirmed guard failed and a later run arms another payment,
+        # the old token stored in settings.json must never make startup mistake
+        # the newer submission for stale cleanup residue.
+        guard_id = os.urandom(16).hex()
+        entries = [item for item in payload.get("entries", []) if isinstance(item, dict)]
+        key_slug = str(slug).strip()
+        key_target = int(target)
+        entries = [
+            item for item in entries
+            if not (str(item.get("slug", "")).strip() == key_slug and _int_or_none(item.get("target")) == key_target)
+        ]
+        entries.append(
+            {
+                "slug": key_slug,
+                "target": key_target,
+                "saved_ids": _unique_ints(saved_ids),
+                "campaign_id": _str_or_none(campaign_id),
+                "armed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        body = {
+            "version": APP_VERSION,
+            "guard_id": guard_id,
+            "entries": entries,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        temp = path.with_name(path.name + ".tmp")
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(body, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
+        temp.replace(path)
+        os.chmod(path, 0o600)
+        _fsync_parent(path)
+        return guard_id
+
+
+def remove_payment_submission_guard_entries(
+    keys: Iterable[tuple[str, int]],
+    *,
+    path: Path = PAYMENT_GUARD_PATH,
+) -> None:
+    with PAYMENT_GUARD_LOCK:
+        payload = _load_payment_submission_guard(path)
+        if payload is None:
+            return
+        remove = {(str(slug).strip(), int(target)) for slug, target in keys}
+        entries = [
+            item for item in payload.get("entries", [])
+            if isinstance(item, dict)
+            and (str(item.get("slug", "")).strip(), _int_or_none(item.get("target"))) not in remove
+        ]
+        if not entries:
+            path.unlink(missing_ok=True)
+            _fsync_parent(path)
+            return
+        payload["entries"] = entries
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        temp = path.with_name(path.name + ".tmp")
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
+        temp.replace(path)
+        os.chmod(path, 0o600)
+        _fsync_parent(path)
+
+
+def clear_payment_submission_guard(path: Path = PAYMENT_GUARD_PATH) -> None:
+    with PAYMENT_GUARD_LOCK:
+        path.unlink(missing_ok=True)
+        _fsync_parent(path)
+
+
+def _recover_settings_from_payment_guard(settings: Settings) -> None:
+    try:
+        payload = _load_payment_submission_guard()
+    except PaymentGuardStateError as exc:
+        # Keep the bot controllable for diagnostics, but fail closed for LIVE.
+        # Scanner.start() and every guard arm also reject the malformed state,
+        # so no Stars request can leave while the durable evidence is unreadable.
+        settings.live_upgrades = False
+        settings.payment_hold_reason = (
+            "Persistent payment guard повреждён или недоступен; LIVE заблокирован "
+            "до исправления payment-submit-guard.json"
+        )
+        logger.critical("payment_submission_guard_invalid error=%s", exc)
+        return
+    if payload is None:
+        return
+    guard_id = _str_or_none(payload.get("guard_id"))
+    # A matching token means the exact post-volley state already reached
+    # settings.json; a leftover guard is only an unlink failure and must not
+    # resurrect candidates that were confirmed or definitively failed.
+    if guard_id is not None and guard_id == settings.payment_guard_token:
+        with contextlib.suppress(OSError):
+            clear_payment_submission_guard()
+        return
+
+    guarded: list[int] = []
+    targets = dict(settings.payment_hold_targets)
+    for entry in payload.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        target = _positive_int_or_none(entry.get("target"))
+        ids = _unique_ints(entry.get("saved_ids", []))
+        guarded.extend(ids)
+        if target is not None:
+            for saved_id in ids:
+                targets[str(saved_id)] = target
+    guarded = _unique_ints(guarded)
+    if not guarded:
+        return
+    settings.payment_hold_saved_ids = _unique_ints([*settings.payment_hold_saved_ids, *guarded])
+    settings.payment_hold_targets = targets
+    settings.payment_hold_reason = (
+        "Обнаружен незавершённый persistent pre-submit guard; повторная оплата "
+        "заблокирована до сверки с Telegram"
+    )
+    settings.payment_verification_url = None
+    settings.live_upgrades = False
+    logger.error(
+        "payment_submission_guard_recovered guard_id=%s saved_ids=%s",
+        guard_id,
+        guarded,
+    )
+
+
 def current_rss_mb() -> float:
     """Current resident memory on Linux; fallback to process lifetime peak."""
     try:
@@ -661,6 +1102,7 @@ def current_rss_mb() -> float:
 
 
 store = SettingsStore(SETTINGS_PATH)
+_recover_settings_from_payment_guard(store.settings)
 
 
 def effective_volley_size() -> int:
@@ -714,6 +1156,11 @@ class RuntimeState:
     fast_fire_source: str | None = None
     fast_udp_peers_sent: int = 0
     fast_campaign_id: str | None = None
+    payment_form_refresh_count: int = 0
+    payment_form_refresh_failures: int = 0
+    payment_form_last_refresh_at: str | None = None
+    payment_form_last_refresh_error: str | None = None
+    payment_form_oldest_age_s: float | None = None
 
 
 runtime = RuntimeState(pending_verification_url=store.settings.payment_verification_url)
@@ -789,6 +1236,30 @@ class UpgradeOutcome:
     actual_slug: str | None = None
     verification_url: str | None = None
     detail: str | None = None
+
+
+def invoice_saved_id(invoice: Any | None) -> int | None:
+    """Return the saved gift ID carried by a Star Gift upgrade invoice."""
+    if invoice is None:
+        return None
+    stargift = getattr(invoice, "stargift", None)
+    return _int_or_none(getattr(stargift, "saved_id", None))
+
+
+def prepared_payment_debug(plan: PreparedUpgrade) -> dict[str, Any]:
+    """Non-secret fields that prove which gift/form a FAST request is bound to."""
+    request = plan.request
+    request_invoice = getattr(request, "invoice", None) if request is not None else None
+    return {
+        "saved_id": plan.saved_id,
+        "prepaid": plan.prepaid,
+        "form_id": plan.form_id,
+        "invoice_saved_id": invoice_saved_id(plan.invoice),
+        "request_form_id": _int_or_none(getattr(request, "form_id", None)) if request is not None else None,
+        "request_invoice_saved_id": invoice_saved_id(request_invoice),
+        "request_object_id": id(request) if request is not None else None,
+        "age_ms": round(max(0.0, time.monotonic() - plan.created_at) * 1000.0, 3),
+    }
 
 
 class MTProtoService:
@@ -1612,17 +2083,44 @@ class MTProtoService:
         )
 
     async def prepare_upgrade(self, peer: Any, info: SavedGiftInfo) -> PreparedUpgrade:
+        """Prepare one gift-specific upgrade request and capture its payment binding.
+
+        Paid gifts receive a fresh getPaymentForm result. The returned form_id is
+        bound to this exact InputInvoiceStarGiftUpgrade and is never shared or
+        substituted between saved gifts.
+        """
         await self.require_authorized()
+        started = time.perf_counter()
         input_saved = self.input_saved(peer, info.saved_id)
+        record_payment_event(
+            "upgrade_prepare_started",
+            saved_id=info.saved_id,
+            base_gift_id=info.base_gift_id,
+            prepaid=bool(info.prepaid),
+        )
         if info.prepaid:
             request = construct(
                 functions.payments.UpgradeStarGiftRequest,
                 stargift=input_saved,
                 keep_original_details=KEEP_ORIGINAL_DETAILS,
             )
-            return PreparedUpgrade(
+            prepared = PreparedUpgrade(
                 info.saved_id, input_saved, None, None, 0, True, time.monotonic(), request
             )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.info(
+                "upgrade_prepaid_prepared saved_id=%s request_type=%s elapsed_ms=%.3f",
+                info.saved_id,
+                request.__class__.__name__,
+                elapsed_ms,
+            )
+            record_payment_event(
+                "upgrade_prepaid_prepared",
+                saved_id=info.saved_id,
+                request_type=request.__class__.__name__,
+                elapsed_ms=round(elapsed_ms, 3),
+            )
+            return prepared
 
         invoice = construct(
             types.InputInvoiceStarGiftUpgrade,
@@ -1630,19 +2128,71 @@ class MTProtoService:
             keep_original_details=KEEP_ORIGINAL_DETAILS,
         )
         try:
-            form_request = construct(functions.payments.GetPaymentFormRequest, invoice=invoice, theme_params=None)
+            form_request = construct(
+                functions.payments.GetPaymentFormRequest, invoice=invoice, theme_params=None
+            )
             form = await self.call(form_request)
         except errors.RPCError as exc:
+            code = self._rpc_code(exc)
             if "NO_PAYMENT_NEEDED" in str(exc).upper():
                 request = construct(
                     functions.payments.UpgradeStarGiftRequest,
                     stargift=input_saved,
                     keep_original_details=KEEP_ORIGINAL_DETAILS,
                 )
-                return PreparedUpgrade(
+                prepared = PreparedUpgrade(
                     info.saved_id, input_saved, None, None, 0, True, time.monotonic(), request
                 )
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                logger.info(
+                    "upgrade_no_payment_needed saved_id=%s elapsed_ms=%.3f",
+                    info.saved_id,
+                    elapsed_ms,
+                )
+                record_payment_event(
+                    "upgrade_no_payment_needed",
+                    saved_id=info.saved_id,
+                    elapsed_ms=round(elapsed_ms, 3),
+                )
+                return prepared
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.warning(
+                "payment_form_prepare_failed saved_id=%s code=%s error_type=%s elapsed_ms=%.3f error=%s",
+                info.saved_id,
+                code,
+                type(exc).__name__,
+                elapsed_ms,
+                exc,
+            )
+            record_payment_event(
+                "payment_form_prepare_failed",
+                saved_id=info.saved_id,
+                code=code,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+                elapsed_ms=round(elapsed_ms, 3),
+            )
             raise
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.warning(
+                "payment_form_prepare_failed saved_id=%s error_type=%s elapsed_ms=%.3f error=%s",
+                info.saved_id,
+                type(exc).__name__,
+                elapsed_ms,
+                exc,
+            )
+            record_payment_event(
+                "payment_form_prepare_failed",
+                saved_id=info.saved_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+                elapsed_ms=round(elapsed_ms, 3),
+            )
+            raise
+
         cost = sum_invoice_amount(getattr(form, "invoice", None)) or info.upgrade_cost
         if cost <= 0:
             raise RuntimeError("Telegram не вернул положительную стоимость улучшения")
@@ -1656,9 +2206,35 @@ class MTProtoService:
             form_id=int(form_id),
             invoice=invoice,
         )
-        return PreparedUpgrade(
+        prepared = PreparedUpgrade(
             info.saved_id, input_saved, invoice, form_id, cost, False, time.monotonic(), request
         )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        debug = prepared_payment_debug(prepared)
+        logger.info(
+            "payment_form_prepared saved_id=%s form_id=%s invoice_saved_id=%s request_form_id=%s "
+            "request_invoice_saved_id=%s cost=%s form_type=%s elapsed_ms=%.3f",
+            info.saved_id,
+            form_id,
+            debug["invoice_saved_id"],
+            debug["request_form_id"],
+            debug["request_invoice_saved_id"],
+            cost,
+            form.__class__.__name__,
+            elapsed_ms,
+        )
+        record_payment_event(
+            "payment_form_prepared",
+            saved_id=info.saved_id,
+            form_id=form_id,
+            invoice_saved_id=debug["invoice_saved_id"],
+            request_form_id=debug["request_form_id"],
+            request_invoice_saved_id=debug["request_invoice_saved_id"],
+            cost=cost,
+            form_type=form.__class__.__name__,
+            elapsed_ms=round(elapsed_ms, 3),
+        )
+        return prepared
 
     async def _verify_unique(self, peer: Any, saved_id: int) -> tuple[int | None, str | None]:
         for delay in VERIFY_DELAYS_SECONDS:
@@ -1753,69 +2329,6 @@ class MTProtoService:
             detail="Запрос принят, но Telegram не подтвердил результат. Повторная оплата не отправлялась.",
         )
 
-    async def execute_upgrade(self, peer: Any, info: SavedGiftInfo, prepared: PreparedUpgrade | None) -> UpgradeOutcome:
-        await self.require_authorized()
-        plan = prepared
-        if plan is None or plan.saved_id != info.saved_id or time.monotonic() - plan.created_at > 540:
-            plan = await self.prepare_upgrade(peer, info)
-
-        async def submit(current: PreparedUpgrade) -> Any:
-            if current.prepaid:
-                request = construct(
-                    functions.payments.UpgradeStarGiftRequest,
-                    stargift=current.input_saved,
-                    keep_original_details=KEEP_ORIGINAL_DETAILS,
-                )
-            else:
-                request = construct(
-                    functions.payments.SendStarsFormRequest,
-                    form_id=int(current.form_id),
-                    invoice=current.invoice,
-                )
-            return await self.call(request)
-
-        async def handle_submit_error(exc: BaseException, *, retry: bool = False) -> UpgradeOutcome:
-            if isinstance(exc, errors.FloodWaitError):
-                raise exc
-            code = self._rpc_code(exc)
-            if code in {"FORM_SUBMIT_DUPLICATE", "STARGIFT_ALREADY_UPGRADED"}:
-                actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
-                if actual_num is not None:
-                    return UpgradeOutcome("confirmed", actual_num, actual_slug)
-                return UpgradeOutcome("unknown", detail=f"{code}: результат не удалось подтвердить")
-            if isinstance(exc, errors.RPCError) and self._is_definitive_upgrade_error(code):
-                return UpgradeOutcome("failed", detail=f"{code}: {exc}")
-            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
-            if actual_num is not None:
-                return UpgradeOutcome("confirmed", actual_num, actual_slug)
-            prefix = "Повторный запрос" if retry else code
-            return UpgradeOutcome("unknown", detail=f"{prefix}: {type(exc).__name__}: {exc}")
-
-        try:
-            result = await submit(plan)
-            return await self._interpret_upgrade_result(peer, info.saved_id, result)
-        except errors.FloodWaitError:
-            raise
-        except errors.RPCError as exc:
-            code = self._rpc_code(exc)
-            if code in {"FORM_EXPIRED", "STARS_FORM_AMOUNT_MISMATCH"}:
-                try:
-                    # Refreshing the form is part of the retry transaction.  It can
-                    # fail with its own definitive Telegram error (for example an
-                    # insufficient balance), so classify that error exactly like a
-                    # submit failure instead of letting it escape to the scanner.
-                    refreshed = await self.prepare_upgrade(peer, info)
-                    result = await submit(refreshed)
-                    return await self._interpret_upgrade_result(peer, info.saved_id, result)
-                except BaseException as retry_exc:
-                    if isinstance(retry_exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                        raise
-                    return await handle_submit_error(retry_exc, retry=True)
-            return await handle_submit_error(exc)
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                raise
-            return await handle_submit_error(exc)
 
     async def execute_upgrade_fast(
         self,
@@ -1834,7 +2347,7 @@ class MTProtoService:
         """
         if prepared.saved_id != info.saved_id or prepared.request is None:
             return UpgradeOutcome("failed", detail="FAST-план отсутствует или относится к другому подарку")
-        if time.monotonic() - prepared.created_at > 540:
+        if time.monotonic() - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
             return UpgradeOutcome("failed", detail="FAST-платёжная форма устарела; повторный запрос запрещён")
 
         try:
@@ -1842,6 +2355,15 @@ class MTProtoService:
             result = await client(prepared.request)
             return await self._interpret_upgrade_result(peer, info.saved_id, result)
         except errors.FloodWaitError as exc:
+            source = f"FAST:{prepared.request.__class__.__name__}"
+            remaining = rate_limit.register(float(exc.seconds), source)
+            record_payment_event(
+                "fast_payment_flood_wait",
+                saved_id=info.saved_id,
+                wait_seconds=int(exc.seconds),
+                persistent_remaining_seconds=round(remaining, 3),
+                source=source,
+            )
             return UpgradeOutcome("failed", detail=f"FLOOD_WAIT_{int(exc.seconds)}: платёж не повторялся")
         except errors.RPCError as exc:
             code = self._rpc_code(exc)
@@ -2146,11 +2668,19 @@ class Scanner:
         self.bot_getter = bot_getter
         self.task: asyncio.Task[None] | None = None
         self.monitor_task: asyncio.Task[None] | None = None
+        self.form_refresh_task: asyncio.Task[None] | None = None
         self.stop_event = asyncio.Event()
         self.prepared: dict[int, PreparedUpgrade] = {}
+        self._form_refresh_retry_after: dict[int, float] = {}
+        self._form_refresh_lock = asyncio.Lock()
+        self._form_refresh_frozen = False
+        self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
+        self._critical_form_ready: set[tuple[str, int]] = set()
+        self._critical_form_unarmed: dict[tuple[str, int], str] = {}
+        self._payment_guard_keys: set[tuple[str, int]] = set()
+        self._payment_guard_id: str | None = None
         self.triggered: set[tuple[str, int]] = set()
         self.notified_missed: set[tuple[str, int]] = set()
-        self._upgrade_lock = asyncio.Lock()
         self.status_chat_id: int | None = None
         self.status_message_id: int | None = None
         self.status_updater = StatusMessageUpdater(
@@ -2421,15 +2951,512 @@ class Scanner:
                         self.prepared[candidate.saved_id].cost,
                     )
 
+    def _fast_candidates_from_ram(self) -> list[SavedGiftInfo]:
+        """Return the currently armed FAST candidates without network or disk I/O."""
+        required = effective_volley_size()
+        output: list[SavedGiftInfo] = []
+        selected = set(store.settings.selected_saved_ids)
+        for group in self._groups.values():
+            output.extend(
+                item for item in group if item.saved_id in selected and item.can_upgrade
+            )
+        return output[:required]
+
+    @staticmethod
+    def _selected_fast_candidates(group: list[SavedGiftInfo]) -> list[SavedGiftInfo]:
+        required = effective_volley_size()
+        selected = set(store.settings.selected_saved_ids)
+        return [
+            item for item in group
+            if item.saved_id in selected and item.can_upgrade
+        ][:required]
+
+    def _fast_ammo_error(self, candidates: list[SavedGiftInfo]) -> str | None:
+        """Return why the in-RAM FAST volley is not fully armed, without I/O."""
+        required = effective_volley_size()
+        if len(candidates) != required:
+            return f"нужно {required} готовых подарков, доступно {len(candidates)}"
+
+        paid_form_ids: list[int] = []
+        now = time.monotonic()
+        for candidate in candidates:
+            plan = self.prepared.get(candidate.saved_id)
+            if plan is None or plan.request is None or plan.saved_id != candidate.saved_id:
+                return f"saved_id={candidate.saved_id}: платёжный план отсутствует"
+            if not plan.prepaid and now - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+                return f"saved_id={candidate.saved_id}: платёжная форма устарела"
+            try:
+                self._validate_prepared_binding(candidate, plan)
+            except Exception as exc:
+                return f"saved_id={candidate.saved_id}: {exc}"
+            if not plan.prepaid and plan.form_id is not None:
+                paid_form_ids.append(int(plan.form_id))
+
+        if len(paid_form_ids) != len(set(paid_form_ids)):
+            return "обнаружены повторяющиеся form_id"
+        return None
+
+    def _release_form_refresh_freeze(self) -> None:
+        self._form_refresh_frozen = False
+        self._critical_form_ready.clear()
+        self._critical_form_unarmed.clear()
+
+    async def _clear_prearmed_payment_guards(self) -> None:
+        """Remove guards that this live process armed but never submitted."""
+        if not self._payment_guard_keys:
+            return
+        keys = set(self._payment_guard_keys)
+        try:
+            await asyncio.to_thread(remove_payment_submission_guard_entries, keys)
+        except OSError as exc:
+            logger.error("payment_submission_guard_cleanup_failed keys=%s error=%s", sorted(keys), exc)
+            return
+        self._payment_guard_keys.difference_update(keys)
+        if not self._payment_guard_keys:
+            self._payment_guard_id = None
+
+    async def _prepare_and_freeze_fast_forms(
+        self,
+        peer: Any,
+        slug: str,
+        target: int,
+        group: list[SavedGiftInfo],
+    ) -> bool:
+        """Refresh every FAST form once, then freeze background refresh.
+
+        The freeze is set before waiting for the refresh lock, so an already
+        running background refresh may finish its current request but cannot
+        start another one.  The scanner therefore enters the hot zone only
+        after a complete forced refresh, or explicitly marks the volley unarmed.
+        """
+        key = (slug, int(target))
+        if key in self._critical_form_ready:
+            return True
+        if key in self._critical_form_unarmed:
+            return False
+
+        self._form_refresh_frozen = True
+        candidates = self._selected_fast_candidates(group)
+        required = effective_volley_size()
+        if len(candidates) != required:
+            reason = f"нужно {required} подарков, доступно {len(candidates)}"
+            self._critical_form_unarmed[key] = reason
+            runtime.last_error = f"FAST-залп не вооружён: {reason}"
+            return False
+
+        required_refresh_ids = {
+            candidate.saved_id
+            for candidate in candidates
+            if not (
+                (existing := self.prepared.get(candidate.saved_id)) is not None
+                and existing.prepaid
+            )
+        }
+        refreshed_ids: set[int] = set()
+        await self._refresh_due_payment_forms(
+            peer,
+            force=True,
+            max_items=len(candidates),
+            candidates=candidates,
+            refreshed_ids=refreshed_ids,
+        )
+        missing_refreshes = sorted(required_refresh_ids - refreshed_ids)
+        reason = (
+            "forced refresh не завершён для saved_id=" + ",".join(map(str, missing_refreshes))
+            if missing_refreshes
+            else self._fast_ammo_error(candidates)
+        )
+        if reason is not None:
+            self._critical_form_unarmed[key] = reason
+            runtime.last_error = f"FAST-залп не вооружён: {reason}"
+            logger.error(
+                "fast_forms_frozen_unarmed slug=%s target=%s candidates=%s reason=%s",
+                slug,
+                target,
+                [item.saved_id for item in candidates],
+                reason,
+            )
+            record_payment_event(
+                "fast_forms_frozen_unarmed",
+                slug=slug,
+                target=target,
+                saved_ids=[item.saved_id for item in candidates],
+                reason=reason[:500],
+            )
+            return False
+
+        try:
+            guard_id = await asyncio.to_thread(
+                add_payment_submission_guard_entry,
+                slug=slug,
+                target=target,
+                saved_ids=[item.saved_id for item in candidates],
+                campaign_id=self._campaign_ids_by_slug.get(slug),
+            )
+        except OSError as exc:
+            reason = f"persistent payment guard не записан: {exc}"
+            self._critical_form_unarmed[key] = reason
+            runtime.last_error = f"FAST-залп не вооружён: {reason}"
+            logger.exception(
+                "fast_payment_guard_arm_failed slug=%s target=%s saved_ids=%s",
+                slug,
+                target,
+                [item.saved_id for item in candidates],
+            )
+            return False
+        self._payment_guard_id = guard_id
+        self._payment_guard_keys.add(key)
+        self._critical_form_ready.add(key)
+        runtime.last_error = None
+        logger.info(
+            "fast_forms_refreshed_and_frozen slug=%s target=%s candidates=%s freeze_distance=%s",
+            slug,
+            target,
+            [item.saved_id for item in candidates],
+            FAST_FORM_FREEZE_DISTANCE,
+        )
+        record_payment_event(
+            "fast_forms_refreshed_and_frozen",
+            slug=slug,
+            target=target,
+            saved_ids=[item.saved_id for item in candidates],
+            freeze_distance=FAST_FORM_FREEZE_DISTANCE,
+        )
+        return True
+
+    def _update_payment_form_age_metric(self) -> None:
+        now = time.monotonic()
+        ages = [
+            max(0.0, now - plan.created_at)
+            for plan in self.prepared.values()
+            if not plan.prepaid
+        ]
+        runtime.payment_form_oldest_age_s = round(max(ages), 3) if ages else None
+
+    @staticmethod
+    def _validate_prepared_binding(candidate: SavedGiftInfo, plan: PreparedUpgrade) -> None:
+        """Fail closed unless a prepared request is bound to exactly one saved gift."""
+        if plan.saved_id != candidate.saved_id or plan.request is None:
+            raise RuntimeError(
+                f"prepared binding mismatch: candidate={candidate.saved_id}, plan_saved_id={plan.saved_id}"
+            )
+        if plan.prepaid:
+            return
+        plan_invoice_saved_id = invoice_saved_id(plan.invoice)
+        request_form_id = _int_or_none(getattr(plan.request, "form_id", None))
+        request_invoice_saved_id = invoice_saved_id(getattr(plan.request, "invoice", None))
+        if plan.form_id is None or request_form_id is None:
+            raise RuntimeError(
+                f"prepared form_id missing: candidate={candidate.saved_id}, "
+                f"plan_form_id={plan.form_id}, request_form_id={request_form_id}"
+            )
+        if plan_invoice_saved_id != candidate.saved_id:
+            raise RuntimeError(
+                f"prepared invoice mismatch: candidate={candidate.saved_id}, "
+                f"invoice_saved_id={plan_invoice_saved_id}, form_id={plan.form_id}"
+            )
+        if request_invoice_saved_id != candidate.saved_id:
+            raise RuntimeError(
+                f"prepared request invoice mismatch: candidate={candidate.saved_id}, "
+                f"request_invoice_saved_id={request_invoice_saved_id}, form_id={plan.form_id}"
+            )
+        if request_form_id != plan.form_id:
+            raise RuntimeError(
+                f"prepared request form mismatch: candidate={candidate.saved_id}, "
+                f"plan_form_id={plan.form_id}, request_form_id={request_form_id}"
+            )
+
+    def _observe_form_refresh_latency(self, elapsed_s: float) -> None:
+        sample = max(0.001, float(elapsed_s))
+        alpha = FORM_REFRESH_LATENCY_EWMA_ALPHA
+        self._form_refresh_latency_ewma_s = (
+            alpha * sample + (1.0 - alpha) * self._form_refresh_latency_ewma_s
+        )
+
+    def _adaptive_form_refresh_batch_size(
+        self,
+        due: list[tuple[float, SavedGiftInfo, PreparedUpgrade | None]],
+    ) -> tuple[int, float | None]:
+        """Choose the smallest batch that can plausibly clear the oldest backlog.
+
+        The base batch remains conservative on a healthy connection.  As measured
+        getPaymentForm latency grows or the oldest form approaches the local safe
+        age, the worker removes idle tick gaps by refreshing more oldest-first
+        forms in the same pass.  Requests are still sequential and capped at 50.
+        """
+        if not due:
+            return FORM_REFRESH_BATCH_SIZE, None
+
+        due_count = min(len(due), FORM_REFRESH_MAX_BATCH_SIZE)
+        oldest_age = due[0][0]
+        if oldest_age == float("inf"):
+            return max(FORM_REFRESH_BATCH_SIZE, due_count), 0.0
+
+        reserve_s = max(0.0, PAYMENT_FORM_MAX_AGE_SECONDS - max(0.0, oldest_age))
+        request_time_s = due_count * max(0.001, self._form_refresh_latency_ewma_s)
+
+        if reserve_s <= request_time_s:
+            required = due_count
+        else:
+            idle_budget_s = reserve_s - request_time_s
+            max_batches = max(1, int(idle_budget_s / FORM_REFRESH_TICK_SECONDS))
+            required = max(1, (due_count + max_batches - 1) // max_batches)
+
+        return (
+            min(
+                due_count,
+                FORM_REFRESH_MAX_BATCH_SIZE,
+                max(FORM_REFRESH_BATCH_SIZE, required),
+            ),
+            reserve_s,
+        )
+
+    async def _refresh_due_payment_forms(
+        self,
+        peer: Any,
+        *,
+        force: bool = False,
+        max_items: int | None = None,
+        candidates: list[SavedGiftInfo] | None = None,
+        refreshed_ids: set[int] | None = None,
+    ) -> int:
+        """Refresh a small batch of paid forms so a month-long run stays armed.
+
+        Telegram forms are valid for 10 minutes. The worker refreshes them well
+        before that limit and staggers refreshes to avoid a 50-form burst in the
+        scanner hot path. No payment is submitted here.
+        """
+        if (
+            not store.settings.live_upgrades
+            or self._fast_fired
+            or self.stop_event.is_set()
+            or (self._form_refresh_frozen and not force)
+        ):
+            self._update_payment_form_age_metric()
+            return 0
+
+        now = time.monotonic()
+        refresh_candidates = list(candidates) if candidates is not None else self._fast_candidates_from_ram()
+        due: list[tuple[float, SavedGiftInfo, PreparedUpgrade | None]] = []
+        for candidate in refresh_candidates:
+            plan = self.prepared.get(candidate.saved_id)
+            if plan is not None and plan.prepaid:
+                continue
+            retry_after = self._form_refresh_retry_after.get(candidate.saved_id, 0.0)
+            if not force and retry_after > now:
+                continue
+            age = float("inf") if plan is None else max(0.0, now - plan.created_at)
+            if force or plan is None or age >= PREPARE_REFRESH_SECONDS:
+                due.append((age, candidate, plan))
+
+        # Oldest first: the form with the least remaining safe lifetime always
+        # gets the next network slot.
+        due.sort(key=lambda item: item[0], reverse=True)
+        if max_items is not None:
+            limit = max(1, int(max_items))
+            reserve_s: float | None = None
+        else:
+            limit, reserve_s = self._adaptive_form_refresh_batch_size(due)
+            if limit > FORM_REFRESH_BATCH_SIZE:
+                logger.info(
+                    "payment_form_refresh_batch_scaled due=%s batch=%s base_batch=%s "
+                    "oldest_reserve_s=%s latency_ewma_s=%.3f",
+                    len(due),
+                    limit,
+                    FORM_REFRESH_BATCH_SIZE,
+                    None if reserve_s is None else round(reserve_s, 3),
+                    self._form_refresh_latency_ewma_s,
+                )
+                record_payment_event(
+                    "payment_form_refresh_batch_scaled",
+                    due_count=len(due),
+                    batch_size=limit,
+                    base_batch_size=FORM_REFRESH_BATCH_SIZE,
+                    max_batch_size=FORM_REFRESH_MAX_BATCH_SIZE,
+                    oldest_reserve_s=None if reserve_s is None else round(reserve_s, 3),
+                    latency_ewma_s=round(self._form_refresh_latency_ewma_s, 3),
+                )
+        refreshed = 0
+        for old_age, candidate, old_plan in due[:limit]:
+            if self._fast_fired or self.stop_event.is_set():
+                break
+            if self._form_refresh_frozen and not force:
+                break
+            old_form_id = old_plan.form_id if old_plan is not None else None
+            try:
+                # Serialize form maintenance itself, but only one candidate at a
+                # time.  When FAST freezes refresh, a background batch can hold
+                # up the scanner for at most the one request already in flight.
+                async with self._form_refresh_lock:
+                    if self._form_refresh_frozen and not force:
+                        break
+                    request_started = time.perf_counter()
+                    try:
+                        new_plan = await self.service.prepare_upgrade(peer, candidate)
+                    finally:
+                        self._observe_form_refresh_latency(
+                            time.perf_counter() - request_started
+                        )
+                self._validate_prepared_binding(candidate, new_plan)
+                if not new_plan.prepaid and new_plan.form_id is not None:
+                    duplicate_saved_ids = [
+                        saved_id
+                        for saved_id, existing in self.prepared.items()
+                        if saved_id != candidate.saved_id
+                        and not existing.prepaid
+                        and existing.form_id == new_plan.form_id
+                    ]
+                    if duplicate_saved_ids:
+                        raise RuntimeError(
+                            f"duplicate refreshed form_id={new_plan.form_id} for saved_id={candidate.saved_id}; "
+                            f"already_used_by={duplicate_saved_ids}"
+                        )
+                if self._fast_fired or self.stop_event.is_set():
+                    break
+                self.prepared[candidate.saved_id] = new_plan
+                self._form_refresh_retry_after.pop(candidate.saved_id, None)
+                refreshed += 1
+                if refreshed_ids is not None:
+                    refreshed_ids.add(candidate.saved_id)
+                runtime.payment_form_refresh_count += 1
+                runtime.payment_form_last_refresh_at = datetime.now(timezone.utc).isoformat()
+                runtime.payment_form_last_refresh_error = None
+                logger.info(
+                    "payment_form_refreshed saved_id=%s old_form_id=%s new_form_id=%s old_age_s=%.3f "
+                    "refresh_after_s=%s max_age_s=%s",
+                    candidate.saved_id,
+                    old_form_id,
+                    new_plan.form_id,
+                    0.0 if old_age == float("inf") else old_age,
+                    PREPARE_REFRESH_SECONDS,
+                    PAYMENT_FORM_MAX_AGE_SECONDS,
+                )
+                record_payment_event(
+                    "payment_form_refreshed",
+                    saved_id=candidate.saved_id,
+                    old_form_id=old_form_id,
+                    new_form_id=new_plan.form_id,
+                    old_age_s=None if old_age == float("inf") else round(old_age, 3),
+                    invoice_saved_id=invoice_saved_id(new_plan.invoice),
+                    request_form_id=_int_or_none(getattr(new_plan.request, "form_id", None)),
+                    request_invoice_saved_id=invoice_saved_id(getattr(new_plan.request, "invoice", None)),
+                    refresh_after_s=PREPARE_REFRESH_SECONDS,
+                    max_age_s=PAYMENT_FORM_MAX_AGE_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                runtime.payment_form_refresh_failures += 1
+                runtime.payment_form_last_refresh_error = f"{type(exc).__name__}: {exc}"[:500]
+                # A failed getPaymentForm is non-financial; retry later without
+                # replacing the last known plan. This also keeps duplicate forms
+                # visible to the audit instead of silently arming them.
+                retry_delay = 15.0
+                if isinstance(exc, RateLimitActiveError):
+                    retry_delay = max(retry_delay, exc.remaining_seconds)
+                elif isinstance(exc, errors.FloodWaitError):
+                    retry_delay = max(retry_delay, float(exc.seconds) + FLOOD_WAIT_EXTRA_MS / 1000.0)
+                self._form_refresh_retry_after[candidate.saved_id] = time.monotonic() + retry_delay
+                logger.warning(
+                    "payment_form_refresh_failed saved_id=%s old_form_id=%s old_age_s=%s "
+                    "retry_in_s=%.3f error_type=%s error=%s",
+                    candidate.saved_id,
+                    old_form_id,
+                    None if old_age == float("inf") else round(old_age, 3),
+                    retry_delay,
+                    type(exc).__name__,
+                    exc,
+                )
+                record_payment_event(
+                    "payment_form_refresh_failed",
+                    saved_id=candidate.saved_id,
+                    old_form_id=old_form_id,
+                    old_age_s=None if old_age == float("inf") else round(old_age, 3),
+                    retry_in_s=round(retry_delay, 3),
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                )
+
+        self._update_payment_form_age_metric()
+        return refreshed
+
+    async def _payment_form_refresh_loop(self, peer: Any) -> None:
+        logger.info(
+            "payment_form_refresh_worker_started refresh_after_s=%s max_age_s=%s tick_s=%s batch=%s",
+            PREPARE_REFRESH_SECONDS,
+            PAYMENT_FORM_MAX_AGE_SECONDS,
+            FORM_REFRESH_TICK_SECONDS,
+            FORM_REFRESH_BATCH_SIZE,
+        )
+        record_payment_event(
+            "payment_form_refresh_worker_started",
+            refresh_after_s=PREPARE_REFRESH_SECONDS,
+            max_age_s=PAYMENT_FORM_MAX_AGE_SECONDS,
+            telegram_ttl_s=TELEGRAM_PAYMENT_FORM_TTL_SECONDS,
+            tick_s=FORM_REFRESH_TICK_SECONDS,
+            batch_size=FORM_REFRESH_BATCH_SIZE,
+        )
+        try:
+            while (
+                runtime.active
+                and store.settings.live_upgrades
+                and not self.stop_event.is_set()
+                and not self._fast_fired
+            ):
+                if not self._form_refresh_frozen:
+                    await self._refresh_due_payment_forms(peer)
+                try:
+                    await asyncio.wait_for(
+                        self.stop_event.wait(), timeout=FORM_REFRESH_TICK_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            runtime.payment_form_last_refresh_error = f"worker: {type(exc).__name__}: {exc}"[:500]
+            logger.exception("payment_form_refresh_worker_failed")
+            record_payment_event(
+                "payment_form_refresh_worker_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+        finally:
+            self._update_payment_form_age_metric()
+            logger.info("payment_form_refresh_worker_stopped")
+            record_payment_event(
+                "payment_form_refresh_worker_stopped",
+                refresh_count=runtime.payment_form_refresh_count,
+                failures=runtime.payment_form_refresh_failures,
+                oldest_age_s=runtime.payment_form_oldest_age_s,
+            )
+
+    async def _stop_payment_form_refresh_worker(self) -> None:
+        task = self.form_refresh_task
+        if task and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(task, timeout=TASK_STOP_TIMEOUT_SECONDS)
+        self.form_refresh_task = None
+
     async def start(self) -> None:
         if self.task and not self.task.done():
             return
+        await self._stop_payment_form_refresh_worker()
         if not store.settings.selected_saved_ids:
             raise RuntimeError("Подарки не выбраны")
         if not store.settings.target_numbers:
             raise RuntimeError("Номера выстрела не заданы")
         rate_limit.clear_if_expired()
         rate_limit.assert_available()
+        if store.settings.live_upgrades:
+            try:
+                _load_payment_submission_guard()
+            except PaymentGuardStateError as exc:
+                raise RuntimeError(
+                    "Повреждён persistent payment guard; LIVE-запуск заблокирован до "
+                    "исправления payment-submit-guard.json"
+                ) from exc
         if not await self.service.is_authorized():
             raise RuntimeError("Telegram-аккаунт не авторизован")
         if active_shooter_count() > 1:
@@ -2442,6 +3469,10 @@ class Scanner:
         self.stop_event = asyncio.Event()
         self.triggered.clear()
         self.notified_missed.clear()
+        self._form_refresh_retry_after.clear()
+        self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
+        await self._clear_prearmed_payment_guards()
+        self._release_form_refresh_freeze()
         self._plan_dirty = True
         self._groups.clear()
         self._counter_meta.clear()
@@ -2483,6 +3514,11 @@ class Scanner:
         runtime.fast_fire_source = None
         runtime.fast_udp_peers_sent = 0
         runtime.fast_campaign_id = None
+        runtime.payment_form_refresh_count = 0
+        runtime.payment_form_refresh_failures = 0
+        runtime.payment_form_last_refresh_at = None
+        runtime.payment_form_last_refresh_error = None
+        runtime.payment_form_oldest_age_s = None
 
         try:
             peer = await self.service.resolve_channel()
@@ -2506,6 +3542,15 @@ class Scanner:
         self._plan_dirty = False
         self.task = asyncio.create_task(self._run(peer), name="gift-scanner")
         self.monitor_task = None
+        self.form_refresh_task = (
+            asyncio.create_task(
+                self._payment_form_refresh_loop(peer),
+                name="gift-payment-form-refresh",
+            )
+            if store.settings.live_upgrades
+            else None
+        )
+        self._update_payment_form_age_metric()
         first_target = min(store.settings.target_numbers)
         cluster_runtime.disarm()
         for campaign_id in self._campaign_ids_by_slug.values():
@@ -2541,6 +3586,7 @@ class Scanner:
         self.stop_event.set()
         task = self.task
         monitor = self.monitor_task
+        refresh_task = self.form_refresh_task
         if task and task is not asyncio.current_task():
             task.cancel()
             try:
@@ -2553,8 +3599,17 @@ class Scanner:
                 await asyncio.wait_for(monitor, timeout=TASK_STOP_TIMEOUT_SECONDS)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+        if refresh_task and refresh_task is not asyncio.current_task():
+            refresh_task.cancel()
+            try:
+                await asyncio.wait_for(refresh_task, timeout=TASK_STOP_TIMEOUT_SECONDS)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         self.task = None
         self.monitor_task = None
+        self.form_refresh_task = None
+        if not self._fast_fired:
+            await self._clear_prearmed_payment_guards()
         runtime.active = False
         runtime.started_at = None
         self._leave_fast_quiet()
@@ -2702,6 +3757,20 @@ class Scanner:
                     # goal the hot path follows exact numbered slugs, with only a
                     # periodic aggregate refresh for display/catch-up.
                     for slug, meta in self._counter_meta.items():
+                        previous = int(runtime.current_by_slug.get(slug, meta.current))
+                        upcoming_target = next_target(store.settings.target_numbers, previous)
+                        if (
+                            store.settings.live_upgrades
+                            and upcoming_target is not None
+                            and 0 < upcoming_target - previous <= FAST_FORM_FREEZE_DISTANCE
+                        ):
+                            await self._prepare_and_freeze_fast_forms(
+                                peer,
+                                slug,
+                                upcoming_target,
+                                self._groups.get(slug, []),
+                            )
+
                         counter, predecessor_exact, existing_target = await self._poll_counter_for_target(
                             slug, meta
                         )
@@ -2712,14 +3781,34 @@ class Scanner:
                         ):
                             hot_target = next_target(store.settings.target_numbers, counter.current)
                             if hot_target is not None and counter.current == hot_target - 1:
-                                await self._fast_volley(
-                                    peer,
-                                    slug,
-                                    counter,
-                                    hot_target,
-                                    self._groups.get(slug, []),
-                                )
-                                break
+                                critical_key = (slug, hot_target)
+                                if critical_key in self._critical_form_ready:
+                                    await self._fast_volley(
+                                        peer,
+                                        slug,
+                                        counter,
+                                        hot_target,
+                                        self._groups.get(slug, []),
+                                    )
+                                else:
+                                    reason = self._critical_form_unarmed.get(
+                                        critical_key,
+                                        "формы не были полностью обновлены до критической зоны",
+                                    )
+                                    runtime.last_error = f"FAST-залп не вооружён: {reason}"
+                                    logger.error(
+                                        "fast_trigger_blocked_unarmed slug=%s target=%s reason=%s",
+                                        slug,
+                                        hot_target,
+                                        reason,
+                                    )
+                                    # Keep scanning without doing any payment
+                                    # preparation in the hot loop.  The exact
+                                    # predecessor must not fall through to the
+                                    # generic trigger block below.
+                                    predecessor_exact = False
+                                if self._fast_fired:
+                                    break
                         counters[slug] = counter
                         exact_predecessors[slug] = predecessor_exact
                         exact_existing_targets[slug] = existing_target
@@ -2768,6 +3857,7 @@ class Scanner:
                             runtime.last_error = "Выстрел уже существует; оплата не отправлена"
                             self.stop_event.set()
                             break
+                        self._release_form_refresh_freeze()
 
                     current_max = max(counter.current for counter in counters.values())
                     future_targets = [value for value in store.settings.target_numbers if value > current_max]
@@ -2823,40 +3913,11 @@ class Scanner:
                                     f"Текущий номер: <b>{counter.current}</b>."
                                 )
 
-                        if (
-                            store.settings.live_upgrades
-                            and state.distance is not None
-                            and 1 < state.distance <= PREPARE_AHEAD
-                        ):
-                            required = min(
-                                len(group),
-                                effective_volley_size(),
-                            )
-                            for candidate in group[:required]:
-                                existing = self.prepared.get(candidate.saved_id)
-                                if existing is not None and time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS:
-                                    continue
-                                try:
-                                    self.prepared[candidate.saved_id] = await self.service.prepare_upgrade(peer, candidate)
-                                    logger.info(
-                                        "upgrade_prepared slug=%s saved_id=%s target=%s cost=%s",
-                                        slug,
-                                        candidate.saved_id,
-                                        target,
-                                        self.prepared[candidate.saved_id].cost,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "upgrade_prepare_failed slug=%s saved_id=%s error=%s",
-                                        slug,
-                                        candidate.saved_id,
-                                        exc,
-                                    )
-
                     if self.stop_event.is_set():
                         break
 
-                    runtime.last_error = None
+                    if not self._critical_form_unarmed:
+                        runtime.last_error = None
                     elapsed_ms = (time.perf_counter() - started_perf) * 1000.0
                     runtime.last_cycle_ms = elapsed_ms
                     if ADAPTIVE_SCAN:
@@ -2923,6 +3984,9 @@ class Scanner:
         finally:
             runtime.active = False
             runtime.started_at = None
+            await self._stop_payment_form_refresh_worker()
+            if not self._fast_fired:
+                await self._clear_prearmed_payment_guards()
             self._leave_fast_quiet()
             cluster_runtime.disarm()
             cluster_runtime.notify_state_changed()
@@ -3089,14 +4153,76 @@ class Scanner:
                     plan is None
                     or plan.request is None
                     or plan.saved_id != candidate.saved_id
-                    or time.monotonic() - plan.created_at > 540
+                    or time.monotonic() - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS
                 ):
                     raise RuntimeError(
                         f"FAST-форма для saved_id={candidate.saved_id} не готова или устарела; "
                         "оплата не отправлена"
                     )
+
+                if not plan.prepaid:
+                    plan_invoice_saved_id = invoice_saved_id(plan.invoice)
+                    request_form_id = _int_or_none(getattr(plan.request, "form_id", None))
+                    request_invoice_saved_id = invoice_saved_id(getattr(plan.request, "invoice", None))
+                    if plan.form_id is None or request_form_id is None:
+                        raise RuntimeError(
+                            f"FAST form_id missing: candidate={candidate.saved_id}, "
+                            f"plan_form_id={plan.form_id}, request_form_id={request_form_id}"
+                        )
+                    if plan_invoice_saved_id != candidate.saved_id:
+                        raise RuntimeError(
+                            f"FAST invoice mismatch: candidate={candidate.saved_id}, "
+                            f"invoice_saved_id={plan_invoice_saved_id}, form_id={plan.form_id}"
+                        )
+                    if request_invoice_saved_id != candidate.saved_id:
+                        raise RuntimeError(
+                            f"FAST request invoice mismatch: candidate={candidate.saved_id}, "
+                            f"request_invoice_saved_id={request_invoice_saved_id}, form_id={plan.form_id}"
+                        )
+                    if request_form_id != plan.form_id:
+                        raise RuntimeError(
+                            f"FAST request form mismatch: candidate={candidate.saved_id}, "
+                            f"plan_form_id={plan.form_id}, request_form_id={request_form_id}"
+                        )
                 plan.fast_send_started_ns = None
                 plans.append(plan)
+
+            paid_form_ids = [int(plan.form_id) for plan in plans if not plan.prepaid and plan.form_id is not None]
+            if len(paid_form_ids) != len(set(paid_form_ids)):
+                duplicates = sorted({value for value in paid_form_ids if paid_form_ids.count(value) > 1})
+                raise RuntimeError(
+                    "FAST duplicate payment form_id detected before submit: "
+                    + ",".join(str(value) for value in duplicates)
+                    + "; оплата не отправлена"
+                )
+
+            guard_payload = _load_payment_submission_guard()
+            guard_matches = False
+            if guard_payload is not None:
+                wanted = {item.saved_id for item in candidates}
+                for entry in guard_payload.get("entries", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    if (
+                        str(entry.get("slug", "")).strip() == slug
+                        and _int_or_none(entry.get("target")) == int(target)
+                        and set(_unique_ints(entry.get("saved_ids", []))) == wanted
+                    ):
+                        guard_matches = True
+                        self._payment_guard_id = _str_or_none(guard_payload.get("guard_id"))
+                        self._payment_guard_keys.add((slug, int(target)))
+                        break
+            if not guard_matches:
+                # Normally armed 25 numbers earlier. This synchronous fallback is
+                # intentionally fail-closed for a lagging UDP follower: no Stars
+                # request may leave the process without a durable restart guard.
+                self._payment_guard_id = add_payment_submission_guard_entry(
+                    slug=slug,
+                    target=target,
+                    saved_ids=[item.saved_id for item in candidates],
+                    campaign_id=campaign_id,
+                )
+                self._payment_guard_keys.add((slug, int(target)))
 
             if client is None or not client.is_connected():
                 raise RuntimeError("FAST MTProto-соединение не готово; оплата не отправлена")
@@ -3144,6 +4270,17 @@ class Scanner:
                 peers_sent,
                 runtime.last_error,
             )
+            record_payment_event(
+                "fast_local_preflight_failed",
+                source=source,
+                campaign_id=campaign_id,
+                slug=slug,
+                predecessor=counter.current,
+                target=target,
+                volley=volley_size,
+                error=runtime.last_error[:500],
+                plans=[prepared_payment_debug(plan) for plan in plans],
+            )
             record_cluster_event(
                 "fast_local_preflight_failed_relayed",
                 source=source,
@@ -3156,8 +4293,19 @@ class Scanner:
                 error=runtime.last_error[:300],
             )
             store.settings.live_upgrades = False
-            with contextlib.suppress(Exception):
+            preflight_saved = False
+            if self._payment_guard_id:
+                store.settings.payment_guard_token = self._payment_guard_id
+            try:
                 await store.save()
+                preflight_saved = True
+            except Exception:
+                logger.exception("fast_preflight_state_save_failed")
+            if preflight_saved and self._payment_guard_keys:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(clear_payment_submission_guard)
+                    self._payment_guard_keys.clear()
+                    self._payment_guard_id = None
             with contextlib.suppress(Exception):
                 await self.notify(
                     "⚠️ Локальный FAST-залп не отправлен, но сигнал другим стрелкам передан. "
@@ -3204,12 +4352,17 @@ class Scanner:
         outcome_log = [
             {
                 "saved_id": candidate.saved_id,
+                "form_id": plan.form_id,
+                "invoice_saved_id": invoice_saved_id(plan.invoice),
+                "request_form_id": _int_or_none(getattr(plan.request, "form_id", None)),
+                "request_invoice_saved_id": invoice_saved_id(getattr(plan.request, "invoice", None)),
+                "form_age_ms": round(max(0.0, time.monotonic() - plan.created_at) * 1000.0, 3),
                 "status": outcome.status,
                 "actual_num": outcome.actual_num,
                 "send_start_ms": offsets[index],
                 "detail": (outcome.detail or "")[:180],
             }
-            for index, (candidate, outcome) in enumerate(zip(candidates, outcomes))
+            for index, (candidate, plan, outcome) in enumerate(zip(candidates, plans, outcomes))
         ]
         logger.warning(
             "fast_volley_completed shooter_id=%s source=%s campaign_id=%s slug=%s predecessor=%s target=%s "
@@ -3226,6 +4379,20 @@ class Scanner:
             runtime.fast_first_send_start_ms or 0.0,
             runtime.fast_task_launch_ms or 0.0,
             json.dumps(outcome_log, ensure_ascii=False, separators=(",", ":")),
+        )
+        record_payment_event(
+            "fast_volley_completed",
+            source=source,
+            campaign_id=campaign_id,
+            slug=slug,
+            predecessor=counter.current,
+            target=target,
+            volley=volley_size,
+            volley_limit=effective_max_volley_size(),
+            first_send_start_ms=runtime.fast_first_send_start_ms,
+            task_launch_ms=runtime.fast_task_launch_ms,
+            send_start_offsets_ms=offsets,
+            outcomes=outcome_log,
         )
         record_cluster_event(
             "fast_volley_completed",
@@ -3305,11 +4472,22 @@ class Scanner:
             runtime.last_error = "; ".join(details)[:500] or "FAST-залп не подтверждён"
 
         save_error: Exception | None = None
+        if self._payment_guard_id:
+            store.settings.payment_guard_token = self._payment_guard_id
         try:
             await store.save()
         except Exception as exc:
             save_error = exc
             logger.exception("fast_volley_state_save_failed")
+        else:
+            if self._payment_guard_keys:
+                try:
+                    await asyncio.to_thread(clear_payment_submission_guard)
+                except OSError:
+                    logger.exception("payment_submission_guard_clear_failed")
+                else:
+                    self._payment_guard_keys.clear()
+                    self._payment_guard_id = None
 
         lines = [
             f"⚡ <b>{APP_NAME} {APP_VERSION}: залп завершён</b>",
@@ -3347,250 +4525,7 @@ class Scanner:
             lines.append("⚠️ Не удалось сохранить итог на диск; проверь подарки вручную перед перезапуском.")
         await self.notify("\n".join(lines))
 
-    async def _upgrade(
-        self,
-        peer: Any,
-        slug: str,
-        counter: GiftCounter,
-        target: int,
-        group: list[SavedGiftInfo],
-    ) -> None:
-        async with self._upgrade_lock:
-            candidates = [
-                item
-                for item in group
-                if item.saved_id in store.settings.selected_saved_ids and item.can_upgrade
-            ]
-            if not candidates:
-                raise RuntimeError("Нет доступного экземпляра подарка для улучшения")
-            chosen = candidates[0]
-            plan = self.prepared.get(chosen.saved_id)
-            trigger_key = (slug, target)
 
-            # Persist an in-flight hold before submitting a financial request. If
-            # the process or network dies after Telegram accepts the payment, a
-            # restart will reconcile this saved gift instead of paying twice.
-            previous_ids = list(store.settings.payment_hold_saved_ids)
-            previous_targets = dict(store.settings.payment_hold_targets)
-            previous_reason = store.settings.payment_hold_reason
-            previous_url = store.settings.payment_verification_url
-            holds = set(previous_ids)
-            holds.add(chosen.saved_id)
-            store.settings.payment_hold_saved_ids = sorted(holds)
-            store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
-            store.settings.payment_hold_reason = (
-                f"LIVE-запрос отправляется: {counter.title}, выстрел #{target}, saved_id={chosen.saved_id}"
-            )
-            store.settings.payment_verification_url = None
-            try:
-                await store.save()
-            except Exception as exc:
-                store.settings.payment_hold_saved_ids = previous_ids
-                store.settings.payment_hold_targets = previous_targets
-                store.settings.payment_hold_reason = previous_reason
-                store.settings.payment_verification_url = previous_url
-                raise RuntimeError(
-                    "Не удалось сохранить защиту от повторной оплаты; LIVE-запрос не отправлен"
-                ) from exc
-
-            self.triggered.add(trigger_key)
-            logger.warning(
-                "live_upgrade_submit slug=%s observed_current=%s target=%s saved_id=%s prepared=%s",
-                slug, counter.current, target, chosen.saved_id, bool(plan),
-            )
-            try:
-                outcome = await self.service.execute_upgrade(peer, chosen, plan)
-            except errors.FloodWaitError:
-                # Telegram rejected this method with FLOOD_WAIT, so no payment was
-                # accepted. Remove the in-flight marker only after persisting it.
-                with contextlib.suppress(ValueError):
-                    store.settings.payment_hold_saved_ids.remove(chosen.saved_id)
-                store.settings.payment_hold_targets.pop(str(chosen.saved_id), None)
-                if not store.settings.payment_hold_saved_ids:
-                    store.settings.payment_hold_reason = None
-                    store.settings.payment_verification_url = None
-                    runtime.pending_verification_url = None
-                try:
-                    await store.save()
-                except Exception as exc:
-                    # The pre-submit hold is still present on disk.  Restore the
-                    # same guard in memory too, otherwise Reset/channel/gift
-                    # controls could overwrite that safe on-disk state before a
-                    # restart or reconciliation.
-                    holds = set(store.settings.payment_hold_saved_ids)
-                    holds.add(chosen.saved_id)
-                    store.settings.payment_hold_saved_ids = sorted(holds)
-                    store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
-                    store.settings.payment_hold_reason = (
-                        f"FLOOD_WAIT до оплаты; снятие блокировки не сохранено, saved_id={chosen.saved_id}"
-                    )
-                    store.settings.live_upgrades = False
-                    self.stop_event.set()
-                    await self.notify(
-                        "⚠️ FLOOD_WAIT получен до оплаты, но не удалось сохранить снятие защитной блокировки. "
-                        "Сканер остановлен; открой «🎁 Подарки» перед повторным запуском."
-                    )
-                    raise RuntimeError("Не удалось сохранить состояние после FLOOD_WAIT") from exc
-                self.triggered.discard(trigger_key)
-                raise
-            await self._finish_upgrade(chosen, counter, target, outcome)
-
-    async def _finish_upgrade(
-        self,
-        chosen: SavedGiftInfo,
-        counter: GiftCounter,
-        target: int,
-        outcome: UpgradeOutcome,
-    ) -> None:
-        if outcome.status == "confirmed" and outcome.actual_num is not None:
-            actual_num = outcome.actual_num
-            runtime.last_success = f"{counter.title}: выстрел {target}, получен {actual_num}"
-            runtime.last_error = None
-            runtime.pending_verification_url = None
-            if actual_num == target:
-                icon = "✅"
-                verdict = "Целевой номер получен"
-            else:
-                icon = "⚠️"
-                verdict = "Улучшение прошло, но из-за гонки выдан другой номер"
-
-            await self.notify(
-                f"{icon} <b>{html.escape(verdict)}</b>\n"
-                f"Подарок: <b>{html.escape(counter.title)}</b>\n"
-                f"Выстрел: <b>#{target}</b>\n"
-                f"Получен: <b>#{actual_num}</b>"
-                + (f"\nSlug: <code>{html.escape(outcome.actual_slug)}</code>" if outcome.actual_slug else "")
-            )
-
-            # Remove the attempted goal and every number that the confirmed
-            # result has already passed, otherwise the scanner could spin forever
-            # with only stale targets left after a race.
-            store.settings.target_numbers = [
-                value
-                for value in store.settings.target_numbers
-                if value != target and value > actual_num
-            ]
-            with contextlib.suppress(ValueError):
-                store.settings.selected_saved_ids.remove(chosen.saved_id)
-            with contextlib.suppress(ValueError):
-                store.settings.payment_hold_saved_ids.remove(chosen.saved_id)
-            store.settings.payment_hold_targets.pop(str(chosen.saved_id), None)
-            store.settings.payment_verification_url = None
-            if not store.settings.payment_hold_saved_ids:
-                store.settings.payment_hold_reason = None
-
-            save_error: Exception | None = None
-            try:
-                await store.save()
-            except Exception as exc:
-                # The pre-submit hold remains on disk.  Restore it in memory as
-                # well, so no UI action can clear the protective state before a
-                # restart/reconciliation.  The confirmed result itself is kept in
-                # runtime and the scanner is stopped below.
-                holds = set(store.settings.payment_hold_saved_ids)
-                holds.add(chosen.saved_id)
-                store.settings.payment_hold_saved_ids = sorted(holds)
-                store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
-                store.settings.payment_hold_reason = (
-                    f"Улучшение подтверждено, но итог не сохранён, saved_id={chosen.saved_id}"
-                )
-                save_error = exc
-                logger.exception("confirmed_upgrade_state_save_failed")
-
-            self.prepared.pop(chosen.saved_id, None)
-
-            # Continue in memory. All required payment forms were prepared before
-            # the trigger, so consecutive target numbers do not incur a saved-gift
-            # reload or payment-form request between upgrades.
-            group = self._groups.get(counter.slug, [])
-            self._groups[counter.slug] = [item for item in group if item.saved_id != chosen.saved_id]
-            runtime.current_by_slug[counter.slug] = max(
-                runtime.current_by_slug.get(counter.slug, actual_num),
-                actual_num,
-            )
-            if not self._groups[counter.slug]:
-                self._groups.pop(counter.slug, None)
-                self._counter_meta.pop(counter.slug, None)
-
-            if save_error is not None:
-                await self.notify(
-                    "⚠️ Улучшение подтверждено, но запись настроек на диск не удалась. "
-                    "Сканер остановлен; после перезапуска защитная сверка не даст списать Stars повторно."
-                )
-                self.stop_event.set()
-            elif STOP_AFTER_SUCCESS or not store.settings.target_numbers or not store.settings.selected_saved_ids:
-                self.stop_event.set()
-            return
-
-        detail = outcome.detail or "Telegram не подтвердил улучшение"
-        runtime.last_error = detail
-        store.settings.live_upgrades = False
-        self.prepared.clear()
-        self.stop_event.set()
-
-        if outcome.status in {"verification", "unknown"}:
-            # The in-flight hold was written before submission; keep it until a
-            # later read proves which collectible number was actually assigned.
-            holds = set(store.settings.payment_hold_saved_ids)
-            holds.add(chosen.saved_id)
-            store.settings.payment_hold_saved_ids = sorted(holds)
-            store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
-            store.settings.payment_hold_reason = detail[:500]
-        else:
-            # A definitive failure means no payment was accepted.
-            with contextlib.suppress(ValueError):
-                store.settings.payment_hold_saved_ids.remove(chosen.saved_id)
-            store.settings.payment_hold_targets.pop(str(chosen.saved_id), None)
-            if not store.settings.payment_hold_saved_ids:
-                store.settings.payment_hold_reason = None
-
-        if outcome.status == "verification":
-            runtime.pending_verification_url = outcome.verification_url
-            store.settings.payment_verification_url = outcome.verification_url
-        elif not store.settings.payment_hold_saved_ids:
-            runtime.pending_verification_url = None
-            store.settings.payment_verification_url = None
-
-        save_error: Exception | None = None
-        try:
-            await store.save()
-        except Exception as exc:
-            # The pre-submit hold is already on disk.  Keep an equivalent guard
-            # in memory even for a definitive failure: without it a later Reset or
-            # channel change could overwrite the last known-safe file while this
-            # process is still running.
-            holds = set(store.settings.payment_hold_saved_ids)
-            holds.add(chosen.saved_id)
-            store.settings.payment_hold_saved_ids = sorted(holds)
-            store.settings.payment_hold_targets[str(chosen.saved_id)] = int(target)
-            store.settings.payment_hold_reason = (
-                f"Результат {outcome.status} не удалось сохранить, saved_id={chosen.saved_id}: {detail[:300]}"
-            )
-            save_error = exc
-            logger.exception("upgrade_result_state_save_failed status=%s", outcome.status)
-
-        if outcome.status == "verification":
-            text = (
-                "⚠️ <b>Нужно подтверждение Telegram</b>\n"
-                "Подарок и выстрел сохранены, повторная оплата не отправлялась."
-            )
-            if outcome.verification_url:
-                text += f"\nОткрой: <code>{html.escape(outcome.verification_url)}</code>"
-        elif outcome.status == "failed":
-            text = (
-                "❌ <b>Улучшение не выполнено</b>\n"
-                f"Причина: <code>{html.escape(detail[:500])}</code>\n"
-                "Подарок и выстрел сохранены."
-            )
-        else:
-            text = (
-                "⚠️ <b>Результат улучшения не подтверждён</b>\n"
-                f"Детали: <code>{html.escape(detail[:500])}</code>\n"
-                "Бот остановлен и не отправляет повторную оплату. Подарок и выстрел сохранены."
-            )
-        if save_error is not None:
-            text += "\n⚠️ Дополнительно не удалось обновить файл настроек; защитная блокировка до отправки сохранена."
-        await self.notify(text)
 
     async def notify(self, text: str) -> None:
         owner = store.settings.owner_user_id
@@ -5402,7 +6337,7 @@ async def shooter_count_handler(message: Message, state: FSMContext) -> None:
     config = provision_store.configure(count)
     settings_changed = False
     # Volley size belongs to each Hunter and is never copied or flattened when
-    # the cluster size changes. Hunter 1 keeps 1-15; Hunter 2-6 keep 1-3.
+    # the cluster size changes. Hunter 1-6 each keep an independent 1-50 local volley.
     if store.settings.live_upgrades:
         store.settings.live_upgrades = False
         settings_changed = True
@@ -5431,7 +6366,7 @@ async def shooter_count_handler(message: Message, state: FSMContext) -> None:
     if count == 1:
         await state.clear()
         await message.answer(
-            "✅ Выбран <b>1 стрелок</b>. Залп одного аккаунта доступен от 1 до 15."
+            "✅ Выбран <b>1 стрелок</b>. Залп одного аккаунта доступен от 1 до 50."
         )
         await confirm_cluster_reconfigure(message, config, previous_count)
         await continue_setup(message, state)
@@ -5916,50 +6851,390 @@ async def send_text_chunks(
         )
 
 
-def build_full_log_export() -> Path:
-    """Build one owner-only ZIP containing all available bot logs."""
-    export_path = DATA_DIR / f"gift-hunter-{APP_VERSION}-full-log.zip"
-    candidates = sorted(
-        (
-            path
-            for path in DATA_DIR.glob("gift-hunter-v*.log*")
-            if path.is_file()
+def _parse_log_timestamp(value: Any) -> float | None:
+    """Best-effort conversion of a log timestamp to Unix seconds."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    normalized = raw.replace("Z", "+00:00")
+    with contextlib.suppress(ValueError):
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            # Normal logging timestamps are written in the container's local time.
+            return time.mktime(dt.timetuple()) + dt.microsecond / 1_000_000
+        return dt.timestamp()
+    for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        with contextlib.suppress(ValueError):
+            dt = datetime.strptime(raw, fmt)
+            if dt.tzinfo is None:
+                return time.mktime(dt.timetuple())
+            return dt.timestamp()
+    return None
+
+
+def _timestamp_from_log_line(line: str) -> float | None:
+    stripped = line.lstrip()
+    if stripped.startswith("{"):
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            payload = json.loads(stripped)
+            if isinstance(payload, dict):
+                for key in ("timestamp", "generated_at", "finished_at", "started_at", "time"):
+                    parsed = _parse_log_timestamp(payload.get(key))
+                    if parsed is not None:
+                        return parsed
+    # Python logging: 2026-09-17 12:34:56,789 ...
+    match = re.match(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.]\d+)?(?:([+-]\d{4}))?",
+        line,
+    )
+    if match:
+        return _parse_log_timestamp(match.group(1) + (match.group(2) or ""))
+    return None
+
+
+def _stream_filter_recent_log(
+    source: Path,
+    target: Path,
+    cutoff_epoch: float,
+) -> tuple[int, bool] | None:
+    """Stream recent log entries into *target* without loading the file in RAM.
+
+    Returns ``(bytes_written, changed)``. ``changed`` is true when at least one
+    physical input line was excluded by the 24-hour filter. Ordinary Python
+    log traceback continuation lines follow the timestamped line that precedes
+    them; JSONL records are treated independently, matching the previous export
+    semantics. Original bytes are preserved for every retained line.
+    """
+    try:
+        source_stat = source.stat()
+    except OSError:
+        return None
+
+    jsonl = ".jsonl" in source.name
+    keep_continuation = source_stat.st_mtime >= cutoff_epoch
+    saw_timestamp = False
+    changed = False
+    bytes_written = 0
+
+    try:
+        with source.open("rb") as input_stream, target.open("wb") as output_stream:
+            for raw_line in input_stream:
+                line = raw_line.decode("utf-8", errors="replace")
+                timestamp = _timestamp_from_log_line(line)
+                keep = False
+                if timestamp is not None:
+                    saw_timestamp = True
+                    keep_continuation = timestamp >= cutoff_epoch
+                    keep = keep_continuation
+                elif jsonl:
+                    keep = source_stat.st_mtime >= cutoff_epoch
+                else:
+                    keep = keep_continuation
+
+                if keep:
+                    output_stream.write(raw_line)
+                    bytes_written += len(raw_line)
+                else:
+                    changed = True
+    except OSError:
+        target.unlink(missing_ok=True)
+        return None
+
+    if not saw_timestamp and source_stat.st_mtime < cutoff_epoch:
+        changed = source_stat.st_size > 0
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+    return bytes_written, changed
+
+
+def _full_log_timeseries_paths() -> list[Path]:
+    paths: list[Path] = []
+    paths.extend(DATA_DIR.glob("gift-hunter-v*.log*"))
+    paths.extend(DATA_DIR.glob("gift-hunter-v*-payment-audit.jsonl*"))
+    paths.extend((STRESS_HISTORY_PATH, provision_store.event_path))
+    unique: dict[str, Path] = {}
+    for path in paths:
+        if (
+            path.exists()
+            and path.is_file()
             and "-full-log" not in path.name
             and not path.name.endswith("-full.log")
-        ),
-        key=lambda path: (path.stat().st_mtime, path.name),
-    )
-    extra_candidates = [
+        ):
+            unique[str(path.resolve())] = path
+    return sorted(unique.values(), key=lambda item: item.name)
+
+
+def _full_log_snapshot_paths() -> list[Path]:
+    candidates = [
         STRESS_REPORT_PATH,
-        STRESS_HISTORY_PATH,
         DIAGNOSTICS_PATH,
         CATALOG_REPORT_PATH,
         RATE_LIMIT_PATH,
+        PAYMENT_GUARD_PATH,
         provision_store.config_path,
         provision_store.generation_path,
-        provision_store.event_path,
         *sorted(provision_store.root.glob("hunter-*.lifecycle.json")),
     ]
-    extras = [
-        path
-        for path in extra_candidates
-        if path.exists() and path.is_file()
-    ]
-    included_names = [path.name for path in candidates + extras]
-    manifest = (
-        f"{APP_NAME} {APP_VERSION} full log export\n"
-        f"generated_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
-        f"shooter_id={SHOOTER_ID}\n"
-        f"active_shooters={active_shooter_count()}\n"
-        f"log_files={len(candidates)}\n"
-        f"extra_files={len(extras)}\n"
-        f"included={','.join(included_names)}\n"
-    )
-    with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    return [path for path in candidates if path.exists() and path.is_file()]
+
+
+def _split_file_for_log_export(path: Path, staging_dir: Path) -> list[tuple[str, Path, int]]:
+    """Split oversized staged files with a bounded streaming buffer."""
+    size = path.stat().st_size
+    if size <= LOG_FULL_FRAGMENT_BYTES:
+        return [(path.name, path, size)]
+
+    fragments: list[tuple[str, Path, int]] = []
+    chunk_size = min(1024 * 1024, LOG_FULL_FRAGMENT_BYTES)
+    with path.open("rb") as source:
+        index = 1
+        while True:
+            fragment = staging_dir / f"{path.name}.chunk{index:03d}"
+            written = 0
+            with fragment.open("wb") as output:
+                while written < LOG_FULL_FRAGMENT_BYTES:
+                    payload = source.read(
+                        min(chunk_size, LOG_FULL_FRAGMENT_BYTES - written)
+                    )
+                    if not payload:
+                        break
+                    output.write(payload)
+                    written += len(payload)
+            if written == 0:
+                fragment.unlink(missing_ok=True)
+                break
+            os.chmod(fragment, 0o600)
+            fragments.append((fragment.name, fragment, written))
+            index += 1
+    return fragments
+
+
+def _write_log_zip(path: Path, entries: list[tuple[str, Path, int]], manifest: str) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("MANIFEST.txt", manifest)
-        for path in candidates + extras:
-            archive.write(path, arcname=path.name)
-    return export_path
+        for arcname, source, _size in entries:
+            archive.write(source, arcname=arcname)
+
+
+def build_full_log_exports(*, now_epoch: float | None = None) -> list[Path]:
+    """Build one or more ZIPs containing only the most recent 24 hours of logs."""
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    cutoff_epoch = now_epoch - LOG_FULL_WINDOW_SECONDS
+    for old_export in DATA_DIR.glob(f"gift-hunter-{APP_VERSION}-full-log-24h*.zip"):
+        old_export.unlink(missing_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="log-full-24h-", dir=DATA_DIR) as tmp:
+        staging = Path(tmp)
+        base_entries: list[tuple[str, Path, int]] = []
+        included_sources: list[str] = []
+
+        for source in _full_log_timeseries_paths():
+            target = staging / source.name
+            filtered = _stream_filter_recent_log(source, target, cutoff_epoch)
+            if filtered is None or filtered[0] == 0:
+                target.unlink(missing_ok=True)
+                continue
+            included_sources.append(source.name)
+            base_entries.append((target.name, target, filtered[0]))
+
+        for source in _full_log_snapshot_paths():
+            target = staging / source.name
+            try:
+                shutil.copyfile(source, target)
+                os.chmod(target, 0o600)
+                size = target.stat().st_size
+            except OSError:
+                target.unlink(missing_ok=True)
+                continue
+            included_sources.append(source.name)
+            base_entries.append((target.name, target, size))
+
+        generated = datetime.fromtimestamp(now_epoch, timezone.utc).isoformat()
+        period_start = datetime.fromtimestamp(cutoff_epoch, timezone.utc).isoformat()
+        manifest_base = (
+            f"{APP_NAME} {APP_VERSION} full log export (last 24h)\n"
+            f"generated_at={generated}\n"
+            f"period_start_utc={period_start}\n"
+            f"period_end_utc={generated}\n"
+            f"window_hours=24\n"
+            f"shooter_id={SHOOTER_ID}\n"
+            f"active_shooters={active_shooter_count()}\n"
+            f"source_files={len(included_sources)}\n"
+            f"included={','.join(included_sources)}\n"
+        )
+
+        single = DATA_DIR / f"gift-hunter-{APP_VERSION}-full-log-24h.zip"
+        _write_log_zip(single, base_entries, manifest_base + "part=1/1\n")
+        if single.stat().st_size <= LOG_FULL_TELEGRAM_LIMIT_BYTES:
+            return [single]
+        single.unlink(missing_ok=True)
+
+        entries: list[tuple[str, Path, int]] = []
+        for _arcname, source, _size in base_entries:
+            entries.extend(_split_file_for_log_export(source, staging))
+
+        # Repack into independent ZIPs. Raw payload stays <=45 MB, which leaves
+        # enough headroom below Telegram's 50 MB document limit even if DEFLATE
+        # cannot compress a particular fragment.
+        groups: list[list[tuple[str, Path, int]]] = []
+        current: list[tuple[str, Path, int]] = []
+        current_size = 0
+        for entry in entries:
+            entry_size = entry[2]
+            if current and current_size + entry_size > LOG_FULL_PART_TARGET_BYTES:
+                groups.append(current)
+                current = []
+                current_size = 0
+            current.append(entry)
+            current_size += entry_size
+        if current or not groups:
+            groups.append(current)
+
+        result: list[Path] = []
+        total = len(groups)
+        for index, group in enumerate(groups, start=1):
+            part = DATA_DIR / (
+                f"gift-hunter-{APP_VERSION}-full-log-24h-part{index:02d}-of{total:02d}.zip"
+            )
+            _write_log_zip(part, group, manifest_base + f"part={index}/{total}\n")
+            if part.stat().st_size > LOG_FULL_TELEGRAM_LIMIT_BYTES:
+                raise RuntimeError(
+                    f"log export part {index} is too large: {part.stat().st_size} bytes"
+                )
+            result.append(part)
+        return result
+
+
+def _replace_with_staged_log(target: Path, staged: Path) -> None:
+    os.chmod(staged, 0o600)
+    staged.replace(target)
+    os.chmod(target, 0o600)
+
+
+def _matching_rotating_handler(target: Path) -> RotatingFileHandler | None:
+    target_resolved = str(target.resolve())
+    for owner in (logging.getLogger(), payment_audit_logger):
+        for handler in list(owner.handlers):
+            if not isinstance(handler, RotatingFileHandler):
+                continue
+            with contextlib.suppress(OSError):
+                if str(Path(handler.baseFilename).resolve()) == target_resolved:
+                    return handler
+    return None
+
+
+def _detach_rotating_segments_for_prune(target: Path) -> list[Path]:
+    """Quickly detach active+numbered log segments, then release logger locks.
+
+    The only critical section is flush/rollover/rename. Heavy 24-hour filtering
+    happens later on ``.history-*`` files that RotatingFileHandler will never
+    rename, so asyncio log calls cannot be stalled by a multi-megabyte prune and
+    a concurrent rollover cannot make us overwrite a fresh ``.1`` file.
+    """
+    handler = _matching_rotating_handler(target)
+    if handler is None:
+        return []
+
+    detached: list[Path] = []
+    stamp = f"{time.time_ns()}-{threading.get_ident()}"
+    handler.acquire()
+    try:
+        handler.flush()
+        # Force one quick rollover so the previously active file becomes a stable
+        # numbered segment. The coordinated handler serializes namespace renames.
+        handler.doRollover()
+        with LOG_ROTATION_COORD_LOCK:
+            backup_count = max(0, int(getattr(handler, "backupCount", 0)))
+            for index in range(1, backup_count + 1):
+                source = Path(f"{handler.baseFilename}.{index}")
+                if not source.exists():
+                    continue
+                history = target.with_name(f"{target.name}.history-{stamp}-{index:02d}")
+                history.unlink(missing_ok=True)
+                source.replace(history)
+                with contextlib.suppress(OSError):
+                    os.chmod(history, 0o600)
+                detached.append(history)
+    finally:
+        handler.release()
+    return detached
+
+
+def _prune_detached_log(path: Path, cutoff_epoch: float) -> tuple[bool, bool]:
+    """Prune one stable segment. Returns ``(changed, deleted)``."""
+    if not path.exists() or not path.is_file():
+        return False, False
+    temp = path.with_name(path.name + ".prune.tmp")
+    temp.unlink(missing_ok=True)
+    filtered = _stream_filter_recent_log(path, temp, cutoff_epoch)
+    if filtered is None:
+        temp.unlink(missing_ok=True)
+        return False, False
+    output_size, was_filtered = filtered
+    if output_size == 0:
+        temp.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        return False, True
+    if not was_filtered:
+        temp.unlink(missing_ok=True)
+        return False, False
+    _replace_with_staged_log(path, temp)
+    return True, False
+
+
+def prune_local_log_history_after_export(cutoff_epoch: float) -> tuple[int, int]:
+    """Keep only recent history without holding a logging lock during filtering."""
+    changed = 0
+    deleted = 0
+
+    detached_now: list[Path] = []
+    for active in (LOG_PATH, PAYMENT_AUDIT_PATH):
+        try:
+            detached_now.extend(_detach_rotating_segments_for_prune(active))
+        except OSError as exc:
+            logger.error("log_segment_detach_failed path=%s error=%s", active, exc)
+
+    # Numbered backups were detached under the handler lock and rotation lock.
+    # Existing .history-* files are already outside RotatingFileHandler's namespace.
+    candidates: list[Path] = list(detached_now)
+    candidates.extend(DATA_DIR.glob("gift-hunter-v*.log.history-*"))
+    candidates.extend(DATA_DIR.glob("gift-hunter-v*-payment-audit.jsonl.history-*"))
+    candidates.append(STRESS_HISTORY_PATH)
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not path.exists() or not path.is_file() or "-full-log" in path.name:
+            continue
+        try:
+            was_changed, was_deleted = _prune_detached_log(path, cutoff_epoch)
+        except OSError as exc:
+            logger.error("log_history_prune_failed path=%s error=%s", path, exc)
+            continue
+        changed += int(was_changed)
+        deleted += int(was_deleted)
+
+    # cluster-events.jsonl is shared by all Hunter containers. ProvisionStore
+    # serializes pruning with appenders so a /log_full on one bot cannot erase a
+    # concurrent event written by another bot.
+    with contextlib.suppress(OSError, ValueError):
+        cluster_changed, cluster_deleted = provision_store.prune_events_before(cutoff_epoch)
+        changed += int(cluster_changed)
+        deleted += int(cluster_deleted)
+    return changed, deleted
 
 
 async def current_status_text() -> str:
@@ -6245,7 +7520,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0030 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0033 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -6647,16 +7922,43 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
 async def log_full_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
-    try:
-        export_path = build_full_log_export()
-        document = FSInputFile(export_path, filename=export_path.name)
-        await message.answer_document(
-            document,
-            caption=f"📄 Полный лог {APP_NAME} {APP_VERSION}",
-        )
-    except Exception as exc:
-        logger.exception("log_full_failed")
-        await message.answer(f"❌ Не удалось отправить полный лог: {html.escape(str(exc))}")
+    if log_full_lock.locked():
+        await message.answer("⏳ /log_full уже формируется. Дождись завершения текущего экспорта.")
+        return
+    export_paths: list[Path] = []
+    export_now = time.time()
+    cutoff_epoch = export_now - LOG_FULL_WINDOW_SECONDS
+    async with log_full_lock:
+        try:
+            export_paths = await asyncio.to_thread(build_full_log_exports, now_epoch=export_now)
+            total = len(export_paths)
+            for index, export_path in enumerate(export_paths, start=1):
+                document = FSInputFile(export_path, filename=export_path.name)
+                suffix = f" · часть {index}/{total}" if total > 1 else ""
+                await message.answer_document(
+                    document,
+                    caption=f"📄 Лог за последние 24 часа · {APP_NAME} {APP_VERSION}{suffix}",
+                )
+            pruned, deleted = await asyncio.to_thread(
+                prune_local_log_history_after_export,
+                cutoff_epoch,
+            )
+            logger.info(
+                "log_full_sent_and_old_history_pruned parts=%s pruned_files=%s deleted_files=%s window_hours=24",
+                total,
+                pruned,
+                deleted,
+            )
+        except Exception as exc:
+            logger.exception("log_full_failed")
+            await message.answer(
+                "❌ Не удалось полностью отправить лог. Старые локальные логи не очищены: "
+                f"{html.escape(str(exc))}"
+            )
+        finally:
+            for export_path in export_paths:
+                with contextlib.suppress(OSError):
+                    export_path.unlink()
 
 
 @router.message(Command("version"))
@@ -6874,6 +8176,7 @@ async def write_diagnostics() -> None:
             "blocked_until": rate_limit.blocked_until or None,
             "source": rate_limit.source,
         },
+        "payment_audit": payment_audit_health.snapshot(),
         "runtime": asdict(runtime),
         "settings": {
             "owner_user_id": store.settings.owner_user_id,
@@ -6922,6 +8225,7 @@ async def run_bot() -> None:
     _dispatcher_instance = dispatcher
     dispatcher.include_router(router)
     heartbeat_task: asyncio.Task[None] | None = None
+    payment_audit_task: asyncio.Task[None] | None = None
     tick_task: asyncio.Task[None] | None = None
     cluster_started = False
     failed = False
@@ -6936,6 +8240,9 @@ async def run_bot() -> None:
     try:
         tick_task = asyncio.create_task(event_loop_tick_loop(), name="event-loop-tick")
         heartbeat_task = asyncio.create_task(heartbeat_loop(), name="heartbeat")
+        payment_audit_task = asyncio.create_task(
+            payment_audit_health_loop(), name="payment-audit-health"
+        )
         await cluster_runtime.start()
         cluster_started = True
         config = cluster_runtime.applied_config or provision_store.load_config()
@@ -6979,7 +8286,7 @@ async def run_bot() -> None:
         if cluster_started:
             with contextlib.suppress(Exception):
                 await cluster_runtime.stop()
-        for task in (heartbeat_task, tick_task):
+        for task in (heartbeat_task, payment_audit_task, tick_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

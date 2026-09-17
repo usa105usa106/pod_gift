@@ -1,4 +1,4 @@
-# Аудит логирования v0030
+# Аудит логирования v0033
 
 ## Автоматический UDP-секрет
 
@@ -15,7 +15,7 @@ cluster_udp_started shooter_id=... port=... secret_source=generated|provision|en
 При запуске каждого Hunter:
 
 ```text
-scanner_started version=v0030 shooter_id=... mode=sniper|volley active_shooters=...
+scanner_started version=v0033 shooter_id=... mode=sniper|volley active_shooters=...
 saved_ids=... targets=... live=... volley=... volley_limit=...
 ```
 
@@ -106,15 +106,16 @@ Hunter 1 пишет:
 
 ## `/log_full`
 
-ZIP текущего Hunter включает:
+ZIP текущего Hunter включает только диагностическое окно последних 24 часов для обычного лога, payment-audit, stress-history и `cluster-events.jsonl`, а также актуальные снимки diagnostics, каталога, rate-limit, cluster/generation и lifecycle.
 
-- обычные и ротированные логи его data-volume;
-- diagnostics, каталог, stress и rate-limit;
-- `cluster.json`;
-- `cluster-generation.json`;
-- общий `cluster-events.jsonl`;
-- lifecycle-файлы Hunter 1–6.
+Если архив больше 49 MB, он автоматически разбивается на несколько самостоятельных ZIP-частей. Фильтрация журналов идёт потоково прямо во staging-файлы, а крупные файлы режутся ограниченным буфером, поэтому `/log_full` не создаёт в RAM полную копию 25-МБ ротации и ещё одну копию её отфильтрованного содержимого. Удаление записей старше 24 часов выполняется только после успешной отправки всех частей; при любой ошибке отправки исходные логи остаются на VPS. После успешной выгрузки из текущих, ротированных и append-only журналов удаляются только записи старше 24 часов; свежая суточная история остаётся доступной для повторной выгрузки.
 
-По архиву Hunter 1 видны ключевые переходы всей группы. Низкоуровневый процессный лог конкретного участника выгружается командой `/log_full` в его собственном боте.
+По архиву Hunter 1 видны ключевые переходы всей группы за последние сутки. Низкоуровневый процессный лог конкретного участника выгружается командой `/log_full` в его собственном боте.
 
 Поля с именами `token`, `secret`, `password`, `api_hash` в общем журнале автоматически заменяются на `[redacted]`.
+
+## Payment audit v0033
+
+Отдельный `gift-hunter-v0033-payment-audit.jsonl` записывает только диагностические, не секретные поля: `saved_id`, `form_id`, invoice/request binding, стоимость, возраст формы, refresh, ошибку, send-start и итог FAST. Токены, FIRE secret, пароль 2FA и `api_hash` туда не передаются.
+
+Ключевые события: `upgrade_prepare_started`, `payment_form_prepared`, `payment_form_refreshed`, `payment_form_refresh_failed`, `fast_local_preflight_failed`, `fast_volley_completed`. `/log_full` фильтрует текущий payment-audit и его ротации по последним 24 часам, а после успешной доставки архива удаляет локальные записи старше 24 часов.
