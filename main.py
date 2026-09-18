@@ -88,7 +88,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0033"
+APP_VERSION = "v0034"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -122,14 +122,22 @@ NEAR_TARGET_DISTANCE = env_int("NEAR_TARGET_DISTANCE", 25, minimum=1)
 PREPARE_AHEAD = env_int("PREPARE_AHEAD", 100, minimum=1)
 # Telegram Stars payment forms expire after 10 minutes. Keep a generous safety
 # margin and continuously refresh prepared forms while the scanner is active.
+#
+# Refresh policy is intentionally built in so a Coolify redeploy picks it up
+# without requiring an environment-variable rename or manual migration:
+#   * farther than 50 numbers from the next target -> refresh after 5 minutes;
+#   * within 50 numbers -> refresh after 2 minutes.
+# The 1-second worker tick only checks ages; it does not call Telegram every second.
 TELEGRAM_PAYMENT_FORM_TTL_SECONDS = 600
 PAYMENT_FORM_MAX_AGE_SECONDS = min(
     540, env_int("PAYMENT_FORM_MAX_AGE_SECONDS", 480, minimum=120)
 )
-PREPARE_REFRESH_SECONDS = min(
-    PAYMENT_FORM_MAX_AGE_SECONDS - 60,
-    env_int("PREPARE_REFRESH_SECONDS", 300, minimum=60),
-)
+PAYMENT_FORM_NEAR_TARGET_DISTANCE = 50
+PAYMENT_FORM_FAR_REFRESH_SECONDS = min(PAYMENT_FORM_MAX_AGE_SECONDS - 60, 300)
+PAYMENT_FORM_NEAR_REFRESH_SECONDS = min(PAYMENT_FORM_FAR_REFRESH_SECONDS, 120)
+# Internal compatibility name used by plan preparation/tests: this is the far-zone
+# age, while the background worker switches to the near-zone age dynamically.
+PREPARE_REFRESH_SECONDS = PAYMENT_FORM_FAR_REFRESH_SECONDS
 FORM_REFRESH_TICK_SECONDS = env_float("FORM_REFRESH_TICK_SECONDS", 1.0, minimum=0.25)
 FORM_REFRESH_BATCH_SIZE = min(50, env_int("FORM_REFRESH_BATCH_SIZE", 1, minimum=1))
 FORM_REFRESH_MAX_BATCH_SIZE = max(
@@ -189,18 +197,11 @@ MAX_PRIMARY_VOLLEY_SIZE = 50
 MAX_SECONDARY_VOLLEY_SIZE = 50
 DEFAULT_FAST_QUIET_DISTANCE = 10
 FAST_QUIET_DISTANCE = env_int("FAST_QUIET_DISTANCE", DEFAULT_FAST_QUIET_DISTANCE, minimum=1)
-# Refresh the entire FAST payment set before the scanner reaches the quiet/hot
-# zone, then stop all background form maintenance until the shot.  This keeps a
-# slow getPaymentForm request from owning the shared MTProto request lock while
-# the exact-number scanner is trying to read the frontier.
-FAST_FORM_FREEZE_DISTANCE = max(
-    FAST_QUIET_DISTANCE + 1,
-    env_int(
-        "FAST_FORM_FREEZE_DISTANCE",
-        max(NEAR_TARGET_DISTANCE, FAST_QUIET_DISTANCE + 1),
-        minimum=FAST_QUIET_DISTANCE + 1,
-    ),
-)
+# Force-refresh the full FAST payment set once when the frontier enters the same
+# 50-number near-target zone used by the faster form-refresh policy. This value
+# is built in deliberately: old Coolify FAST_FORM_FREEZE_DISTANCE settings are
+# ignored and no environment-variable migration is required on redeploy.
+FAST_FORM_ARM_DISTANCE = max(FAST_QUIET_DISTANCE + 1, PAYMENT_FORM_NEAR_TARGET_DISTANCE)
 FAST_DISABLE_GC = parse_bool(os.getenv("FAST_DISABLE_GC", "true"), True)
 FAST_CPU_AFFINITY = os.getenv("FAST_CPU_AFFINITY", "").strip()
 SHOOTER_ID = min(MAX_SHOOTERS, max(1, env_int("SHOOTER_ID", 1, minimum=1)))
@@ -2673,10 +2674,10 @@ class Scanner:
         self.prepared: dict[int, PreparedUpgrade] = {}
         self._form_refresh_retry_after: dict[int, float] = {}
         self._form_refresh_lock = asyncio.Lock()
-        self._form_refresh_frozen = False
         self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
         self._critical_form_ready: set[tuple[str, int]] = set()
         self._critical_form_unarmed: dict[tuple[str, int], str] = {}
+        self._critical_form_retry_after: dict[tuple[str, int], float] = {}
         self._payment_guard_keys: set[tuple[str, int]] = set()
         self._payment_guard_id: str | None = None
         self.triggered: set[tuple[str, int]] = set()
@@ -2996,10 +2997,10 @@ class Scanner:
             return "обнаружены повторяющиеся form_id"
         return None
 
-    def _release_form_refresh_freeze(self) -> None:
-        self._form_refresh_frozen = False
+    def _reset_critical_form_state(self) -> None:
         self._critical_form_ready.clear()
         self._critical_form_unarmed.clear()
+        self._critical_form_retry_after.clear()
 
     async def _clear_prearmed_payment_guards(self) -> None:
         """Remove guards that this live process armed but never submitted."""
@@ -3015,32 +3016,42 @@ class Scanner:
         if not self._payment_guard_keys:
             self._payment_guard_id = None
 
-    async def _prepare_and_freeze_fast_forms(
+    async def _prepare_fast_forms(
         self,
         peer: Any,
         slug: str,
         target: int,
         group: list[SavedGiftInfo],
     ) -> bool:
-        """Refresh every FAST form once, then freeze background refresh.
+        """Force-refresh every FAST form once before the hot zone.
 
-        The freeze is set before waiting for the refresh lock, so an already
-        running background refresh may finish its current request but cannot
-        start another one.  The scanner therefore enters the hot zone only
-        after a complete forced refresh, or explicitly marks the volley unarmed.
+        The normal background refresher deliberately keeps running afterwards.
+        The frontier can remain inside the hot zone for hours; permanently
+        freezing forms here would let otherwise valid FAST ammunition expire.
         """
         key = (slug, int(target))
-        if key in self._critical_form_ready:
-            return True
-        if key in self._critical_form_unarmed:
-            return False
-
-        self._form_refresh_frozen = True
         candidates = self._selected_fast_candidates(group)
+
+        # A previously armed key is cheap to validate from RAM on every pass.
+        # If a worker died or Telegram could not refresh for long enough, do not
+        # keep trusting a stale "ready" bit: drop it and rebuild the forms.
+        if key in self._critical_form_ready:
+            reason = self._fast_ammo_error(candidates)
+            if reason is None:
+                return True
+            self._critical_form_ready.discard(key)
+            self._critical_form_unarmed[key] = reason
+
+        retry_after = self._critical_form_retry_after.get(key, 0.0)
+        if retry_after > time.monotonic():
+            return False
+        self._critical_form_unarmed.pop(key, None)
+
         required = effective_volley_size()
         if len(candidates) != required:
             reason = f"нужно {required} подарков, доступно {len(candidates)}"
             self._critical_form_unarmed[key] = reason
+            self._critical_form_retry_after[key] = time.monotonic() + 15.0
             runtime.last_error = f"FAST-залп не вооружён: {reason}"
             return False
 
@@ -3068,16 +3079,17 @@ class Scanner:
         )
         if reason is not None:
             self._critical_form_unarmed[key] = reason
+            self._critical_form_retry_after[key] = time.monotonic() + 15.0
             runtime.last_error = f"FAST-залп не вооружён: {reason}"
             logger.error(
-                "fast_forms_frozen_unarmed slug=%s target=%s candidates=%s reason=%s",
+                "fast_forms_unarmed slug=%s target=%s candidates=%s reason=%s",
                 slug,
                 target,
                 [item.saved_id for item in candidates],
                 reason,
             )
             record_payment_event(
-                "fast_forms_frozen_unarmed",
+                "fast_forms_unarmed",
                 slug=slug,
                 target=target,
                 saved_ids=[item.saved_id for item in candidates],
@@ -3096,6 +3108,7 @@ class Scanner:
         except OSError as exc:
             reason = f"persistent payment guard не записан: {exc}"
             self._critical_form_unarmed[key] = reason
+            self._critical_form_retry_after[key] = time.monotonic() + 15.0
             runtime.last_error = f"FAST-залп не вооружён: {reason}"
             logger.exception(
                 "fast_payment_guard_arm_failed slug=%s target=%s saved_ids=%s",
@@ -3106,21 +3119,23 @@ class Scanner:
             return False
         self._payment_guard_id = guard_id
         self._payment_guard_keys.add(key)
+        self._critical_form_unarmed.pop(key, None)
+        self._critical_form_retry_after.pop(key, None)
         self._critical_form_ready.add(key)
         runtime.last_error = None
         logger.info(
-            "fast_forms_refreshed_and_frozen slug=%s target=%s candidates=%s freeze_distance=%s",
+            "fast_forms_refreshed_and_armed slug=%s target=%s candidates=%s arm_distance=%s",
             slug,
             target,
             [item.saved_id for item in candidates],
-            FAST_FORM_FREEZE_DISTANCE,
+            FAST_FORM_ARM_DISTANCE,
         )
         record_payment_event(
-            "fast_forms_refreshed_and_frozen",
+            "fast_forms_refreshed_and_armed",
             slug=slug,
             target=target,
             saved_ids=[item.saved_id for item in candidates],
-            freeze_distance=FAST_FORM_FREEZE_DISTANCE,
+            arm_distance=FAST_FORM_ARM_DISTANCE,
         )
         return True
 
@@ -3172,6 +3187,30 @@ class Scanner:
         self._form_refresh_latency_ewma_s = (
             alpha * sample + (1.0 - alpha) * self._form_refresh_latency_ewma_s
         )
+
+    def _payment_form_refresh_policy(self) -> tuple[int, int | None]:
+        """Return (refresh_age_seconds, distance_to_next_target).
+
+        Farther than 50 numbers we keep the low-noise five-minute cadence. Once
+        the observed frontier is within 50 numbers of the next target, every
+        prepared form is maintained on a two-minute cadence. Because each form's
+        created_at is updated after its own refresh, a large volley naturally
+        stays staggered instead of creating one synchronized burst.
+        """
+        distances: list[int] = []
+        for slug, meta in self._counter_meta.items():
+            current = int(runtime.current_by_slug.get(slug, meta.current))
+            target = next_target(store.settings.target_numbers, current)
+            if target is None:
+                continue
+            distance = int(target) - current
+            if distance > 0:
+                distances.append(distance)
+
+        nearest = min(distances) if distances else None
+        if nearest is not None and nearest <= PAYMENT_FORM_NEAR_TARGET_DISTANCE:
+            return PAYMENT_FORM_NEAR_REFRESH_SECONDS, nearest
+        return PAYMENT_FORM_FAR_REFRESH_SECONDS, nearest
 
     def _adaptive_form_refresh_batch_size(
         self,
@@ -3230,12 +3269,12 @@ class Scanner:
             not store.settings.live_upgrades
             or self._fast_fired
             or self.stop_event.is_set()
-            or (self._form_refresh_frozen and not force)
         ):
             self._update_payment_form_age_metric()
             return 0
 
         now = time.monotonic()
+        refresh_after_s, target_distance = self._payment_form_refresh_policy()
         refresh_candidates = list(candidates) if candidates is not None else self._fast_candidates_from_ram()
         due: list[tuple[float, SavedGiftInfo, PreparedUpgrade | None]] = []
         for candidate in refresh_candidates:
@@ -3246,7 +3285,7 @@ class Scanner:
             if not force and retry_after > now:
                 continue
             age = float("inf") if plan is None else max(0.0, now - plan.created_at)
-            if force or plan is None or age >= PREPARE_REFRESH_SECONDS:
+            if force or plan is None or age >= refresh_after_s:
                 due.append((age, candidate, plan))
 
         # Oldest first: the form with the least remaining safe lifetime always
@@ -3280,16 +3319,12 @@ class Scanner:
         for old_age, candidate, old_plan in due[:limit]:
             if self._fast_fired or self.stop_event.is_set():
                 break
-            if self._form_refresh_frozen and not force:
-                break
             old_form_id = old_plan.form_id if old_plan is not None else None
             try:
-                # Serialize form maintenance itself, but only one candidate at a
-                # time.  When FAST freezes refresh, a background batch can hold
-                # up the scanner for at most the one request already in flight.
+                # Serialize form maintenance itself, one candidate at a time.
+                # The worker stays enabled even while the target is inside the
+                # hot zone, so a long wait cannot age the forms past the limit.
                 async with self._form_refresh_lock:
-                    if self._form_refresh_frozen and not force:
-                        break
                     request_started = time.perf_counter()
                     try:
                         new_plan = await self.service.prepare_upgrade(peer, candidate)
@@ -3323,12 +3358,13 @@ class Scanner:
                 runtime.payment_form_last_refresh_error = None
                 logger.info(
                     "payment_form_refreshed saved_id=%s old_form_id=%s new_form_id=%s old_age_s=%.3f "
-                    "refresh_after_s=%s max_age_s=%s",
+                    "refresh_after_s=%s target_distance=%s max_age_s=%s",
                     candidate.saved_id,
                     old_form_id,
                     new_plan.form_id,
                     0.0 if old_age == float("inf") else old_age,
-                    PREPARE_REFRESH_SECONDS,
+                    refresh_after_s,
+                    target_distance,
                     PAYMENT_FORM_MAX_AGE_SECONDS,
                 )
                 record_payment_event(
@@ -3340,7 +3376,8 @@ class Scanner:
                     invoice_saved_id=invoice_saved_id(new_plan.invoice),
                     request_form_id=_int_or_none(getattr(new_plan.request, "form_id", None)),
                     request_invoice_saved_id=invoice_saved_id(getattr(new_plan.request, "invoice", None)),
-                    refresh_after_s=PREPARE_REFRESH_SECONDS,
+                    refresh_after_s=refresh_after_s,
+                    target_distance=target_distance,
                     max_age_s=PAYMENT_FORM_MAX_AGE_SECONDS,
                 )
             except asyncio.CancelledError:
@@ -3382,15 +3419,20 @@ class Scanner:
 
     async def _payment_form_refresh_loop(self, peer: Any) -> None:
         logger.info(
-            "payment_form_refresh_worker_started refresh_after_s=%s max_age_s=%s tick_s=%s batch=%s",
-            PREPARE_REFRESH_SECONDS,
+            "payment_form_refresh_worker_started far_refresh_s=%s near_refresh_s=%s near_distance=%s "
+            "max_age_s=%s tick_s=%s batch=%s",
+            PAYMENT_FORM_FAR_REFRESH_SECONDS,
+            PAYMENT_FORM_NEAR_REFRESH_SECONDS,
+            PAYMENT_FORM_NEAR_TARGET_DISTANCE,
             PAYMENT_FORM_MAX_AGE_SECONDS,
             FORM_REFRESH_TICK_SECONDS,
             FORM_REFRESH_BATCH_SIZE,
         )
         record_payment_event(
             "payment_form_refresh_worker_started",
-            refresh_after_s=PREPARE_REFRESH_SECONDS,
+            far_refresh_s=PAYMENT_FORM_FAR_REFRESH_SECONDS,
+            near_refresh_s=PAYMENT_FORM_NEAR_REFRESH_SECONDS,
+            near_distance=PAYMENT_FORM_NEAR_TARGET_DISTANCE,
             max_age_s=PAYMENT_FORM_MAX_AGE_SECONDS,
             telegram_ttl_s=TELEGRAM_PAYMENT_FORM_TTL_SECONDS,
             tick_s=FORM_REFRESH_TICK_SECONDS,
@@ -3403,8 +3445,24 @@ class Scanner:
                 and not self.stop_event.is_set()
                 and not self._fast_fired
             ):
-                if not self._form_refresh_frozen:
+                try:
                     await self._refresh_due_payment_forms(peer)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # An unexpected bookkeeping/worker error must not kill form
+                    # maintenance for the rest of a long-running scan. Record it,
+                    # wait one normal tick, and try again. Candidate-level network
+                    # failures are already handled inside _refresh_due_payment_forms.
+                    runtime.payment_form_last_refresh_error = (
+                        f"worker: {type(exc).__name__}: {exc}"[:500]
+                    )
+                    logger.exception("payment_form_refresh_worker_iteration_failed")
+                    record_payment_event(
+                        "payment_form_refresh_worker_iteration_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                    )
                 try:
                     await asyncio.wait_for(
                         self.stop_event.wait(), timeout=FORM_REFRESH_TICK_SECONDS
@@ -3413,14 +3471,6 @@ class Scanner:
                     pass
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            runtime.payment_form_last_refresh_error = f"worker: {type(exc).__name__}: {exc}"[:500]
-            logger.exception("payment_form_refresh_worker_failed")
-            record_payment_event(
-                "payment_form_refresh_worker_failed",
-                error_type=type(exc).__name__,
-                error=str(exc)[:500],
-            )
         finally:
             self._update_payment_form_age_metric()
             logger.info("payment_form_refresh_worker_stopped")
@@ -3472,7 +3522,7 @@ class Scanner:
         self._form_refresh_retry_after.clear()
         self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
         await self._clear_prearmed_payment_guards()
-        self._release_form_refresh_freeze()
+        self._reset_critical_form_state()
         self._plan_dirty = True
         self._groups.clear()
         self._counter_meta.clear()
@@ -3762,9 +3812,9 @@ class Scanner:
                         if (
                             store.settings.live_upgrades
                             and upcoming_target is not None
-                            and 0 < upcoming_target - previous <= FAST_FORM_FREEZE_DISTANCE
+                            and 0 < upcoming_target - previous <= FAST_FORM_ARM_DISTANCE
                         ):
-                            await self._prepare_and_freeze_fast_forms(
+                            await self._prepare_fast_forms(
                                 peer,
                                 slug,
                                 upcoming_target,
@@ -3857,7 +3907,7 @@ class Scanner:
                             runtime.last_error = "Выстрел уже существует; оплата не отправлена"
                             self.stop_event.set()
                             break
-                        self._release_form_refresh_freeze()
+                        self._reset_critical_form_state()
 
                     current_max = max(counter.current for counter in counters.values())
                     future_targets = [value for value in store.settings.target_numbers if value > current_max]
@@ -7520,7 +7570,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0033 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0034 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -7626,9 +7676,20 @@ async def status_text() -> str:
         f"Фактический шаг: {runtime.poll_gap_ms:.0f} мс" if runtime.poll_gap_ms is not None else "Фактический шаг: —",
         f"FloodWait: {runtime.flood_count}" + (f" · последний {runtime.last_flood_wait_s}с" if runtime.last_flood_wait_s is not None else ""),
         f"Cooldown: {runtime.rate_cooldown_cycles} циклов" if runtime.rate_cooldown_cycles else "Cooldown: нет",
+        (
+            f"FAST-формы: старшая {runtime.payment_form_oldest_age_s:.0f}с · обновлений {runtime.payment_form_refresh_count}"
+            if store.settings.live_upgrades and runtime.payment_form_oldest_age_s is not None
+            else (f"FAST-формы: обновлений {runtime.payment_form_refresh_count}" if store.settings.live_upgrades else "FAST-формы: —")
+        ),
         f"Uptime сканера: {uptime}с" if runtime.started_at else "Uptime сканера: —",
         f"Обновлено: <b>{msk_time_str()}</b>",
     ])
+    if store.settings.live_upgrades and runtime.payment_form_last_refresh_error:
+        lines.append(
+            "⚠️ Refresh FAST-форм: <code>"
+            + html.escape(runtime.payment_form_last_refresh_error[:300])
+            + "</code>"
+        )
     if runtime.fast_trigger_to_submit_ms is not None:
         lines.append(
             f"⚡ Последняя реакция: <b>{runtime.fast_trigger_to_submit_ms:.3f} мс</b> · "

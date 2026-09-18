@@ -1,36 +1,39 @@
-Gift Hunter v0033 — Release Manifest — Final audited release
+Gift Hunter v0034 — Release Manifest — dynamic FAST form refresh hotfix
 
 Validation summary:
-- 192 tests pass in the updated release tree.
-- Python sources compile successfully; AST parsing succeeds; asyncio debug-run completed without RuntimeWarning.
-- docker-compose.yaml parses with 6 services.
-- Version identifiers in application, bootstrap, healthcheck, user-facing strings, tests and documentation are synchronized to v0033; no previous-version identifiers remain.
-- Critical payment-safety fix A: an existing but unreadable/corrupt payment-submit-guard.json now fails closed and cannot be silently treated as absent before a Stars submission.
-- Critical payment-safety fix B: every durable payment-guard mutation receives a fresh random generation token, preventing a previously persisted confirmation token from matching a later armed submission after stale-guard cleanup failure.
-- Previous Stage 1–4 fixes remain intact.
+- Production log root cause confirmed: forms were refreshed/armed at 22:42:47 UTC, then the old permanent hot-zone freeze left them untouched until the 00:11:38 UTC trigger; oldest_age_s reached 5330.599.
+- Permanent payment-form freeze removed.
+- Built-in refresh policy: farther than 50 numbers from the next target, each form is refreshed after 300 s; within 50 numbers, after 120 s.
+- Entering the 50-number zone forces one full FAST-form refresh, then background maintenance continues; no form freeze is reintroduced.
+- Coolify migration is automatic: FAST_FORM_FREEZE_DISTANCE / FAST_FORM_ARM_DISTANCE renaming is no longer required for this policy, and the obsolete compose knobs were removed.
+- Armed FAST state is revalidated from RAM; stale plans are rebuilt, and transient arm failures become retryable after 15 seconds.
+- Scanner status exposes oldest FAST-form age, refresh count, and the latest refresh error.
+- Unexpected refresh-worker iteration errors are logged and retried instead of terminating form maintenance.
+- Full local regression run: 194 tests, OK.
+- Python compileall succeeds; docker-compose.yaml parses with 6 services.
 - No live Telegram/Stars payment was executed as part of this offline validation.
 
 Files (SHA256  bytes  path):
-e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
-300000ca9db0adae182d21dd4cd858a365a9fa679548e71847da9b9bfccd20f8        2313  .env.example
-8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
+e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  dockerignore
+f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  env.example
+8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  gitignore
 08c7eaa6bc933356c4febab23d75d94a09acdd668b491e3816be4bfad1511b29        8257  AUDIT-LOGGING.md
-c71d73029d37b0552e6c7408cb8ee8a7a3f61ecd66673735d18fe58f46021ae6       29351  CHANGELOG.md
+efe02a75f508f4650a7e6c030a5b3d1122a99fb484e40fc3c503ae9dc3b6f5de       32029  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-70dea47d539de341aa17fb9ddcef42c7c56659a48b62f15759a7a0f1616a0c24        1597  PAYMENT-DIAGNOSTIC-PATCH.md
-cf23ae03cb8aa4bc89f0b0bbad24368629b51b6fcf9f97f144005e2a300a8478       27258  README.md
-dc7aef5038f0deb0cfc8d4015ecc330c60e658ca65ab849e64ea0b59daeccdfb       16711  VALIDATION.md
+c63e91aec3648a3b4f847381e3ed814415be300cf5e1b1df7e9850d090deb60c        1891  PAYMENT-DIAGNOSTIC-PATCH.md
+b63259c6b0b507c69dc534266c3bdb54cb947b379d2063cad2ef1e61aa6b1985       28483  README.md
+5cb0679bb018a1bb5c20188a4424daab81d159aa048819f83e0b81a3da145117       18704  VALIDATION.md
 f19d141f98f29a356a9bee260c70b2453d653743818624be739329430660ec47        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
-394005f428faf1878d62c538b3720b478208450a00c935c35b42ee0cf956d173        5565  docker-compose.yaml
+d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
 0ecf49bd42010a2e32071c4b73e600a11d53be2b8b13a5b0ba517075f6b9a5bb        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-9822a33693cbf3f91573efbc7a02fa7d47f0b25146860abe87682e89e9720fa2      368055  main.py
+d0e75e9a0ff2a0b2fd36771ae567b2d804460aa9ffb385dcf2e8d5a32e6463c0      371927  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
 81e6188306eab3953032990327165f6a7379b5f115c0d316af72c10f4b4d54f1        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-ee250c2b142a96df94280ad0bcbc202e784d5164e7b5e7879cccf9d7ee12be75      159821  tests/test_runtime.py
-49eccd87416f60412ddcf6e6b8e9dff71c987de14b08401b72d12a5dce17e9d5       20630  tests/test_source_guards.py
+ec1dc59e2efad56aa0ea908d9a948692fc45860b539ac62938eef06419f0cd52      162033  tests/test_runtime.py
+d78af3c53237c3a50991f1652c3efbee11a63671987215f38e6e0b75def88150       21387  tests/test_source_guards.py
