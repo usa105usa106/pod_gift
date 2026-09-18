@@ -88,7 +88,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0034"
+APP_VERSION = "v0035"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -1275,6 +1275,13 @@ class MTProtoService:
         self._gift_catalog: dict[int, Any] = {}
         self._gift_catalog_at: float = 0.0
         self._authorized: bool | None = None
+        # Monotonic diagnostics only.  These counters never participate in
+        # authorization or reconnect logic; they simply let /log_full prove
+        # whether the scanner reused the same client/connection around a shot.
+        self._client_epoch: int = 0
+        self._connect_epoch: int = 0
+        self._client_created_monotonic: float | None = None
+        self._connected_monotonic: float | None = None
 
     @staticmethod
     def session_base() -> str:
@@ -1315,6 +1322,12 @@ class MTProtoService:
             raise RuntimeError("MTProto не настроен: нужны TG_API_ID, TG_API_HASH и номер телефона")
         async with self._client_lock:
             if reload and self.client is not None:
+                logger.info(
+                    "mtproto_client_reload client_epoch=%s connect_epoch=%s connected=%s",
+                    self._client_epoch,
+                    self._connect_epoch,
+                    bool(self.client.is_connected()),
+                )
                 with contextlib.suppress(Exception):
                     await self.client.disconnect()
                 self.client = None
@@ -1335,9 +1348,54 @@ class MTProtoService:
                     connection_retries=5,
                     flood_sleep_threshold=0,
                 )
+                self._client_epoch += 1
+                self._client_created_monotonic = time.monotonic()
+                logger.info(
+                    "mtproto_client_created client_epoch=%s session=%s app_version=%s",
+                    self._client_epoch,
+                    Path(self.session_base()).name,
+                    APP_VERSION,
+                )
             if not self.client.is_connected():
+                logger.info(
+                    "mtproto_connect_started client_epoch=%s next_connect_epoch=%s",
+                    self._client_epoch,
+                    self._connect_epoch + 1,
+                )
                 await self.client.connect()
+                self._connect_epoch += 1
+                self._connected_monotonic = time.monotonic()
+                logger.info(
+                    "mtproto_connect_ready client_epoch=%s connect_epoch=%s",
+                    self._client_epoch,
+                    self._connect_epoch,
+                )
             return self.client
+
+    def connection_snapshot(self, client: TelegramClient | None = None) -> dict[str, Any]:
+        """Return non-secret transport diagnostics for payment audit logs."""
+        current = client or self.client
+        connected = bool(current is not None and current.is_connected())
+        session = getattr(current, "session", None) if current is not None else None
+        sender = getattr(current, "_sender", None) if current is not None else None
+        now = time.monotonic()
+        return {
+            "client_epoch": self._client_epoch,
+            "connect_epoch": self._connect_epoch,
+            "connected": connected,
+            "dc_id": _int_or_none(getattr(session, "dc_id", None)),
+            "client_age_s": (
+                round(max(0.0, now - self._client_created_monotonic), 3)
+                if self._client_created_monotonic is not None
+                else None
+            ),
+            "connection_age_s": (
+                round(max(0.0, now - self._connected_monotonic), 3)
+                if self._connected_monotonic is not None
+                else None
+            ),
+            "sender_reconnecting": bool(getattr(sender, "_reconnecting", False)),
+        }
 
     async def is_authorized(self, *, reload: bool = False) -> bool:
         if not self.configured():
@@ -1375,6 +1433,12 @@ class MTProtoService:
     async def disconnect(self) -> None:
         async with self._client_lock:
             if self.client is not None:
+                logger.info(
+                    "mtproto_disconnect_requested client_epoch=%s connect_epoch=%s connected=%s",
+                    self._client_epoch,
+                    self._connect_epoch,
+                    bool(self.client.is_connected()),
+                )
                 with contextlib.suppress(Exception):
                     await self.client.disconnect()
                 self.client = None
@@ -2259,6 +2323,7 @@ class MTProtoService:
         text = str(exc).upper()
         codes = (
             "FORM_EXPIRED", "STARS_FORM_AMOUNT_MISMATCH", "FORM_SUBMIT_DUPLICATE",
+            "MSG_WAIT_FAILED", "MSG_WAIT_TIMEOUT",
             "BALANCE_TOO_LOW", "BOT_INVOICE_INVALID", "FORM_ID_EMPTY", "GIFT_STARS_INVALID",
             "INVOICE_INVALID", "SAVED_ID_EMPTY", "STARGIFT_ALREADY_CONVERTED",
             "STARGIFT_ALREADY_UPGRADED", "STARGIFT_NOT_FOUND", "STARGIFT_OWNER_INVALID",
@@ -2273,6 +2338,8 @@ class MTProtoService:
             "FORMEXPIREDERROR": "FORM_EXPIRED",
             "STARSFORMAMOUNTMISMATCHERROR": "STARS_FORM_AMOUNT_MISMATCH",
             "FORMSUBMITDUPLICATEERROR": "FORM_SUBMIT_DUPLICATE",
+            "MSGWAITFAILEDERROR": "MSG_WAIT_FAILED",
+            "MSGWAITTIMEOUTERROR": "MSG_WAIT_TIMEOUT",
             "BALANCETOOLOWERROR": "BALANCE_TOO_LOW",
             "BOTINVOICEINVALIDERROR": "BOT_INVOICE_INVALID",
             "FORMIDEMPTYERROR": "FORM_ID_EMPTY",
@@ -2330,6 +2397,233 @@ class MTProtoService:
             detail="Запрос принят, но Telegram не подтвердил результат. Повторная оплата не отправлялась.",
         )
 
+    @staticmethod
+    def _multi_error_parts(exc: BaseException, expected: int) -> tuple[list[Any], list[BaseException | None]] | None:
+        """Duck-type Telethon MultiError without coupling tests to its class."""
+        results = getattr(exc, "results", None)
+        exceptions = getattr(exc, "exceptions", None)
+        if not isinstance(results, (list, tuple)) or not isinstance(exceptions, (list, tuple)):
+            return None
+        if len(results) != expected or len(exceptions) != expected:
+            return None
+        normalized: list[BaseException | None] = []
+        for item in exceptions:
+            normalized.append(item if isinstance(item, BaseException) else None)
+        return list(results), normalized
+
+    async def _fast_outcome_from_exception(
+        self,
+        peer: Any,
+        info: SavedGiftInfo,
+        request: Any,
+        exc: BaseException,
+    ) -> UpgradeOutcome:
+        if isinstance(exc, errors.FloodWaitError):
+            source = f"FAST:{request.__class__.__name__}"
+            remaining = rate_limit.register(float(exc.seconds), source)
+            record_payment_event(
+                "fast_payment_flood_wait",
+                saved_id=info.saved_id,
+                wait_seconds=int(exc.seconds),
+                persistent_remaining_seconds=round(remaining, 3),
+                source=source,
+            )
+            return UpgradeOutcome("failed", detail=f"FLOOD_WAIT_{int(exc.seconds)}: платёж не повторялся")
+
+        if isinstance(exc, errors.RPCError):
+            code = self._rpc_code(exc)
+            if code in {"FORM_SUBMIT_DUPLICATE", "STARGIFT_ALREADY_UPGRADED"}:
+                actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+                if actual_num is not None:
+                    return UpgradeOutcome("confirmed", actual_num, actual_slug)
+                return UpgradeOutcome("unknown", detail=f"{code}: результат не удалось подтвердить")
+            if self._is_definitive_upgrade_error(code) or code in {
+                "FORM_EXPIRED",
+                "STARS_FORM_AMOUNT_MISMATCH",
+            }:
+                return UpgradeOutcome("failed", detail=f"{code}: {exc}")
+            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+            if actual_num is not None:
+                return UpgradeOutcome("confirmed", actual_num, actual_slug)
+            return UpgradeOutcome("unknown", detail=f"{code}: {type(exc).__name__}: {exc}")
+
+        actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
+        if actual_num is not None:
+            return UpgradeOutcome("confirmed", actual_num, actual_slug)
+        return UpgradeOutcome(
+            "unknown",
+            detail=f"{type(exc).__name__}: {exc}; FAST-повтор не отправлялся",
+        )
+
+    async def execute_upgrade_fast_batch(
+        self,
+        peer: Any,
+        items: list[tuple[SavedGiftInfo, PreparedUpgrade]],
+        *,
+        client: TelegramClient,
+    ) -> list[UpgradeOutcome]:
+        """Submit a FAST volley as one ordered MTProto pipeline.
+
+        Telethon accepts a list of requests with ``ordered=True``. It queues the
+        whole list immediately and wraps later requests with invokeAfterMsg, so
+        Telegram receives one pipeline but executes each payment only after the
+        previous payment has completed successfully. This avoids the v0034
+        behaviour where several ``client(request)`` coroutines entered the same
+        payment method essentially simultaneously.
+
+        If a previous ordered request fails, Telegram returns MSG_WAIT_FAILED for
+        dependent requests. Those dependent requests were not executed, so they
+        are immediately re-pipelined without waiting for slow post-submit
+        verification of the failed item. No payment that actually ran (or whose
+        state is ambiguous) is automatically submitted again.
+        """
+        if not items:
+            return []
+
+        now = time.monotonic()
+        for info, prepared in items:
+            if prepared.saved_id != info.saved_id or prepared.request is None:
+                raise RuntimeError(
+                    f"FAST-план отсутствует или относится к другому подарку: saved_id={info.saved_id}"
+                )
+            if now - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+                raise RuntimeError(
+                    f"FAST-платёжная форма устарела: saved_id={info.saved_id}; оплата не отправлена"
+                )
+
+        raw_results: list[Any] = [None] * len(items)
+        raw_errors: list[BaseException | None] = [None] * len(items)
+        pending = list(range(len(items)))
+        phase = 0
+        snapshot_before = self.connection_snapshot(client)
+        record_payment_event(
+            "fast_payment_batch_started",
+            count=len(items),
+            ordered=True,
+            transport="telethon_ordered_list",
+            connection=snapshot_before,
+            entries=[prepared_payment_debug(plan) for _info, plan in items],
+        )
+
+        while pending:
+            phase += 1
+            phase_requests = [items[index][1].request for index in pending]
+            submit_ns = time.perf_counter_ns()
+            for index in pending:
+                # For a dependent MSG_WAIT_FAILED request this timestamp is
+                # replaced by the phase in which it is actually re-pipelined.
+                items[index][1].fast_send_started_ns = submit_ns
+
+            phase_results: list[Any] = [None] * len(pending)
+            phase_errors: list[BaseException | None] = [None] * len(pending)
+            try:
+                raw = await client(phase_requests, ordered=True)
+                if isinstance(raw, (list, tuple)):
+                    phase_results = list(raw)
+                elif len(pending) == 1:
+                    phase_results = [raw]
+                else:
+                    raise RuntimeError(
+                        f"FAST ordered batch вернул неожиданный тип {type(raw).__name__}"
+                    )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                multi = self._multi_error_parts(exc, len(pending))
+                if multi is not None:
+                    phase_results, phase_errors = multi
+                elif len(pending) == 1:
+                    phase_errors = [exc]
+                else:
+                    # A connection-level failure around a list call is ambiguous:
+                    # some requests may already have reached Telegram. Never
+                    # re-submit any of them automatically.
+                    phase_errors = [exc] * len(pending)
+
+            retry_indexes: list[int] = []
+            for local_index, global_index in enumerate(pending):
+                error = phase_errors[local_index]
+                if error is not None and self._rpc_code(error) in {"MSG_WAIT_FAILED", "MSG_WAIT_TIMEOUT"}:
+                    # These errors come from the invokeAfterMsg wrapper, before
+                    # the dependent payment query itself is executed. Telegram's
+                    # MTProto docs explicitly require resending that dependent
+                    # query. Re-pipeline only this known-unexecuted request; never
+                    # retry a payment that ran or whose transport state is unclear.
+                    retry_indexes.append(global_index)
+                    continue
+                raw_results[global_index] = phase_results[local_index]
+                raw_errors[global_index] = error
+
+            record_payment_event(
+                "fast_payment_batch_phase",
+                phase=phase,
+                submitted_saved_ids=[items[index][0].saved_id for index in pending],
+                retry_unexecuted_saved_ids=[items[index][0].saved_id for index in retry_indexes],
+                connection=self.connection_snapshot(client),
+            )
+            # Do this immediately. In particular, do not wait for
+            # FORM_SUBMIT_DUPLICATE verification on a different saved gift.
+            pending = retry_indexes
+
+        interpretation_jobs: list[tuple[int, asyncio.Task[UpgradeOutcome]]] = []
+        outcomes: list[UpgradeOutcome | None] = [None] * len(items)
+        for index, (info, prepared) in enumerate(items):
+            error = raw_errors[index]
+            if error is not None:
+                interpretation_jobs.append(
+                    (
+                        index,
+                        asyncio.create_task(
+                            self._fast_outcome_from_exception(
+                                peer, info, prepared.request, error
+                            )
+                        ),
+                    )
+                )
+            else:
+                interpretation_jobs.append(
+                    (
+                        index,
+                        asyncio.create_task(
+                            self._interpret_upgrade_result(peer, info.saved_id, raw_results[index])
+                        ),
+                    )
+                )
+
+        if interpretation_jobs:
+            interpreted = await asyncio.gather(
+                *(task for _index, task in interpretation_jobs),
+                return_exceptions=True,
+            )
+            for (index, _task), value in zip(interpretation_jobs, interpreted):
+                if isinstance(value, UpgradeOutcome):
+                    outcomes[index] = value
+                elif isinstance(value, BaseException):
+                    outcomes[index] = UpgradeOutcome(
+                        "unknown",
+                        detail=f"{type(value).__name__}: {value}; результат проверки неясен",
+                    )
+                else:
+                    outcomes[index] = UpgradeOutcome(
+                        "unknown", detail="Неожиданный результат проверки FAST-платежа"
+                    )
+
+        snapshot_after = self.connection_snapshot(client)
+        final = [
+            outcome
+            if isinstance(outcome, UpgradeOutcome)
+            else UpgradeOutcome("unknown", detail="FAST batch завершился без результата")
+            for outcome in outcomes
+        ]
+        record_payment_event(
+            "fast_payment_batch_finished",
+            count=len(items),
+            phases=phase,
+            connection_before=snapshot_before,
+            connection_after=snapshot_after,
+            statuses=[outcome.status for outcome in final],
+        )
+        return final
 
     async def execute_upgrade_fast(
         self,
@@ -2355,43 +2649,10 @@ class MTProtoService:
             prepared.fast_send_started_ns = time.perf_counter_ns()
             result = await client(prepared.request)
             return await self._interpret_upgrade_result(peer, info.saved_id, result)
-        except errors.FloodWaitError as exc:
-            source = f"FAST:{prepared.request.__class__.__name__}"
-            remaining = rate_limit.register(float(exc.seconds), source)
-            record_payment_event(
-                "fast_payment_flood_wait",
-                saved_id=info.saved_id,
-                wait_seconds=int(exc.seconds),
-                persistent_remaining_seconds=round(remaining, 3),
-                source=source,
-            )
-            return UpgradeOutcome("failed", detail=f"FLOOD_WAIT_{int(exc.seconds)}: платёж не повторялся")
-        except errors.RPCError as exc:
-            code = self._rpc_code(exc)
-            if code in {"FORM_SUBMIT_DUPLICATE", "STARGIFT_ALREADY_UPGRADED"}:
-                actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
-                if actual_num is not None:
-                    return UpgradeOutcome("confirmed", actual_num, actual_slug)
-                return UpgradeOutcome("unknown", detail=f"{code}: результат не удалось подтвердить")
-            if self._is_definitive_upgrade_error(code) or code in {
-                "FORM_EXPIRED",
-                "STARS_FORM_AMOUNT_MISMATCH",
-            }:
-                return UpgradeOutcome("failed", detail=f"{code}: {exc}")
-            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
-            if actual_num is not None:
-                return UpgradeOutcome("confirmed", actual_num, actual_slug)
-            return UpgradeOutcome("unknown", detail=f"{code}: {type(exc).__name__}: {exc}")
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
                 raise
-            actual_num, actual_slug = await self._verify_unique(peer, info.saved_id)
-            if actual_num is not None:
-                return UpgradeOutcome("confirmed", actual_num, actual_slug)
-            return UpgradeOutcome(
-                "unknown",
-                detail=f"{type(exc).__name__}: {exc}; FAST-повтор не отправлялся",
-            )
+            return await self._fast_outcome_from_exception(peer, info, prepared.request, exc)
 
 
 
@@ -4128,20 +4389,6 @@ class Scanner:
             )
             await self._maybe_write_diagnostics(force=True)
 
-    async def _execute_upgrade_fast_tracked(
-        self,
-        peer: Any,
-        candidate: SavedGiftInfo,
-        plan: PreparedUpgrade,
-        client: TelegramClient,
-    ) -> UpgradeOutcome:
-        # Fallback timestamp for test doubles or future service adapters.  The
-        # production MTProtoService overwrites it immediately before client().
-        plan.fast_send_started_ns = time.perf_counter_ns()
-        return await self.service.execute_upgrade_fast(
-            peer, candidate, plan, client=client
-        )
-
     async def _fast_volley(
         self,
         peer: Any,
@@ -4182,7 +4429,7 @@ class Scanner:
         runtime.fast_volley_size = volley_size
         candidates: list[SavedGiftInfo] = []
         plans: list[PreparedUpgrade] = []
-        tasks: list[asyncio.Task[UpgradeOutcome]] = []
+        batch_task: asyncio.Task[list[UpgradeOutcome]] | None = None
         local_error: BaseException | None = None
         client = self._fast_client
 
@@ -4284,15 +4531,19 @@ class Scanner:
 
         launch_started = time.perf_counter()
         if local_error is None and client is not None:
-            tasks = [
-                asyncio.create_task(
-                    self._execute_upgrade_fast_tracked(
-                        peer, candidate, plan, client
-                    ),
-                    name=f"fast-upgrade-{candidate.saved_id}",
-                )
-                for candidate, plan in zip(candidates, plans)
-            ]
+            # Fallback timestamp for adapters/tests. The production
+            # MTProtoService overwrites it at the actual ordered client() call.
+            scheduled_ns = time.perf_counter_ns()
+            for plan in plans:
+                plan.fast_send_started_ns = scheduled_ns
+            batch_task = asyncio.create_task(
+                self.service.execute_upgrade_fast_batch(
+                    peer,
+                    list(zip(candidates, plans)),
+                    client=client,
+                ),
+                name=f"fast-volley-batch-{SHOOTER_ID}-{campaign_id[:8]}-{target}",
+            )
         launch_finished = time.perf_counter()
         peers_sent = 0
         if broadcast:
@@ -4363,14 +4614,30 @@ class Scanner:
                 )
             return
 
-        # Yield directly into gather: no logging, disk write or UI work occurs
-        # before the payment coroutines get their first event-loop turn. Once a
-        # financial request is launched, a manual Stop must not cancel it midway.
-        gather_future = asyncio.gather(*tasks, return_exceptions=True)
-        try:
-            raw_results = await asyncio.shield(gather_future)
-        except asyncio.CancelledError:
-            raw_results = await gather_future
+        # Yield directly into the ordered batch task: no logging, disk write or
+        # UI work occurs before the payment pipeline gets its first event-loop
+        # turn. Once a financial request is launched, a manual Stop must not
+        # cancel it midway.
+        if batch_task is None:
+            raw_results: list[Any] = [
+                UpgradeOutcome("unknown", detail="FAST batch task отсутствует")
+                for _candidate in candidates
+            ]
+        else:
+            try:
+                raw_results = await asyncio.shield(batch_task)
+            except asyncio.CancelledError:
+                raw_results = await batch_task
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raw_results = [
+                    UpgradeOutcome(
+                        "unknown",
+                        detail=f"{type(exc).__name__}: {exc}; FAST batch завершился аварийно",
+                    )
+                    for _candidate in candidates
+                ]
 
         trigger_at = self._fast_trigger_detected_at
         offsets: list[float | None] = []
@@ -7570,7 +7837,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0034 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0035 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):

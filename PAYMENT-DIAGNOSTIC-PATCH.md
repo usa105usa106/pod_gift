@@ -1,16 +1,22 @@
-# Payment diagnostics and form lifecycle — v0034
+# Payment diagnostics and FAST volley — v0035
 
-v0034 hardens FAST paid-upgrade volleys and keeps payment evidence for later debugging.
+v0035 hardens multi-payment Stars volleys after the production `#444665` run.
 
-- Every prepared paid upgrade records `saved_id`, `form_id`, invoice `saved_id`, request `form_id`, request invoice `saved_id`, cost and preparation latency.
-- FAST refuses to submit if the invoice/request points at a different saved gift, if `form_id` is missing, or if two paid plans share the same `form_id`.
-- Telegram Stars forms are treated as a 10-minute resource: default background refresh starts at 300 seconds and FAST refuses forms older than 480 seconds.
-- Refresh is staggered in small batches while LIVE is active, including inside the FAST hot zone, so a scanner that waits there for hours does not keep the form created on entry.
-- Refresh failures and duplicate refreshed forms are fail-closed: the last plan is not silently replaced with a bad binding, and a stale/duplicate plan cannot pass FAST preflight.
-- Completed-volley audit contains the payment binding fields, form age, send-start offset, status, actual number and error detail for every shot.
-- Dedicated structured audit: `gift-hunter-v0034-payment-audit.jsonl`; `/log_full` exports only its last 24 hours, can split oversized ZIPs, and clears local history only after every part is sent successfully.
-- No file logging, refresh or disk write is inserted between local FAST task creation and the prebuilt UDP FIRE broadcast.
+## Что изменено
 
-Recommended live diagnostic after deployment: use volley size 2 on expendable gifts, verify two distinct `form_id` values and two confirmed results, then increase the volley size.
+- Формы по-прежнему живут по политике `300 с` дальше 50 номеров и `120 с` внутри 50; на входе в near-target зону весь комплект refresh-ится принудительно.
+- Каждый paid plan проверяется по `saved_id`, invoice binding, `form_id`, request binding и возрасту формы. Повторяющийся `form_id` блокирует залп fail-closed.
+- Локальный залп теперь отправляется одним `client([requests...], ordered=True)`, а не набором независимых конкурентных `client(request)`. Telegram получает pipeline сразу, но исполняет payment RPC последовательно.
+- `MSG_WAIT_FAILED` и `MSG_WAIT_TIMEOUT` считаются ошибками dependency-wrapper: повторно pipeline-ится только request, который сервер ещё не исполнил.
+- `FORM_SUBMIT_DUPLICATE`, сетевой сбой с неоднозначным состоянием и прочие результаты, где payment мог быть выполнен, автоматически не повторяются. Они проверяются и при необходимости оставляют payment hold.
+- `gift-hunter-v0035-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
+- В batch audit пишется не секретный snapshot MTProto: `client_epoch`, `connect_epoch`, `connected`, `dc_id`, возраст клиента/соединения и `sender_reconnecting`.
+- Между созданием локальной batch-task и prebuilt UDP FIRE по-прежнему нет await/log/disk I/O.
 
-Hot-zone lifecycle hotfix: the old permanent form freeze was removed after a real run showed an armed form aging to 5330.599 seconds before the target arrived. `FAST_FORM_ARM_DISTANCE` now means “force-refresh and arm here”, not “stop maintenance here”.
+## Разбор production-сбоя v0034
+
+Обе формы перед выстрелом были свежими (~72–73 с). Два payment RPC стартовали через `1.769` и `1.857` мс после trigger; один вернул `FORM_SUBMIT_DUPLICATE`, второй подтвердил `#444665`. Поэтому этот hotfix меняет именно механизм multi-submit, а не интервалы refresh.
+
+Уведомление Telegram о новом устройстве содержит server timestamp `02:48:18 UTC`. В этот период лог действительно показывает первоначальные connect/auth действия MTProto. Выстрел произошёл около `11:01:22 UTC`; рядом с ним нет connect/disconnect/reconnect строк, то есть в том выстреле сессия не отваливалась.
+
+Offline validation: `198` tests `OK`; живой Stars-залп в тестовой среде не выполнялся.

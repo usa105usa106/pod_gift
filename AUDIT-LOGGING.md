@@ -1,4 +1,4 @@
-# Аудит логирования v0034
+# Аудит логирования v0035
 
 ## Автоматический UDP-секрет
 
@@ -15,9 +15,19 @@ cluster_udp_started shooter_id=... port=... secret_source=generated|provision|en
 При запуске каждого Hunter:
 
 ```text
-scanner_started version=v0034 shooter_id=... mode=sniper|volley active_shooters=...
+scanner_started version=v0035 shooter_id=... mode=sniper|volley active_shooters=...
 saved_ids=... targets=... live=... volley=... volley_limit=...
 ```
+
+Перед и во время локального ordered-залпа payment-audit пишет:
+
+```text
+fast_payment_batch_started count=... ordered=true transport=telethon_ordered_list connection=...
+fast_payment_batch_phase phase=... submitted_saved_ids=[...] retry_unexecuted_saved_ids=[...] connection=...
+fast_payment_batch_finished count=... phases=... connection_before=... connection_after=... statuses=[...]
+```
+
+`connection` содержит только не секретные transport-поля: `client_epoch`, `connect_epoch`, `connected`, `dc_id`, `client_age_s`, `connection_age_s`, `sender_reconnecting`. Дополнительно обычный лог пишет `mtproto_client_created`, `mtproto_client_reload`, `mtproto_connect_started`, `mtproto_connect_ready`, `mtproto_disconnect_requested`. Это позволяет проверить, был ли reconnect рядом с выстрелом.
 
 После отправки залпа:
 
@@ -114,8 +124,8 @@ ZIP текущего Hunter включает только диагностиче
 
 Поля с именами `token`, `secret`, `password`, `api_hash` в общем журнале автоматически заменяются на `[redacted]`.
 
-## Payment audit v0034
+## Payment audit v0035
 
-Отдельный `gift-hunter-v0034-payment-audit.jsonl` записывает только диагностические, не секретные поля: `saved_id`, `form_id`, invoice/request binding, стоимость, возраст формы, refresh, ошибку, send-start и итог FAST. Токены, FIRE secret, пароль 2FA и `api_hash` туда не передаются.
+Отдельный `gift-hunter-v0035-payment-audit.jsonl` записывает только диагностические, не секретные поля: `saved_id`, `form_id`, invoice/request binding, стоимость, возраст формы, refresh, ошибку, send-start и итог FAST. Токены, FIRE secret, пароль 2FA и `api_hash` туда не передаются.
 
-Ключевые события: `upgrade_prepare_started`, `payment_form_prepared`, `payment_form_refreshed`, `payment_form_refresh_failed`, `fast_local_preflight_failed`, `fast_volley_completed`. `/log_full` фильтрует текущий payment-audit и его ротации по последним 24 часам, а после успешной доставки архива удаляет локальные записи старше 24 часов.
+Ключевые события: `upgrade_prepare_started`, `payment_form_prepared`, `payment_form_refreshed`, `payment_form_refresh_failed`, `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, `fast_local_preflight_failed`, `fast_volley_completed`. `/log_full` фильтрует текущий payment-audit и его ротации по последним 24 часам, а после успешной доставки архива удаляет локальные записи старше 24 часов.

@@ -1,39 +1,37 @@
-Gift Hunter v0034 — Release Manifest — dynamic FAST form refresh hotfix
+Gift Hunter v0035 — Release Manifest — ordered MTProto FAST volley hotfix
 
 Validation summary:
-- Production log root cause confirmed: forms were refreshed/armed at 22:42:47 UTC, then the old permanent hot-zone freeze left them untouched until the 00:11:38 UTC trigger; oldest_age_s reached 5330.599.
-- Permanent payment-form freeze removed.
-- Built-in refresh policy: farther than 50 numbers from the next target, each form is refreshed after 300 s; within 50 numbers, after 120 s.
-- Entering the 50-number zone forces one full FAST-form refresh, then background maintenance continues; no form freeze is reintroduced.
-- Coolify migration is automatic: FAST_FORM_FREEZE_DISTANCE / FAST_FORM_ARM_DISTANCE renaming is no longer required for this policy, and the obsolete compose knobs were removed.
-- Armed FAST state is revalidated from RAM; stale plans are rebuilt, and transient arm failures become retryable after 15 seconds.
-- Scanner status exposes oldest FAST-form age, refresh count, and the latest refresh error.
-- Unexpected refresh-worker iteration errors are logged and retried instead of terminating form maintenance.
-- Full local regression run: 194 tests, OK.
-- Python compileall succeeds; docker-compose.yaml parses with 6 services.
-- No live Telegram/Stars payment was executed as part of this offline validation.
+- Production #444665 incident: both payment forms were fresh (~72–73 s); concurrent v0034 sends started at 1.769 ms and 1.857 ms after trigger, one returned FORM_SUBMIT_DUPLICATE and one confirmed #444665.
+- Local multi-payment submit is now a single Telethon request list with ordered=True, so the batch is queued immediately but executed sequentially by Telegram.
+- MSG_WAIT_FAILED / MSG_WAIT_TIMEOUT recovery re-pipelines only dependency-wrapped requests that Telegram did not execute. No executed or transport-ambiguous payment is blindly retried.
+- Payment audit now records ordered-batch phases plus non-secret MTProto connection snapshots.
+- Session incident review: Telegram login timestamp 02:48:18 UTC matches initial MTProto setup; shot was ~11:01:22 UTC and its log window contains no connect/disconnect/reconnect event.
+- Existing dynamic form refresh policy is unchanged: >50 numbers = 300 s; <=50 numbers = 120 s plus full forced refresh on entry.
+- Full local regression run: 198 tests, OK.
+- Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with 6 services.
+- No live Telegram/Stars payment was executed as part of offline validation.
 
 Files (SHA256  bytes  path):
-e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  dockerignore
-f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  env.example
-8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  gitignore
-08c7eaa6bc933356c4febab23d75d94a09acdd668b491e3816be4bfad1511b29        8257  AUDIT-LOGGING.md
-efe02a75f508f4650a7e6c030a5b3d1122a99fb484e40fc3c503ae9dc3b6f5de       32029  CHANGELOG.md
+e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
+f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  .env.example
+8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
+d2b8e9832ff69ff1389f566af9c4ff68389d03bcb0421fc9d37235c665907831        9268  AUDIT-LOGGING.md
+3872160eeac883c22aa9927798ce7ac88a7d606d87b36d0562d153b16b043801       34943  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-c63e91aec3648a3b4f847381e3ed814415be300cf5e1b1df7e9850d090deb60c        1891  PAYMENT-DIAGNOSTIC-PATCH.md
-b63259c6b0b507c69dc534266c3bdb54cb947b379d2063cad2ef1e61aa6b1985       28483  README.md
-5cb0679bb018a1bb5c20188a4424daab81d159aa048819f83e0b81a3da145117       18704  VALIDATION.md
-f19d141f98f29a356a9bee260c70b2453d653743818624be739329430660ec47        7663  bootstrap.py
+51ce8f8105ee5b37a18cec1d4ce07c3101c7a0c78842160160f42f9e2bb4b2d7        3135  PAYMENT-DIAGNOSTIC-PATCH.md
+fc76b299a83737cec1bed95254a25f946aeaeaba0d9c3459214f8ada54647ffd       30668  README.md
+11cfbf4780c5d3125d5ecf7faf97cc7fbe2bf6eefa248d2a231270e289ea0e1c       21187  VALIDATION.md
+cbbd42737832225218f232ac24536ff4cd96dcf33af76e8b21f38c5718739d78        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
 d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
-0ecf49bd42010a2e32071c4b73e600a11d53be2b8b13a5b0ba517075f6b9a5bb        1533  healthcheck.py
+04c5de578d55e0abc7d9bec7da46b8a98a6a2a6287d9d7fd5facbd3696d819d7        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-d0e75e9a0ff2a0b2fd36771ae567b2d804460aa9ffb385dcf2e8d5a32e6463c0      371927  main.py
+61db03f4cf1c5966db25d369c32fffa5ca506480498f75f734f211c1ffbd3fdd      384452  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
-81e6188306eab3953032990327165f6a7379b5f115c0d316af72c10f4b4d54f1        2109  tests/test_bootstrap.py
+267b6819337f91f88ed3487e64da79837658a6c5ef127a83f5a7f5e9ee48d667        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-ec1dc59e2efad56aa0ea908d9a948692fc45860b539ac62938eef06419f0cd52      162033  tests/test_runtime.py
-d78af3c53237c3a50991f1652c3efbee11a63671987215f38e6e0b75def88150       21387  tests/test_source_guards.py
+9635ec7cc28b59e509780a0ade760494bfa942130eb77379f29f4d42b62dd5d3      168513  tests/test_runtime.py
+567c3607f9bd6920140b67c8d3fcbc877e21df10dc482bf60866eaf427b38c42       21613  tests/test_source_guards.py
