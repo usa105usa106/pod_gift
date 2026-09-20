@@ -88,7 +88,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0035"
+APP_VERSION = "v0036"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -2462,20 +2462,20 @@ class MTProtoService:
         *,
         client: TelegramClient,
     ) -> list[UpgradeOutcome]:
-        """Submit a FAST volley as one ordered MTProto pipeline.
+        """Submit every prebuilt FAST payment in one unordered one-shot burst.
 
-        Telethon accepts a list of requests with ``ordered=True``. It queues the
-        whole list immediately and wraps later requests with invokeAfterMsg, so
-        Telegram receives one pipeline but executes each payment only after the
-        previous payment has completed successfully. This avoids the v0034
-        behaviour where several ``client(request)`` coroutines entered the same
-        payment method essentially simultaneously.
+        Maximum speed matters more than server-side ordering here. All prepared
+        ``SendStarsFormRequest`` objects are queued in the same event-loop turn
+        with ``ordered=False`` so Telethon does not wrap later payments in
+        ``invokeAfterMsg``. On the real TelegramClient we submit straight to the
+        already-connected MTProto sender. This deliberately bypasses the client
+        request-retry loop: a financial request is sent once, and an ambiguous
+        transport result is verified later instead of being submitted again.
 
-        If a previous ordered request fails, Telegram returns MSG_WAIT_FAILED for
-        dependent requests. Those dependent requests were not executed, so they
-        are immediately re-pipelined without waiting for slow post-submit
-        verification of the failed item. No payment that actually ran (or whose
-        state is ambiguous) is automatically submitted again.
+        The whole burst is queued before this coroutine awaits any result. This
+        lets Telethon's sender pack the requests together and removes the previous
+        ordered-pipeline delay where payment #2 could wait hundreds of
+        milliseconds for payment #1/dependency recovery.
         """
         if not items:
             return []
@@ -2491,79 +2491,85 @@ class MTProtoService:
                     f"FAST-платёжная форма устарела: saved_id={info.saved_id}; оплата не отправлена"
                 )
 
-        raw_results: list[Any] = [None] * len(items)
-        raw_errors: list[BaseException | None] = [None] * len(items)
-        pending = list(range(len(items)))
-        phase = 0
+        requests = [prepared.request for _info, prepared in items]
         snapshot_before = self.connection_snapshot(client)
         record_payment_event(
             "fast_payment_batch_started",
             count=len(items),
-            ordered=True,
-            transport="telethon_ordered_list",
+            ordered=False,
+            transport="telethon_sender_unordered_one_shot",
             connection=snapshot_before,
             entries=[prepared_payment_debug(plan) for _info, plan in items],
         )
 
-        while pending:
-            phase += 1
-            phase_requests = [items[index][1].request for index in pending]
-            submit_ns = time.perf_counter_ns()
-            for index in pending:
-                # For a dependent MSG_WAIT_FAILED request this timestamp is
-                # replaced by the phase in which it is actually re-pipelined.
-                items[index][1].fast_send_started_ns = submit_ns
+        # One timestamp for the whole burst: sender.send() is synchronous and
+        # queues every RequestState before control returns to the event loop.
+        submit_ns = time.perf_counter_ns()
+        for _info, prepared in items:
+            prepared.fast_send_started_ns = submit_ns
 
-            phase_results: list[Any] = [None] * len(pending)
-            phase_errors: list[BaseException | None] = [None] * len(pending)
+        raw_results: list[Any] = [None] * len(items)
+        raw_errors: list[BaseException | None] = [None] * len(items)
+        transport = "telethon_sender_unordered_one_shot"
+
+        sender = getattr(client, "_sender", None)
+        sender_send = getattr(sender, "send", None)
+        if callable(sender_send):
             try:
-                raw = await client(phase_requests, ordered=True)
+                futures = sender_send(requests, ordered=False)
+                if isinstance(futures, (list, tuple)):
+                    queued = list(futures)
+                else:
+                    queued = [futures]
+                if len(queued) != len(items):
+                    raise RuntimeError(
+                        f"FAST sender вернул {len(queued)} future для {len(items)} запросов"
+                    )
+                settled = await asyncio.gather(*queued, return_exceptions=True)
+                for index, value in enumerate(settled):
+                    if isinstance(value, BaseException):
+                        raw_errors[index] = value
+                    else:
+                        raw_results[index] = value
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                # sender.send() failing around a financial burst is ambiguous:
+                # some RequestState objects may already be queued. Never retry.
+                raw_errors = [exc] * len(items)
+        else:
+            # Test/custom-client fallback. Production TelegramClient uses the
+            # direct sender path above to avoid UserMethods._call retries.
+            transport = "telethon_client_unordered_fallback"
+            try:
+                raw = await client(requests, ordered=False)
                 if isinstance(raw, (list, tuple)):
-                    phase_results = list(raw)
-                elif len(pending) == 1:
-                    phase_results = [raw]
+                    raw_results = list(raw)
+                elif len(items) == 1:
+                    raw_results = [raw]
                 else:
                     raise RuntimeError(
-                        f"FAST ordered batch вернул неожиданный тип {type(raw).__name__}"
+                        f"FAST unordered batch вернул неожиданный тип {type(raw).__name__}"
                     )
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
                     raise
-                multi = self._multi_error_parts(exc, len(pending))
+                multi = self._multi_error_parts(exc, len(items))
                 if multi is not None:
-                    phase_results, phase_errors = multi
-                elif len(pending) == 1:
-                    phase_errors = [exc]
+                    raw_results, raw_errors = multi
+                elif len(items) == 1:
+                    raw_errors = [exc]
                 else:
-                    # A connection-level failure around a list call is ambiguous:
-                    # some requests may already have reached Telegram. Never
-                    # re-submit any of them automatically.
-                    phase_errors = [exc] * len(pending)
+                    raw_errors = [exc] * len(items)
 
-            retry_indexes: list[int] = []
-            for local_index, global_index in enumerate(pending):
-                error = phase_errors[local_index]
-                if error is not None and self._rpc_code(error) in {"MSG_WAIT_FAILED", "MSG_WAIT_TIMEOUT"}:
-                    # These errors come from the invokeAfterMsg wrapper, before
-                    # the dependent payment query itself is executed. Telegram's
-                    # MTProto docs explicitly require resending that dependent
-                    # query. Re-pipeline only this known-unexecuted request; never
-                    # retry a payment that ran or whose transport state is unclear.
-                    retry_indexes.append(global_index)
-                    continue
-                raw_results[global_index] = phase_results[local_index]
-                raw_errors[global_index] = error
-
-            record_payment_event(
-                "fast_payment_batch_phase",
-                phase=phase,
-                submitted_saved_ids=[items[index][0].saved_id for index in pending],
-                retry_unexecuted_saved_ids=[items[index][0].saved_id for index in retry_indexes],
-                connection=self.connection_snapshot(client),
-            )
-            # Do this immediately. In particular, do not wait for
-            # FORM_SUBMIT_DUPLICATE verification on a different saved gift.
-            pending = retry_indexes
+        record_payment_event(
+            "fast_payment_batch_dispatched",
+            count=len(items),
+            ordered=False,
+            transport=transport,
+            submitted_saved_ids=[info.saved_id for info, _prepared in items],
+            connection=self.connection_snapshot(client),
+        )
 
         interpretation_jobs: list[tuple[int, asyncio.Task[UpgradeOutcome]]] = []
         outcomes: list[UpgradeOutcome | None] = [None] * len(items)
@@ -2618,7 +2624,9 @@ class MTProtoService:
         record_payment_event(
             "fast_payment_batch_finished",
             count=len(items),
-            phases=phase,
+            phases=1,
+            ordered=False,
+            transport=transport,
             connection_before=snapshot_before,
             connection_after=snapshot_after,
             statuses=[outcome.status for outcome in final],
@@ -4532,7 +4540,7 @@ class Scanner:
         launch_started = time.perf_counter()
         if local_error is None and client is not None:
             # Fallback timestamp for adapters/tests. The production
-            # MTProtoService overwrites it at the actual ordered client() call.
+            # MTProtoService overwrites it at the actual one-shot sender queue call.
             scheduled_ns = time.perf_counter_ns()
             for plan in plans:
                 plan.fast_send_started_ns = scheduled_ns
@@ -4614,7 +4622,7 @@ class Scanner:
                 )
             return
 
-        # Yield directly into the ordered batch task: no logging, disk write or
+        # Yield directly into the one-shot batch task: no logging, disk write or
         # UI work occurs before the payment pipeline gets its first event-loop
         # turn. Once a financial request is launched, a manual Stop must not
         # cancel it midway.
@@ -7837,7 +7845,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0035 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0036 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):

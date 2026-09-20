@@ -1,15 +1,16 @@
-# Payment diagnostics and FAST volley — v0035
+# Payment diagnostics and FAST volley — v0036
 
-v0035 hardens multi-payment Stars volleys after the production `#444665` run.
+v0036 hardens multi-payment Stars volleys after the production `#444665` run.
 
 ## Что изменено
 
 - Формы по-прежнему живут по политике `300 с` дальше 50 номеров и `120 с` внутри 50; на входе в near-target зону весь комплект refresh-ится принудительно.
 - Каждый paid plan проверяется по `saved_id`, invoice binding, `form_id`, request binding и возрасту формы. Повторяющийся `form_id` блокирует залп fail-closed.
-- Локальный залп теперь отправляется одним `client([requests...], ordered=True)`, а не набором независимых конкурентных `client(request)`. Telegram получает pipeline сразу, но исполняет payment RPC последовательно.
-- `MSG_WAIT_FAILED` и `MSG_WAIT_TIMEOUT` считаются ошибками dependency-wrapper: повторно pipeline-ится только request, который сервер ещё не исполнил.
+- Локальный залп теперь ставится одним `client._sender.send([requests...], ordered=False)` burst. Все RequestState попадают в sender в одном event-loop turn до первого ожидания ответа.
+- `invokeAfterMsg`/ordered dependency удалены, потому что реальный залп показал задержку второго submit на 521.728 мс.
+- Финансовый batch не использует client-level request retry. Неоднозначный результат не вызывает автоматический повтор платежа.
 - `FORM_SUBMIT_DUPLICATE`, сетевой сбой с неоднозначным состоянием и прочие результаты, где payment мог быть выполнен, автоматически не повторяются. Они проверяются и при необходимости оставляют payment hold.
-- `gift-hunter-v0035-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
+- `gift-hunter-v0036-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
 - В batch audit пишется не секретный snapshot MTProto: `client_epoch`, `connect_epoch`, `connected`, `dc_id`, возраст клиента/соединения и `sender_reconnecting`.
 - Между созданием локальной batch-task и prebuilt UDP FIRE по-прежнему нет await/log/disk I/O.
 

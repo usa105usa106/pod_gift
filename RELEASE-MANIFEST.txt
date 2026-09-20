@@ -1,12 +1,12 @@
-Gift Hunter v0035 — Release Manifest — ordered MTProto FAST volley hotfix
+Gift Hunter v0036 — Release Manifest — maximum-speed unordered MTProto FAST volley hotfix
 
 Validation summary:
-- Production #444665 incident: both payment forms were fresh (~72–73 s); concurrent v0034 sends started at 1.769 ms and 1.857 ms after trigger, one returned FORM_SUBMIT_DUPLICATE and one confirmed #444665.
-- Local multi-payment submit is now a single Telethon request list with ordered=True, so the batch is queued immediately but executed sequentially by Telegram.
-- MSG_WAIT_FAILED / MSG_WAIT_TIMEOUT recovery re-pipelines only dependency-wrapped requests that Telegram did not execute. No executed or transport-ambiguous payment is blindly retried.
-- Payment audit now records ordered-batch phases plus non-secret MTProto connection snapshots.
-- Session incident review: Telegram login timestamp 02:48:18 UTC matches initial MTProto setup; shot was ~11:01:22 UTC and its log window contains no connect/disconnect/reconnect event.
+- Real v0035 shot #444744/#444745 confirmed two prebuilt payment forms can both complete, but ordered dependency/recovery delayed payment #2 to 521.728 ms after trigger.
+- v0036 removes ordered/invokeAfterMsg payment dependencies: all prebuilt SendStarsFormRequest objects are queued in one ordered=False one-shot burst before the first await.
+- Production submit uses the already-connected Telethon MTProto sender directly, bypassing TelegramClient request-level retry logic for the financial burst.
+- No payment is automatically re-submitted after an RPC/transport ambiguity; results are verified/held instead.
 - Existing dynamic form refresh policy is unchanged: >50 numbers = 300 s; <=50 numbers = 120 s plus full forced refresh on entry.
+- Scanner/exact-number detection and status-card layout are unchanged by this hotfix.
 - Full local regression run: 198 tests, OK.
 - Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with 6 services.
 - No live Telegram/Stars payment was executed as part of offline validation.
@@ -15,23 +15,23 @@ Files (SHA256  bytes  path):
 e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
 f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  .env.example
 8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
-d2b8e9832ff69ff1389f566af9c4ff68389d03bcb0421fc9d37235c665907831        9268  AUDIT-LOGGING.md
-3872160eeac883c22aa9927798ce7ac88a7d606d87b36d0562d153b16b043801       34943  CHANGELOG.md
+2e3be2c496a673fad869eb95081bdf0d0f0c3f6af481da41dcdcfa857acb1d14        9282  AUDIT-LOGGING.md
+b2581d61085cd3ff43755e6772beb9e160f3211fed03d285ff84035dded9fabf       34999  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-51ce8f8105ee5b37a18cec1d4ce07c3101c7a0c78842160160f42f9e2bb4b2d7        3135  PAYMENT-DIAGNOSTIC-PATCH.md
-fc76b299a83737cec1bed95254a25f946aeaeaba0d9c3459214f8ada54647ffd       30668  README.md
-11cfbf4780c5d3125d5ecf7faf97cc7fbe2bf6eefa248d2a231270e289ea0e1c       21187  VALIDATION.md
-cbbd42737832225218f232ac24536ff4cd96dcf33af76e8b21f38c5718739d78        7663  bootstrap.py
+03642330c8f6a8798355c85a518fcb41049f81cb1bcf7dc71bbc332be8af4cb5        3239  PAYMENT-DIAGNOSTIC-PATCH.md
+5df135b38d89b5fa30a0bf709a9c1d489279e3bf44d9ed0ce1d846fab976c821       30346  README.md
+b040917cf1a00475ee241da8bd60efea50b440e30bdf7dc44085a5bb9372b3bb       21242  VALIDATION.md
+926064f27512fe7b97d2cac87a115376c525721537832dc80ba5b12f6ae545ab        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
 d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
-04c5de578d55e0abc7d9bec7da46b8a98a6a2a6287d9d7fd5facbd3696d819d7        1533  healthcheck.py
+0bc9231edb1da1b7ffd2f6c7dbb298f6e5a37d131e8cf585bbcad380420ed15d        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-61db03f4cf1c5966db25d369c32fffa5ca506480498f75f734f211c1ffbd3fdd      384452  main.py
+0ac172ab3116f6883388afee80a3c0854d1eb364412dfd659d0c5e50a3ba6502      384514  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
-267b6819337f91f88ed3487e64da79837658a6c5ef127a83f5a7f5e9ee48d667        2109  tests/test_bootstrap.py
+a58f189879ee38ebfed5fb15a276ae84ee72c3b34e46797c723616ccde5f2f6c        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-9635ec7cc28b59e509780a0ade760494bfa942130eb77379f29f4d42b62dd5d3      168513  tests/test_runtime.py
-567c3607f9bd6920140b67c8d3fcbc877e21df10dc482bf60866eaf427b38c42       21613  tests/test_source_guards.py
+b7dcb30cb2f874d05a201dc3eff54cca88c482d9898f005c85317605ea30c769      168495  tests/test_runtime.py
+1663fa9ac877a05304071e6d1cd6617fc77006a3668bb95ad7ad76ef74d9098e       21642  tests/test_source_guards.py
