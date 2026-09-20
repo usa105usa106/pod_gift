@@ -88,7 +88,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0036"
+APP_VERSION = "v0037"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -1186,6 +1186,7 @@ class SavedGiftInfo:
     upgrade_cost: int
     gift_num: int | None
     raw: Any
+    prepaid_upgrade_hash: str | None = None
 
 
 @dataclass
@@ -1259,6 +1260,7 @@ def prepared_payment_debug(plan: PreparedUpgrade) -> dict[str, Any]:
         "request_form_id": _int_or_none(getattr(request, "form_id", None)) if request is not None else None,
         "request_invoice_saved_id": invoice_saved_id(request_invoice),
         "request_object_id": id(request) if request is not None else None,
+        "request_type": request.__class__.__name__ if request is not None else None,
         "age_ms": round(max(0.0, time.monotonic() - plan.created_at) * 1000.0, 3),
     }
 
@@ -1933,6 +1935,7 @@ class MTProtoService:
                     upgrade_cost=cost,
                     gift_num=_int_or_none(getattr(item, "gift_num", None)),
                     raw=item,
+                    prepaid_upgrade_hash=_str_or_none(getattr(item, "prepaid_upgrade_hash", None)),
                 )
             )
         return infos
@@ -1972,6 +1975,7 @@ class MTProtoService:
                     upgrade_cost=_int_or_none(getattr(gift, "upgrade_stars", None)) or 0,
                     gift_num=_int_or_none(getattr(item, "gift_num", None)),
                     raw=item,
+                    prepaid_upgrade_hash=_str_or_none(getattr(item, "prepaid_upgrade_hash", None)),
                 )
             )
         return infos
@@ -2146,6 +2150,199 @@ class MTProtoService:
             "Telegram не вернул ни одного коллекционного экземпляра или названия для этого типа. "
             "Можно прислать slug вручную, но сканер останется остановлен до успешной привязки."
         )
+
+    async def refresh_saved_info_state(self, peer: Any, info: SavedGiftInfo) -> SavedGiftInfo:
+        """Refresh payment/number flags for one saved gift without changing its selection."""
+        mapping = await self.fetch_saved_by_ids(peer, [info.saved_id])
+        item = mapping.get(info.saved_id)
+        if item is None:
+            raise RuntimeError(f"Telegram не вернул saved gift {info.saved_id} после предоплаты")
+        gift = getattr(item, "gift", None)
+        if gift is not None and gift.__class__.__name__ == "StarGiftUnique":
+            num = _int_or_none(getattr(gift, "num", None))
+            raise RuntimeError(
+                f"Предоплата неожиданно уже улучшила saved_id={info.saved_id}"
+                + (f" в #{num}" if num is not None else "")
+                + "; дальнейший залп остановлен"
+            )
+        base_id = _int_or_none(getattr(gift, "id", None))
+        if base_id is None:
+            raise RuntimeError(f"saved_id={info.saved_id}: Telegram вернул неизвестный тип подарка после предоплаты")
+        info.base_gift_id = base_id
+        info.can_upgrade = bool(getattr(item, "can_upgrade", False))
+        info.prepaid = bool(getattr(item, "upgrade_separate", False) or getattr(item, "upgrade_stars", None))
+        info.upgrade_cost = _int_or_none(getattr(gift, "upgrade_stars", None)) or info.upgrade_cost
+        info.gift_num = _int_or_none(getattr(item, "gift_num", None))
+        info.prepaid_upgrade_hash = _str_or_none(getattr(item, "prepaid_upgrade_hash", None))
+        info.raw = item
+        return info
+
+    async def _verify_prepaid_state(self, peer: Any, info: SavedGiftInfo) -> SavedGiftInfo:
+        """Wait briefly until Telegram exposes the separate-prepay state."""
+        last_error: Exception | None = None
+        for delay in (0.0, 0.10, 0.25, 0.50, 1.0):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self.refresh_saved_info_state(peer, info)
+            except Exception as exc:
+                last_error = exc
+                if "неожиданно уже улучшила" in str(exc):
+                    raise
+                continue
+            if info.gift_num is not None:
+                raise RuntimeError(
+                    f"PREPAID TEST STOP: Telegram уже зарезервировал номер #{info.gift_num} "
+                    f"для saved_id={info.saved_id}; сам upgrade не отправлялся"
+                )
+            if info.prepaid:
+                return info
+        if last_error is not None:
+            raise RuntimeError(
+                f"Не удалось подтвердить PREPAID-состояние saved_id={info.saved_id}: {last_error}"
+            ) from last_error
+        raise RuntimeError(
+            f"Telegram не подтвердил отдельную предоплату saved_id={info.saved_id}; upgrade не отправлялся"
+        )
+
+    async def prepay_upgrade(self, peer: Any, info: SavedGiftInfo) -> int:
+        """Sequentially prepay one upgrade without upgrading the gift itself.
+
+        The critical invariant is that this method never invokes
+        ``payments.upgradeStarGift``.  It only pays
+        ``inputInvoiceStarGiftPrepaidUpgrade`` and then re-reads the saved gift.
+        If Telegram exposes ``gift_num`` after payment, the caller is stopped so
+        we can learn whether prepay reserves the future collectible number.
+        """
+        await self.require_authorized()
+        await self.refresh_saved_info_state(peer, info)
+        if info.gift_num is not None:
+            raise RuntimeError(
+                f"PREPAID TEST STOP: у saved_id={info.saved_id} уже есть gift_num=#{info.gift_num}; "
+                "предоплата не отправлялась"
+            )
+        if info.prepaid:
+            record_payment_event(
+                "prepaid_upgrade_already_ready",
+                saved_id=info.saved_id,
+                gift_num=info.gift_num,
+            )
+            return 0
+
+        prepaid_invoice_cls = getattr(types, "InputInvoiceStarGiftPrepaidUpgrade", None)
+        if prepaid_invoice_cls is None:
+            raise RuntimeError(
+                "Telethon не поддерживает InputInvoiceStarGiftPrepaidUpgrade; нужен слой Telegram с prepaid upgrade"
+            )
+        prepay_hash = (info.prepaid_upgrade_hash or "").strip()
+        if not prepay_hash:
+            raise RuntimeError(
+                f"Telegram не вернул prepaid_upgrade_hash для saved_id={info.saved_id}; "
+                "отдельная предоплата невозможна"
+            )
+
+        invoice = construct(prepaid_invoice_cls, peer=peer, hash=prepay_hash)
+        started = time.perf_counter()
+        record_payment_event(
+            "prepaid_upgrade_prepare_started",
+            saved_id=info.saved_id,
+            base_gift_id=info.base_gift_id,
+            gift_num_before=info.gift_num,
+        )
+        form = await self.call(
+            construct(functions.payments.GetPaymentFormRequest, invoice=invoice, theme_params=None)
+        )
+        cost = sum_invoice_amount(getattr(form, "invoice", None)) or info.upgrade_cost
+        if cost <= 0:
+            raise RuntimeError(f"Telegram не вернул стоимость PREPAID для saved_id={info.saved_id}")
+        if MAX_UPGRADE_STARS and cost > MAX_UPGRADE_STARS:
+            raise RuntimeError(
+                f"Цена PREPAID {cost} ⭐ превышает лимит {MAX_UPGRADE_STARS} ⭐ для saved_id={info.saved_id}"
+            )
+        form_id = _int_or_none(getattr(form, "form_id", None))
+        if not form_id:
+            raise RuntimeError(f"Telegram не вернул form_id PREPAID для saved_id={info.saved_id}")
+        send_request = construct(
+            functions.payments.SendStarsFormRequest,
+            form_id=int(form_id),
+            invoice=invoice,
+        )
+        record_payment_event(
+            "prepaid_upgrade_submit_started",
+            saved_id=info.saved_id,
+            form_id=form_id,
+            cost=cost,
+            gift_num_before=info.gift_num,
+        )
+        try:
+            result = await self.call(send_request)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            # A Stars submit may have reached Telegram even if the local result
+            # is ambiguous. Never submit the same prepay form again here; first
+            # reconcile the authoritative saved-gift state.
+            try:
+                await self._verify_prepaid_state(peer, info)
+            except Exception as reconcile_exc:
+                record_payment_event(
+                    "prepaid_upgrade_submit_failed",
+                    saved_id=info.saved_id,
+                    form_id=form_id,
+                    cost=cost,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    reconcile_error=f"{type(reconcile_exc).__name__}: {reconcile_exc}"[:500],
+                )
+                # Never hide the safety stop that proves PREPAID assigned a
+                # number (or even upgraded the gift) while reconciling an
+                # ambiguous Stars response.  That result is more authoritative
+                # than the local transport exception and must halt the test.
+                reconcile_text = str(reconcile_exc)
+                if (
+                    "PREPAID TEST STOP" in reconcile_text
+                    or "неожиданно уже улучшила" in reconcile_text
+                ):
+                    raise reconcile_exc
+                raise exc
+            else:
+                record_payment_event(
+                    "prepaid_upgrade_submit_reconciled",
+                    saved_id=info.saved_id,
+                    form_id=form_id,
+                    cost=cost,
+                    submit_error=f"{type(exc).__name__}: {exc}"[:500],
+                    gift_num_after=info.gift_num,
+                )
+                return cost
+
+        verification = find_object_by_class_name(result, "PaymentVerificationNeeded")
+        if verification is not None:
+            url = _str_or_none(getattr(verification, "url", None))
+            raise RuntimeError(
+                "Telegram запросил дополнительное подтверждение PREPAID-платежа"
+                + (f": {url}" if url else "")
+            )
+
+        await self._verify_prepaid_state(peer, info)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        logger.warning(
+            "prepaid_upgrade_confirmed saved_id=%s cost=%s gift_num=%s elapsed_ms=%.3f",
+            info.saved_id,
+            cost,
+            info.gift_num,
+            elapsed_ms,
+        )
+        record_payment_event(
+            "prepaid_upgrade_confirmed",
+            saved_id=info.saved_id,
+            form_id=form_id,
+            cost=cost,
+            prepaid=bool(info.prepaid),
+            gift_num_after=info.gift_num,
+            elapsed_ms=round(elapsed_ms, 3),
+        )
+        return cost
 
     async def prepare_upgrade(self, peer: Any, info: SavedGiftInfo) -> PreparedUpgrade:
         """Prepare one gift-specific upgrade request and capture its payment binding.
@@ -2462,20 +2659,17 @@ class MTProtoService:
         *,
         client: TelegramClient,
     ) -> list[UpgradeOutcome]:
-        """Submit every prebuilt FAST payment in one unordered one-shot burst.
+        """Submit every prepaid UpgradeStarGift request as one unordered burst.
 
-        Maximum speed matters more than server-side ordering here. All prepared
-        ``SendStarsFormRequest`` objects are queued in the same event-loop turn
-        with ``ordered=False`` so Telethon does not wrap later payments in
-        ``invokeAfterMsg``. On the real TelegramClient we submit straight to the
-        already-connected MTProto sender. This deliberately bypasses the client
-        request-retry loop: a financial request is sent once, and an ambiguous
-        transport result is verified later instead of being submitted again.
+        v0037 keeps Stars payments completely out of the critical shot. Every
+        item reaching this method must already be separately prepaid, so the
+        requests queued here are only ``UpgradeStarGiftRequest`` objects. They
+        are placed into the already-connected MTProto sender in the same event-
+        loop turn with ``ordered=False`` and before awaiting any result.
 
-        The whole burst is queued before this coroutine awaits any result. This
-        lets Telethon's sender pack the requests together and removes the previous
-        ordered-pipeline delay where payment #2 could wait hundreds of
-        milliseconds for payment #1/dependency recovery.
+        The direct sender path also avoids adding a client-side retry/ordering
+        layer to the shot itself. Any server/network ambiguity is verified after
+        the burst; the shot is never converted back into a Stars payment here.
         """
         if not items:
             return []
@@ -2486,7 +2680,11 @@ class MTProtoService:
                 raise RuntimeError(
                     f"FAST-план отсутствует или относится к другому подарку: saved_id={info.saved_id}"
                 )
-            if now - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+            if not prepared.prepaid:
+                raise RuntimeError(
+                    f"PREPAID FAST запрещает SendStarsForm в момент выстрела: saved_id={info.saved_id}"
+                )
+            if not prepared.prepaid and now - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
                 raise RuntimeError(
                     f"FAST-платёжная форма устарела: saved_id={info.saved_id}; оплата не отправлена"
                 )
@@ -2650,7 +2848,7 @@ class MTProtoService:
         """
         if prepared.saved_id != info.saved_id or prepared.request is None:
             return UpgradeOutcome("failed", detail="FAST-план отсутствует или относится к другому подарку")
-        if time.monotonic() - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+        if not prepared.prepaid and time.monotonic() - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
             return UpgradeOutcome("failed", detail="FAST-платёжная форма устарела; повторный запрос запрещён")
 
         try:
@@ -3211,7 +3409,14 @@ class Scanner:
                     )
                 for candidate in group[:required]:
                     existing = self.prepared.get(candidate.saved_id)
-                    if existing is not None and time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS:
+                    if not candidate.prepaid:
+                        raise RuntimeError(
+                            f"PREPAID FAST не вооружён: saved_id={candidate.saved_id} ещё не предоплачен. "
+                            "Выключи и снова включи LIVE, чтобы выполнить последовательную предоплату."
+                        )
+                    if existing is not None and (
+                        existing.prepaid or time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS
+                    ):
                         continue
                     self.prepared[candidate.saved_id] = await self.service.prepare_upgrade(peer, candidate)
                     logger.info(
@@ -3253,7 +3458,9 @@ class Scanner:
             plan = self.prepared.get(candidate.saved_id)
             if plan is None or plan.request is None or plan.saved_id != candidate.saved_id:
                 return f"saved_id={candidate.saved_id}: платёжный план отсутствует"
-            if not plan.prepaid and now - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+            if not plan.prepaid:
+                return f"saved_id={candidate.saved_id}: PREPAID не подтверждён"
+            if now - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS and not plan.prepaid:
                 return f"saved_id={candidate.saved_id}: платёжная форма устарела"
             try:
                 self._validate_prepared_binding(candidate, plan)
@@ -3861,14 +4068,10 @@ class Scanner:
         self._plan_dirty = False
         self.task = asyncio.create_task(self._run(peer), name="gift-scanner")
         self.monitor_task = None
-        self.form_refresh_task = (
-            asyncio.create_task(
-                self._payment_form_refresh_loop(peer),
-                name="gift-payment-form-refresh",
-            )
-            if store.settings.live_upgrades
-            else None
-        )
+        # v0037 PREPAID FAST has no expiring payment forms in the hot path.
+        # Every required gift was paid sequentially before LIVE was enabled, so
+        # the scanner only keeps prebuilt UpgradeStarGiftRequest objects in RAM.
+        self.form_refresh_task = None
         self._update_payment_form_age_metric()
         first_target = min(store.settings.target_numbers)
         cluster_runtime.disarm()
@@ -4458,11 +4661,17 @@ class Scanner:
                     plan is None
                     or plan.request is None
                     or plan.saved_id != candidate.saved_id
-                    or time.monotonic() - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS
+                    or (not plan.prepaid and time.monotonic() - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS)
                 ):
                     raise RuntimeError(
                         f"FAST-форма для saved_id={candidate.saved_id} не готова или устарела; "
                         "оплата не отправлена"
+                    )
+
+                if not plan.prepaid:
+                    raise RuntimeError(
+                        f"PREPAID FAST не вооружён для saved_id={candidate.saved_id}; "
+                        "платёж в момент выстрела запрещён"
                     )
 
                 if not plan.prepaid:
@@ -7643,7 +7852,7 @@ async def scanner_start_handler(message: Message) -> None:
             await asyncio.sleep(0.1)
         sent = await message.answer(
             (await status_text())
-            + ("\n\n💳 <b>LIVE:</b> бот отправит оплату при текущем номере = выстрел − 1."
+            + ("\n\n⚡ <b>PREPAID FAST:</b> Stars уже оплачены; при exact-триггере уйдёт только upgradeStarGift."
                if store.settings.live_upgrades
                else "\n\n🧪 <b>DRY-RUN:</b> Stars не списываются."),
         )
@@ -7662,6 +7871,13 @@ async def scanner_stop_handler(message: Message) -> None:
 
 
 async def live_preflight(*, prepare: bool) -> str:
+    """Validate LIVE and, on activation, sequentially prepay the whole volley.
+
+    v0037 deliberately moves every Stars payment out of the critical shot.  The
+    payment-toggle press is the explicit financial confirmation: required gifts
+    are prepaid strictly one-by-one, each state is re-read from Telegram, and
+    only then are non-financial UpgradeStarGiftRequest objects armed in RAM.
+    """
     rate_limit.clear_if_expired()
     rate_limit.assert_available()
     peer = await mtproto.resolve_channel()
@@ -7696,67 +7912,151 @@ async def live_preflight(*, prepare: bool) -> str:
         await cluster_runtime.verify_active_peers()
     operation_count = effective_volley_size()
     if len(infos) < operation_count:
-        raise RuntimeError(
-            f"Для залпа {operation_count} выбрано только {len(infos)} подарков"
-        )
+        raise RuntimeError(f"Для залпа {operation_count} выбрано только {len(infos)} подарков")
     planned_infos = infos[:operation_count]
-    planned_targets = [future_targets[0]] * operation_count
-    plans: list[PreparedUpgrade | None] = []
+
+    already_prepaid = 0
+    newly_prepaid = 0
+    newly_paid_stars = 0
+    ready_count = 0
+    scanner.prepared = {
+        saved_id: plan
+        for saved_id, plan in scanner.prepared.items()
+        if saved_id in {info.saved_id for info in planned_infos}
+    }
+
     for candidate in planned_infos:
-        plan = scanner.prepared.get(candidate.saved_id)
-        if prepare and (plan is None or time.monotonic() - plan.created_at > PREPARE_REFRESH_SECONDS):
-            plan = await mtproto.prepare_upgrade(peer, candidate)
-            scanner.prepared[candidate.saved_id] = plan
-        plans.append(plan)
+        if candidate.gift_num is not None:
+            raise RuntimeError(
+                f"PREPAID TEST STOP: у saved_id={candidate.saved_id} уже есть gift_num=#{candidate.gift_num}; "
+                "Stars не списывались, LIVE не включён"
+            )
 
-    costs: list[int] = []
-    prepaid_count = 0
-    for candidate, plan in zip(planned_infos, plans):
-        is_prepaid = candidate.prepaid or (plan is not None and plan.prepaid)
-        if is_prepaid:
-            prepaid_count += 1
-            costs.append(0)
-        else:
-            cost = plan.cost if plan is not None else candidate.upgrade_cost
-            if cost <= 0:
-                raise RuntimeError(
-                    f"Telegram не вернул стоимость улучшения для экземпляра {candidate.saved_id}"
-                )
-            if MAX_UPGRADE_STARS and cost > MAX_UPGRADE_STARS:
-                raise RuntimeError(
-                    f"Цена улучшения {cost} ⭐ превышает лимит {MAX_UPGRADE_STARS} ⭐"
-                )
-            costs.append(cost)
-
-    paid_total = sum(costs)
-    if prepaid_count == operation_count:
-        payment_text = "все операции предоплачены"
-    elif prepaid_count:
-        payment_text = f"{paid_total} ⭐ максимум + {prepaid_count} предоплач."
-    else:
-        payment_text = f"до {paid_total} ⭐ суммарно"
-    limit_text = f"{MAX_UPGRADE_STARS} ⭐" if MAX_UPGRADE_STARS else "без лимита"
-    warning = ""
-    if operation_count > 1:
-        warning = (
-            f"\n⚠️ Залп {operation_count}: все запросы уйдут почти одновременно по одному номеру выстрела. "
-            f"Максимальное списание — {paid_total} ⭐; часть подарков может получить следующие номера."
+    if prepare:
+        record_payment_event(
+            "prepaid_volley_started",
+            target=future_targets[0],
+            count=operation_count,
+            saved_ids=[item.saved_id for item in planned_infos],
         )
+        for index, candidate in enumerate(planned_infos, start=1):
+            was_prepaid = bool(candidate.prepaid)
+            try:
+                cost = await mtproto.prepay_upgrade(peer, candidate)
+                if was_prepaid:
+                    already_prepaid += 1
+                else:
+                    newly_prepaid += 1
+                    newly_paid_stars += int(cost)
+                if candidate.gift_num is not None:
+                    raise RuntimeError(
+                        f"Telegram зарезервировал #{candidate.gift_num} после PREPAID; upgrade не отправлялся"
+                    )
+                if not candidate.prepaid:
+                    raise RuntimeError("Telegram не подтвердил prepaid state")
 
+                plan = await mtproto.prepare_upgrade(peer, candidate)
+                if not plan.prepaid or plan.request is None:
+                    raise RuntimeError("не удалось собрать UpgradeStarGiftRequest после PREPAID")
+                scanner.prepared[candidate.saved_id] = plan
+                ready_count += 1
+                record_payment_event(
+                    "prepaid_volley_progress",
+                    index=index,
+                    count=operation_count,
+                    saved_id=candidate.saved_id,
+                    newly_paid=not was_prepaid,
+                    cost=int(cost),
+                    ready=ready_count,
+                    gift_num=candidate.gift_num,
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                record_payment_event(
+                    "prepaid_volley_failed",
+                    index=index,
+                    count=operation_count,
+                    saved_id=candidate.saved_id,
+                    ready=ready_count,
+                    newly_prepaid=newly_prepaid,
+                    already_prepaid=already_prepaid,
+                    newly_paid_stars=newly_paid_stars,
+                    error=f"{type(exc).__name__}: {exc}"[:500],
+                )
+                paid_note = (
+                    f" За уже подготовленные {ready_count} шт. списано сейчас {newly_paid_stars} ⭐; "
+                    "они остались предоплаченными и НЕ улучшены."
+                    if ready_count
+                    else " Stars по подтверждённым PREPAID-патронам в этом запуске не списаны."
+                )
+                raise RuntimeError(
+                    f"PREPAID-подготовка остановлена на {index}/{operation_count}: {exc}."
+                    f" Готово {ready_count}/{operation_count}.{paid_note} LIVE не включён."
+                ) from exc
+
+        # PREPAID can take several sequential Stars payments. Re-read the
+        # counter before arming LIVE so we never announce an already-passed
+        # target after a long preparation. The gifts remain prepaid if this
+        # safety check stops activation.
+        counter = await mtproto.counter_for_info(planned_infos[0], peer=peer, cache_seconds=0)
+        future_targets = sorted(
+            {target for target in store.settings.target_numbers if target > counter.current}
+        )
+        if not future_targets:
+            record_payment_event(
+                "prepaid_volley_target_passed",
+                count=operation_count,
+                ready=ready_count,
+                current=counter.current,
+                saved_ids=[item.saved_id for item in planned_infos],
+            )
+            raise RuntimeError(
+                f"PREPAID готов {ready_count}/{operation_count}, но номер выстрела уже прошёл "
+                f"во время подготовки (текущий #{counter.current}). LIVE не включён; "
+                "подарки остались предоплаченными и НЕ улучшены."
+            )
+
+        record_payment_event(
+            "prepaid_volley_ready",
+            target=future_targets[0],
+            count=operation_count,
+            ready=ready_count,
+            newly_prepaid=newly_prepaid,
+            already_prepaid=already_prepaid,
+            newly_paid_stars=newly_paid_stars,
+            saved_ids=[item.saved_id for item in planned_infos],
+            gift_nums=[item.gift_num for item in planned_infos],
+        )
+    else:
+        for candidate in planned_infos:
+            if candidate.prepaid and candidate.gift_num is None:
+                already_prepaid += 1
+                ready_count += 1
+
+    if prepare and ready_count != operation_count:
+        raise RuntimeError(f"PREPAID FAST готов только {ready_count}/{operation_count}; LIVE не включён")
+
+    limit_text = f"{MAX_UPGRADE_STARS} ⭐" if MAX_UPGRADE_STARS else "без лимита"
+    spent_text = (
+        f"{newly_paid_stars} ⭐ сейчас"
+        if newly_paid_stars
+        else "0 ⭐ сейчас (уже было предоплачено)"
+    )
     return (
-        "⚠️ <b>Подтверждение LIVE</b>\n"
+        "💳 <b>FAST-предоплата готова</b>\n"
         f"Канал: <b>{html.escape(store.settings.channel_title or '—')}</b>\n"
         f"Подарок: <b>{html.escape(counter.title)}</b>\n"
-        f"Выбранных экземпляров: <b>{len(infos)}</b>\n"
+        f"PREPAID: <b>{ready_count}/{operation_count} ✅</b>\n"
+        f"Stars списаны заранее: <b>{spent_text}</b>\n"
+        f"Подарки улучшены: <b>НЕТ</b>\n"
+        f"gift_num после PREPAID: <b>пусто</b>\n"
         f"Текущий номер: <b>{counter.current}</b>\n"
-        f"Выстрел FAST-залпа: <b>#{future_targets[0]}</b>\n"
-        f"Размер залпа: <b>{operation_count}</b>\n"
-        f"Возможное списание: <b>{payment_text}</b>\n"
-        f"Лимит одной операции: <b>{limit_text}</b>"
-        f"{warning}\n\n"
-        "Платёжные формы и сами MTProto-запросы подготовлены заранее. После точного появления "
-        "номера выстрела минус один FAST отправит залп без дополнительной проверки выстрела, без записи на диск "
-        "и без автоматического повтора. Точный номер не гарантируется."
+        f"🎯 Жду выстрел: <b>#{future_targets[0]}</b>\n"
+        f"Лимит одной предоплаты: <b>{limit_text}</b>\n"
+        "Режим: <b>PREPAID FAST</b>\n\n"
+        "В момент exact-триггера Stars больше не оплачиваются: бот отправит только заранее "
+        "собранные payments.upgradeStarGift одним unordered FAST-залпом."
     )
 
 
@@ -7805,10 +8105,10 @@ async def volley_toggle_handler(message: Message) -> None:
 
 @router.message(F.text.in_({BTN_PAYMENT_OFF, BTN_PAYMENT_ON}))
 async def payment_toggle_handler(message: Message) -> None:
-    """The payment switch and scanner mode are the same setting.
+    """Toggle PREPAID FAST. Enabling it sequentially prepays the whole volley.
 
-    Pressing the OFF label performs the full preflight and immediately enables
-    LIVE. The button press itself is the explicit financial confirmation.
+    The button press is the explicit financial confirmation. Stars are charged
+    before LIVE is armed; the exact-number shot itself performs no Stars payment.
     """
     if not await owner_guard_message(message):
         return
@@ -7820,7 +8120,11 @@ async def payment_toggle_handler(message: Message) -> None:
         await store.save()
         cluster_runtime.notify_state_changed()
         logger.info("live_disabled_by_toggle")
-        await message.answer("🛡 Оплата выключена. Режим DRY-RUN.", reply_markup=main_keyboard())
+        await message.answer(
+            "🛡 LIVE выключен. Режим DRY-RUN.\n"
+            "Уже сделанные PREPAID остаются оплаченными у Telegram; сами подарки не улучшены.",
+            reply_markup=main_keyboard(),
+        )
         return
     try:
         summary = await live_preflight(prepare=True)
@@ -7829,8 +8133,7 @@ async def payment_toggle_handler(message: Message) -> None:
         cluster_runtime.notify_state_changed()
         logger.info("live_enabled_by_toggle")
         await message.answer(
-            "💳 <b>Оплата включена — режим LIVE активирован.</b>\n"
-            + summary.replace("⚠️ <b>Подтверждение LIVE</b>\n", ""),
+            summary + "\n\n🟢 <b>LIVE активирован. Жду exact-триггер.</b>",
             reply_markup=main_keyboard(),
         )
     except Exception as exc:
@@ -7845,7 +8148,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0036 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0037 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):

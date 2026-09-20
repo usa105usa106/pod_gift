@@ -1,6 +1,14 @@
-# Payment diagnostics and FAST volley — v0036
+# v0037 PREPAID FAST diagnostic patch
 
-v0036 hardens multi-payment Stars volleys after the production `#444665` run.
+This release replaces the v0036 parallel Stars-payment experiment. LIVE activation sequentially prepays each selected saved gift with `InputInvoiceStarGiftPrepaidUpgrade`, re-reads Telegram state after every payment, and fails closed if `gift_num` appears or the gift becomes unique. The exact-trigger path is then limited to an unordered burst of already-prepaid `UpgradeStarGiftRequest` objects.
+
+Key audit events: `prepaid_upgrade_prepare_started`, `prepaid_upgrade_submit_started`, `prepaid_upgrade_confirmed`, `prepaid_volley_progress`, `prepaid_volley_ready`, plus `fast_payment_batch_*` carrying `request_type`.
+
+---
+
+# Payment diagnostics and FAST volley — v0037
+
+v0037 hardens multi-payment Stars volleys after the production `#444665` run.
 
 ## Что изменено
 
@@ -10,7 +18,7 @@ v0036 hardens multi-payment Stars volleys after the production `#444665` run.
 - `invokeAfterMsg`/ordered dependency удалены, потому что реальный залп показал задержку второго submit на 521.728 мс.
 - Финансовый batch не использует client-level request retry. Неоднозначный результат не вызывает автоматический повтор платежа.
 - `FORM_SUBMIT_DUPLICATE`, сетевой сбой с неоднозначным состоянием и прочие результаты, где payment мог быть выполнен, автоматически не повторяются. Они проверяются и при необходимости оставляют payment hold.
-- `gift-hunter-v0036-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
+- `gift-hunter-v0037-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
 - В batch audit пишется не секретный snapshot MTProto: `client_epoch`, `connect_epoch`, `connected`, `dc_id`, возраст клиента/соединения и `sender_reconnecting`.
 - Между созданием локальной batch-task и prebuilt UDP FIRE по-прежнему нет await/log/disk I/O.
 

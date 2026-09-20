@@ -1,13 +1,11 @@
-Gift Hunter v0036 — Release Manifest — maximum-speed unordered MTProto FAST volley hotfix
+Gift Hunter v0037 — Release Manifest — PREPAID FAST experimental hotfix
 
 Validation summary:
-- Real v0035 shot #444744/#444745 confirmed two prebuilt payment forms can both complete, but ordered dependency/recovery delayed payment #2 to 521.728 ms after trigger.
-- v0036 removes ordered/invokeAfterMsg payment dependencies: all prebuilt SendStarsFormRequest objects are queued in one ordered=False one-shot burst before the first await.
-- Production submit uses the already-connected Telethon MTProto sender directly, bypassing TelegramClient request-level retry logic for the financial burst.
-- No payment is automatically re-submitted after an RPC/transport ambiguity; results are verified/held instead.
-- Existing dynamic form refresh policy is unchanged: >50 numbers = 300 s; <=50 numbers = 120 s plus full forced refresh on entry.
-- Scanner/exact-number detection and status-card layout are unchanged by this hotfix.
-- Full local regression run: 198 tests, OK.
+- LIVE activation prepays the selected volley sequentially with InputInvoiceStarGiftPrepaidUpgrade.
+- After every Stars payment the saved gift is re-read; gift_num / unexpected unique state triggers PREPAID TEST STOP before any upgrade request.
+- Exact-trigger FAST path rejects non-prepaid plans and sends only UpgradeStarGiftRequest objects in one ordered=False sender burst.
+- No payment-form refresh worker runs in PREPAID LIVE.
+- Full local regression run: 200 tests, OK.
 - Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with 6 services.
 - No live Telegram/Stars payment was executed as part of offline validation.
 
@@ -15,23 +13,23 @@ Files (SHA256  bytes  path):
 e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
 f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  .env.example
 8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
-2e3be2c496a673fad869eb95081bdf0d0f0c3f6af481da41dcdcfa857acb1d14        9282  AUDIT-LOGGING.md
-b2581d61085cd3ff43755e6772beb9e160f3211fed03d285ff84035dded9fabf       34999  CHANGELOG.md
+62f549cae4772eb3f635003ed4214cca82808b10eb782eb18ebe93ff60672f0e        9768  AUDIT-LOGGING.md
+6816b0e7201beedd99d62ffb5f1ff6097539cff2e5a94ad8ccbc8b08e397cf68       38133  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-03642330c8f6a8798355c85a518fcb41049f81cb1bcf7dc71bbc332be8af4cb5        3239  PAYMENT-DIAGNOSTIC-PATCH.md
-5df135b38d89b5fa30a0bf709a9c1d489279e3bf44d9ed0ce1d846fab976c821       30346  README.md
-b040917cf1a00475ee241da8bd60efea50b440e30bdf7dc44085a5bb9372b3bb       21242  VALIDATION.md
-926064f27512fe7b97d2cac87a115376c525721537832dc80ba5b12f6ae545ab        7663  bootstrap.py
+8acffbd6b166db528bb94f867a6fc98a9478b2d1484230837eb156175c214527        3903  PAYMENT-DIAGNOSTIC-PATCH.md
+70754432c69af9b5055f3d3fcc7faf4b33c45ba7141e322f3f7786a55b691244       28373  README.md
+07b38e354136dc6ed6c2bc953d4ea674ec1c04fc6703d631990e3bca6240d238       21968  VALIDATION.md
+589c777e46414ae11993c8dd8493afbd54c7403d97dd52108f939d893cc7c9f3        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
 d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
-0bc9231edb1da1b7ffd2f6c7dbb298f6e5a37d131e8cf585bbcad380420ed15d        1533  healthcheck.py
+3c78cb1f5a0b061f58830cc4142bb1bd8198f8c2e20e85d203f303210b7ff047        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-0ac172ab3116f6883388afee80a3c0854d1eb364412dfd659d0c5e50a3ba6502      384514  main.py
+0017001ba3545ec97c43fe3f58d3b93af185293039f0af8295a4618cb4a031c4      399411  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
-a58f189879ee38ebfed5fb15a276ae84ee72c3b34e46797c723616ccde5f2f6c        2109  tests/test_bootstrap.py
+3c5b578705927750ec517cfc94980a185c53f20a56ed92051dcb8c68136de42f        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-b7dcb30cb2f874d05a201dc3eff54cca88c482d9898f005c85317605ea30c769      168495  tests/test_runtime.py
-1663fa9ac877a05304071e6d1cd6617fc77006a3668bb95ad7ad76ef74d9098e       21642  tests/test_source_guards.py
+5f82573e90d4aff54ec792333349f852273191317a1955157787d0a009220a76      171725  tests/test_runtime.py
+baee036424db47a6ca518dd155bf7a47521137c2ce9f0f5f2acd949abd3ca379       22453  tests/test_source_guards.py

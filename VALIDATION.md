@@ -1,4 +1,16 @@
-# Validation — Gift Hunter v0036
+# v0037 PREPAID FAST validation
+
+- LIVE activation prepays the selected volley sequentially with `InputInvoiceStarGiftPrepaidUpgrade`; the shot path rejects non-prepaid plans.
+- After each payment, saved-gift state is re-read. `gift_num` or an already-unique gift triggers a fail-closed `PREPAID TEST STOP` before any upgrade request.
+- Exact-trigger batch contains only prepaid `UpgradeStarGiftRequest` objects and uses one unordered sender burst.
+- Payment-form refresh worker is not started in PREPAID LIVE.
+- Local regression suite: 200 tests, OK.
+- `py_compile`, `compileall`, AST parsing and compose parsing are part of the release check below.
+- No live Telegram Stars payment is performed by offline validation.
+
+---
+
+# Validation — Gift Hunter v0037
 
 ## Ordered FAST-volley hotfix — 18 сентября 2026
 
@@ -6,7 +18,7 @@
 
 В рабочем пути два/несколько FAST-платежей ставятся одним unordered one-shot burst через уже подключённый MTProto sender. Весь список queued до первого `await`, `invokeAfterMsg` и recovery-фазы удалены. Production path обходит `TelegramClient._call`, поэтому client-level request retry не может повторно отправить финансовый batch. Добавлены regression-тесты одного unordered sender burst, независимых per-request ошибок, enqueue/transport ambiguity без повтора и fallback list API.
 
-Отдельно проверена гипотеза потери MTProto-сессии на выстреле. Telegram-уведомление указывает время входа `02:48:18 UTC`, и production log содержит connect/auth/reload активность около `02:47–02:50 UTC`. Выстрел был около `11:01:22 UTC`; в его окне отсутствуют `Connecting`, `Disconnecting` и `Reconnecting`, а клиент продолжает получать account updates. Следовательно, в предоставленном запуске на момент залпа нового входа/переавторизации не было. В v0036 добавлены snapshots соединения вокруг каждого batch для будущей проверки.
+Отдельно проверена гипотеза потери MTProto-сессии на выстреле. Telegram-уведомление указывает время входа `02:48:18 UTC`, и production log содержит connect/auth/reload активность около `02:47–02:50 UTC`. Выстрел был около `11:01:22 UTC`; в его окне отсутствуют `Connecting`, `Disconnecting` и `Reconnecting`, а клиент продолжает получать account updates. Следовательно, в предоставленном запуске на момент залпа нового входа/переавторизации не было. В v0037 добавлены snapshots соединения вокруг каждого batch для будущей проверки.
 
 Финальный локальный прогон:
 
@@ -32,7 +44,7 @@ OK
 
 Также выполнены `compileall`, AST-разбор Python и YAML-разбор `docker-compose.yaml`. Живые Telegram/Stars-платежи в офлайн-проверке не выполнялись.
 
-## Финальный аудит v0036 — проверка 18 сентября 2026
+## Финальный аудит v0037 — проверка 18 сентября 2026
 
 Полный локальный regression-run после смены версии и исправления только критичных payment-safety edge-cases:
 
@@ -147,7 +159,7 @@ logic.py: 92%
 main.py: 57%
 ```
 
-## Критические исправления v0036
+## Критические исправления v0037
 
 ### Формы Stars при длительном ожидании и залп 50
 
