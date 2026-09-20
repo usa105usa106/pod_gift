@@ -1,25 +1,16 @@
-# v0037 PREPAID FAST diagnostic patch
+# Payment diagnostics and FAST volley — v0038
 
-This release replaces the v0036 parallel Stars-payment experiment. LIVE activation sequentially prepays each selected saved gift with `InputInvoiceStarGiftPrepaidUpgrade`, re-reads Telegram state after every payment, and fails closed if `gift_num` appears or the gift becomes unique. The exact-trigger path is then limited to an unordered burst of already-prepaid `UpgradeStarGiftRequest` objects.
-
-Key audit events: `prepaid_upgrade_prepare_started`, `prepaid_upgrade_submit_started`, `prepaid_upgrade_confirmed`, `prepaid_volley_progress`, `prepaid_volley_ready`, plus `fast_payment_batch_*` carrying `request_type`.
-
----
-
-# Payment diagnostics and FAST volley — v0037
-
-v0037 hardens multi-payment Stars volleys after the production `#444665` run.
+v0038 hardens multi-payment Stars volleys after the production `#444665` run.
 
 ## Что изменено
 
-- Формы по-прежнему живут по политике `300 с` дальше 50 номеров и `120 с` внутри 50; на входе в near-target зону весь комплект refresh-ится принудительно.
+- Формы живут по прежней политике `300 с` дальше 50 номеров и `120 с` внутри 50; на входе в near-target зону весь комплект refresh-ится принудительно.
 - Каждый paid plan проверяется по `saved_id`, invoice binding, `form_id`, request binding и возрасту формы. Повторяющийся `form_id` блокирует залп fail-closed.
-- Локальный залп теперь ставится одним `client._sender.send([requests...], ordered=False)` burst. Все RequestState попадают в sender в одном event-loop turn до первого ожидания ответа.
-- `invokeAfterMsg`/ordered dependency удалены, потому что реальный залп показал задержку второго submit на 521.728 мс.
-- Финансовый batch не использует client-level request retry. Неоднозначный результат не вызывает автоматический повтор платежа.
-- `FORM_SUBMIT_DUPLICATE`, сетевой сбой с неоднозначным состоянием и прочие результаты, где payment мог быть выполнен, автоматически не повторяются. Они проверяются и при необходимости оставляют payment hold.
-- `gift-hunter-v0037-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
-- В batch audit пишется не секретный snapshot MTProto: `client_epoch`, `connect_epoch`, `connected`, `dc_id`, возраст клиента/соединения и `sender_reconnecting`.
+- После живого v0036 теста полный simultaneous submit заменён на micro-stagger: каждый `SendStarsFormRequest` ставится напрямую в `client._sender` как `ordered=False`, но соседние queue-start разделены на `10` мс по умолчанию. Ответ предыдущего платежа не ожидается.
+- Настройка `fast_volley_stagger_ms` сохраняется в `settings.json`; `/stagger 10` меняет её, `/settings` и `/help` показывают управление.
+- `invokeAfterMsg`/ordered dependency не используются, поэтому старой задержки порядка `521.728` мс нет.
+- Финансовый submit не использует client-level request retry. Неоднозначный результат не вызывает автоматический повтор платежа.
+- `gift-hunter-v0038-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_dispatched`, `fast_payment_batch_finished`, `stagger_ms`, реальные `queue_offsets_ms`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
 - Между созданием локальной batch-task и prebuilt UDP FIRE по-прежнему нет await/log/disk I/O.
 
 ## Разбор production-сбоя v0034

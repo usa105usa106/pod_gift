@@ -1,10 +1,4 @@
-# v0037 PREPAID FAST audit additions
-
-The payment audit now records sequential PREPAID preparation (`prepaid_upgrade_*`, `prepaid_volley_*`) separately from the exact-trigger burst. On a fully armed v0037 shot, `prepared_payment_debug.request_type` must be `UpgradeStarGiftRequest`; a non-prepaid `SendStarsFormRequest` is rejected before the FAST sender. `/log_full` therefore shows whether Stars were paid beforehand and whether the shot itself contained only prepaid upgrades.
-
----
-
-# Аудит логирования v0037
+# Аудит логирования v0038
 
 ## Автоматический UDP-секрет
 
@@ -21,7 +15,7 @@ cluster_udp_started shooter_id=... port=... secret_source=generated|provision|en
 При запуске каждого Hunter:
 
 ```text
-scanner_started version=v0037 shooter_id=... mode=sniper|volley active_shooters=...
+scanner_started version=v0038 shooter_id=... mode=sniper|volley active_shooters=...
 saved_ids=... targets=... live=... volley=... volley_limit=...
 ```
 
@@ -130,8 +124,12 @@ ZIP текущего Hunter включает только диагностиче
 
 Поля с именами `token`, `secret`, `password`, `api_hash` в общем журнале автоматически заменяются на `[redacted]`.
 
-## Payment audit v0037
+## Payment audit v0038
 
-Отдельный `gift-hunter-v0037-payment-audit.jsonl` записывает только диагностические, не секретные поля: `saved_id`, `form_id`, invoice/request binding, стоимость, возраст формы, refresh, ошибку, send-start и итог FAST. Токены, FIRE secret, пароль 2FA и `api_hash` туда не передаются.
+Отдельный `gift-hunter-v0038-payment-audit.jsonl` записывает только диагностические, не секретные поля: `saved_id`, `form_id`, invoice/request binding, стоимость, возраст формы, refresh, ошибку, send-start и итог FAST. Токены, FIRE secret, пароль 2FA и `api_hash` туда не передаются.
 
 Ключевые события: `upgrade_prepare_started`, `payment_form_prepared`, `payment_form_refreshed`, `payment_form_refresh_failed`, `fast_payment_batch_started`, `fast_payment_batch_phase`, `fast_payment_batch_finished`, `fast_local_preflight_failed`, `fast_volley_completed`. `/log_full` фильтрует текущий payment-audit и его ротации по последним 24 часам, а после успешной доставки архива удаляет локальные записи старше 24 часов.
+
+## FAST micro-stagger v0038
+
+`fast_payment_batch_started/dispatched/finished` содержат `stagger_ms`; dispatched/finished также пишут `queue_offsets_ms`, то есть фактический локальный queue-start каждого payment request относительно первого. Команда `/log_full` включает эти события.

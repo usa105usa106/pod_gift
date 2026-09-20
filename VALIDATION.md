@@ -1,24 +1,14 @@
-# v0037 PREPAID FAST validation
+# Validation — Gift Hunter v0038
 
-- LIVE activation prepays the selected volley sequentially with `InputInvoiceStarGiftPrepaidUpgrade`; the shot path rejects non-prepaid plans.
-- After each payment, saved-gift state is re-read. `gift_num` or an already-unique gift triggers a fail-closed `PREPAID TEST STOP` before any upgrade request.
-- Exact-trigger batch contains only prepaid `UpgradeStarGiftRequest` objects and uses one unordered sender burst.
-- Payment-form refresh worker is not started in PREPAID LIVE.
-- Local regression suite: 200 tests, OK.
-- `py_compile`, `compileall`, AST parsing and compose parsing are part of the release check below.
-- No live Telegram Stars payment is performed by offline validation.
+## FAST micro-stagger hotfix — 20 сентября 2026
 
----
+Живой тест v0036 подтвердил проблему полного совпадения payment-submit: две разные свежие формы для двух разных `saved_id` были поставлены в MTProto sender с одинаковым стартом `+2.145` мс после trigger. Один запрос подтвердил `#444776`, второй получил `FORM_SUBMIT_DUPLICATE`. Это произошло без reconnect, при разных `form_id` и свежих формах, поэтому v0038 разводит соседние `sendStarsForm` по времени.
 
-# Validation — Gift Hunter v0037
+Production path остаётся прямым через `TelegramClient._sender` и `ordered=False`, но теперь запросы ставятся по одному с настраиваемым шагом. Значение по умолчанию — `10` мс. Между submit нет ожидания ответа предыдущего платежа и нет `invokeAfterMsg`; для залпа из 5 локальные queue-start ожидаются примерно `0/10/20/30/40` мс относительно первого. Реальный scheduler может добавить небольшую положительную задержку.
 
-## Ordered FAST-volley hotfix — 18 сентября 2026
+Автоматический retry финансового request по-прежнему запрещён. Если enqueue/RPC результат неоднозначен, соответствующий подарок проходит существующую verification/payment-hold логику. Payment-audit пишет `stagger_ms`, `queue_offsets_ms`, binding формы и итог каждого запроса.
 
-Разобран реальный двухплатёжный залп на цели `#444665`. Обе формы были обновлены примерно за 72–73 секунды до отправки. Первый payment RPC вошёл в send-path через `1.769` мс после точного trigger, второй — через `1.857` мс; первый завершился `FORM_SUBMIT_DUPLICATE`, второй подтвердил `#444665`. Это исключает протухшую форму как причину данного сбоя и указывает на необходимость убрать конкурентный multi-submit.
-
-В рабочем пути два/несколько FAST-платежей ставятся одним unordered one-shot burst через уже подключённый MTProto sender. Весь список queued до первого `await`, `invokeAfterMsg` и recovery-фазы удалены. Production path обходит `TelegramClient._call`, поэтому client-level request retry не может повторно отправить финансовый batch. Добавлены regression-тесты одного unordered sender burst, независимых per-request ошибок, enqueue/transport ambiguity без повтора и fallback list API.
-
-Отдельно проверена гипотеза потери MTProto-сессии на выстреле. Telegram-уведомление указывает время входа `02:48:18 UTC`, и production log содержит connect/auth/reload активность около `02:47–02:50 UTC`. Выстрел был около `11:01:22 UTC`; в его окне отсутствуют `Connecting`, `Disconnecting` и `Reconnecting`, а клиент продолжает получать account updates. Следовательно, в предоставленном запуске на момент залпа нового входа/переавторизации не было. В v0037 добавлены snapshots соединения вокруг каждого batch для будущей проверки.
+Добавлены пользовательские настройки: `/stagger <0..1000>`, `/stagger`, `/settings`, кнопка `⚙️ Настройки` и `/help`. Значение сохраняется в `settings.json`; default после обновления — `10` мс. Сканер, exact-probe, quiet zone и политика refresh форм не менялись.
 
 Финальный локальный прогон:
 
@@ -44,7 +34,7 @@ OK
 
 Также выполнены `compileall`, AST-разбор Python и YAML-разбор `docker-compose.yaml`. Живые Telegram/Stars-платежи в офлайн-проверке не выполнялись.
 
-## Финальный аудит v0037 — проверка 18 сентября 2026
+## Финальный аудит v0038 — проверка 18 сентября 2026
 
 Полный локальный regression-run после смены версии и исправления только критичных payment-safety edge-cases:
 
@@ -159,7 +149,7 @@ logic.py: 92%
 main.py: 57%
 ```
 
-## Критические исправления v0037
+## Критические исправления v0038
 
 ### Формы Stars при длительном ожидании и залп 50
 

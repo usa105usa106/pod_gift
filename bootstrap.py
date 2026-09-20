@@ -9,7 +9,7 @@ from pathlib import Path
 from cluster import MAX_SHOOTERS, ProvisionStore, StableConfigGate, resolve_fire_secret
 
 
-APP_VERSION = "v0037"
+APP_VERSION = "v0038"
 
 
 def append_bootstrap_log(path: Path, event: str, **fields: object) -> None:
