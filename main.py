@@ -89,7 +89,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0039"
+APP_VERSION = "v0041"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -101,7 +101,7 @@ STRESS_REPORT_PATH = DATA_DIR / "stress-test-latest.json"
 STRESS_HISTORY_PATH = DATA_DIR / "stress-tests.jsonl"
 CATALOG_REPORT_PATH = DATA_DIR / "catalog-numbers-latest.json"
 RATE_LIMIT_PATH = DATA_DIR / "rate-limit.json"
-PAYMENT_GUARD_PATH = DATA_DIR / "payment-submit-guard.json"
+LEGACY_PAYMENT_GUARD_PATH = DATA_DIR / "payment-submit-guard.json"
 SCANNER_RESUME_PATH = DATA_DIR / "scanner-resume.json"
 PENDING_PAYMENT_HOLD_MESSAGE = (
     "Есть платёж с неподтверждённым результатом. Повторная оплата и изменение "
@@ -199,12 +199,11 @@ MAX_PRIMARY_VOLLEY_SIZE = 50
 MAX_SECONDARY_VOLLEY_SIZE = 50
 DEFAULT_FAST_QUIET_DISTANCE = 10
 FAST_QUIET_DISTANCE = env_int("FAST_QUIET_DISTANCE", DEFAULT_FAST_QUIET_DISTANCE, minimum=1)
-# Gap between the queue-start of adjacent Stars submits in a FAST volley.
-# 10 ms is the default selected for the next live test: simultaneous submits
-# have collided with Telegram's duplicate-payment protection, while a small
-# stagger avoids the old ~0.5 s ordered/dependency penalty. This is user-configurable
-# in settings via /stagger and persisted in settings.json.
-DEFAULT_FAST_VOLLEY_STAGGER_MS = 10
+# v0041 deliberately uses no fixed millisecond stagger. /otvet off preserves the
+# default NEXT-TICK path; /otvet on waits only for the previous raw payment RPC
+# future before queueing the next request. Neither mode uses a durable payment
+# guard or an automatic financial retry.
+DEFAULT_FAST_VOLLEY_STAGGER_MS = 0
 MAX_FAST_VOLLEY_STAGGER_MS = 1000
 # Force-refresh the full FAST payment set once when the frontier enters the same
 # 50-number near-target zone used by the faster form-refresh policy. This value
@@ -664,12 +663,12 @@ class Settings:
     live_upgrades: bool = False
     volley_size: int = 1
     fast_volley_stagger_ms: int = DEFAULT_FAST_VOLLEY_STAGGER_MS
+    fast_wait_response: bool = False
     slug_map: dict[str, str] = field(default_factory=dict)
     payment_hold_saved_ids: list[int] = field(default_factory=list)
     payment_hold_targets: dict[str, int] = field(default_factory=dict)
     payment_hold_reason: str | None = None
     payment_verification_url: str | None = None
-    payment_guard_token: str | None = None
 
 
 class SettingsStore:
@@ -718,12 +717,8 @@ class SettingsStore:
             target_numbers=_unique_ints(nested.get("target_numbers", [])),
             live_upgrades=parse_bool(nested.get("live_upgrades", False), False),
             volley_size=min(max_volley_size_for_shooter(SHOOTER_ID), max(1, _int_or_none(nested.get("volley_size")) or 1)),
-            fast_volley_stagger_ms=min(
-                MAX_FAST_VOLLEY_STAGGER_MS,
-                max(0, _int_or_none(nested.get("fast_volley_stagger_ms"))
-                    if _int_or_none(nested.get("fast_volley_stagger_ms")) is not None
-                    else DEFAULT_FAST_VOLLEY_STAGGER_MS),
-            ),
+            fast_volley_stagger_ms=0,
+            fast_wait_response=parse_bool(nested.get("fast_wait_response", False), False),
             slug_map={str(k): str(v) for k, v in (nested.get("slug_map", {}) or {}).items() if v},
             payment_hold_saved_ids=_unique_ints(nested.get("payment_hold_saved_ids", [])),
             payment_hold_targets={
@@ -734,7 +729,6 @@ class SettingsStore:
             },
             payment_hold_reason=_str_or_none(nested.get("payment_hold_reason")),
             payment_verification_url=_str_or_none(nested.get("payment_verification_url")),
-            payment_guard_token=_str_or_none(nested.get("payment_guard_token")),
         )
         return settings
 
@@ -913,13 +907,6 @@ class RateLimitStore:
             logger.warning("rate_limit_state_write_failed error=%s", exc)
 
 
-PAYMENT_GUARD_LOCK = threading.RLock()
-
-
-class PaymentGuardStateError(OSError):
-    """Persistent payment guard exists but cannot be trusted or parsed."""
-
-
 def _fsync_parent(path: Path) -> None:
     """Best-effort directory fsync for durable atomic state replacement."""
     flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
@@ -933,281 +920,6 @@ def _fsync_parent(path: Path) -> None:
         os.close(fd)
 
 
-def _load_payment_submission_guard(path: Path = PAYMENT_GUARD_PATH) -> dict[str, Any] | None:
-    """Load the durable pre-submit guard, failing closed on corruption.
-
-    A missing file means there is no armed submission.  An existing file that
-    cannot be read or validated is different: silently treating it as absent
-    could permit a second Stars payment after an interrupted first submission.
-    """
-    with PAYMENT_GUARD_LOCK:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise PaymentGuardStateError(f"cannot read payment guard {path}: {exc}") from exc
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise PaymentGuardStateError(f"invalid payment guard JSON {path}: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise PaymentGuardStateError(f"invalid payment guard payload {path}")
-        guard_id = _str_or_none(payload.get("guard_id"))
-        entries = payload.get("entries")
-        if guard_id is None or not isinstance(entries, list):
-            raise PaymentGuardStateError(f"incomplete payment guard payload {path}")
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise PaymentGuardStateError(f"invalid payment guard entry {path}")
-            if not str(entry.get("slug", "")).strip():
-                raise PaymentGuardStateError(f"payment guard entry has no slug {path}")
-            if _positive_int_or_none(entry.get("target")) is None:
-                raise PaymentGuardStateError(f"payment guard entry has invalid target {path}")
-            if not _unique_ints(entry.get("saved_ids", [])):
-                raise PaymentGuardStateError(f"payment guard entry has no saved_ids {path}")
-            state = _str_or_none(entry.get("state"))
-            # v0038 had no state field. Treat that legacy shape as unknown on
-            # recovery (fail closed), but accept it here so the Reset button can
-            # still clear it after an upgrade. New v0039 entries are explicit.
-            if state is not None and state not in {"armed", "submitted"}:
-                raise PaymentGuardStateError(f"payment guard entry has invalid state {path}")
-        return payload
-
-
-def add_payment_submission_guard_entry(
-    *,
-    slug: str,
-    target: int,
-    saved_ids: Iterable[int],
-    campaign_id: str | None = None,
-    path: Path = PAYMENT_GUARD_PATH,
-) -> str:
-    """Durably arm a pre-submit guard before any Stars request may be sent.
-
-    The guard intentionally lives outside settings.json. If the process dies or
-    the post-volley settings save fails, startup converts every guarded saved_id
-    into a payment hold instead of risking a duplicate payment after restart.
-    """
-    with PAYMENT_GUARD_LOCK:
-        payload = _load_payment_submission_guard(path) or {}
-        # Every new ARMED generation gets a fresh token.  If clearing an
-        # already-confirmed guard failed and a later run arms another payment,
-        # the old token stored in settings.json must never make startup mistake
-        # the newer submission for stale cleanup residue.
-        guard_id = os.urandom(16).hex()
-        entries = [item for item in payload.get("entries", []) if isinstance(item, dict)]
-        key_slug = str(slug).strip()
-        key_target = int(target)
-        entries = [
-            item for item in entries
-            if not (str(item.get("slug", "")).strip() == key_slug and _int_or_none(item.get("target")) == key_target)
-        ]
-        entries.append(
-            {
-                "slug": key_slug,
-                "target": key_target,
-                "saved_ids": _unique_ints(saved_ids),
-                "campaign_id": _str_or_none(campaign_id),
-                "state": "armed",
-                "armed_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        body = {
-            "version": APP_VERSION,
-            "guard_id": guard_id,
-            "entries": entries,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        temp = path.with_name(path.name + ".tmp")
-        with temp.open("w", encoding="utf-8") as stream:
-            json.dump(body, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temp, 0o600)
-        temp.replace(path)
-        os.chmod(path, 0o600)
-        _fsync_parent(path)
-        return guard_id
-
-
-def mark_payment_submission_guard_submitted(
-    *,
-    slug: str,
-    target: int,
-    saved_ids: Iterable[int],
-    path: Path = PAYMENT_GUARD_PATH,
-) -> str:
-    """Durably switch one pre-armed volley to SUBMITTED immediately before send.
-
-    ARMED means payment forms exist but no Stars RPC has been dispatched. A
-    watchdog/container restart while only ARMED is therefore safe and must not
-    create a payment hold. SUBMITTED is written as the last durable preflight
-    operation before the first sender call; a restart after that point stays
-    fail-closed because a payment may have reached Telegram.
-    """
-    with PAYMENT_GUARD_LOCK:
-        payload = _load_payment_submission_guard(path)
-        if payload is None:
-            raise PaymentGuardStateError("payment guard disappeared before submit")
-        key_slug = str(slug).strip()
-        key_target = int(target)
-        wanted = set(_unique_ints(saved_ids))
-        if not wanted:
-            raise PaymentGuardStateError("payment guard submit has no saved_ids")
-        match: dict[str, Any] | None = None
-        for entry in payload.get("entries", []):
-            if not isinstance(entry, dict):
-                continue
-            if (
-                str(entry.get("slug", "")).strip() == key_slug
-                and _int_or_none(entry.get("target")) == key_target
-                and set(_unique_ints(entry.get("saved_ids", []))) == wanted
-            ):
-                match = entry
-                break
-        if match is None:
-            raise PaymentGuardStateError(
-                f"payment guard entry missing before submit: slug={key_slug} target={key_target}"
-            )
-        match["state"] = "submitted"
-        match["submitted_at"] = datetime.now(timezone.utc).isoformat()
-        payload["version"] = APP_VERSION
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-        temp = path.with_name(path.name + ".tmp")
-        with temp.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temp, 0o600)
-        temp.replace(path)
-        os.chmod(path, 0o600)
-        _fsync_parent(path)
-        guard_id = _str_or_none(payload.get("guard_id"))
-        if guard_id is None:
-            raise PaymentGuardStateError("payment guard lost guard_id before submit")
-        return guard_id
-
-
-def remove_payment_submission_guard_entries(
-    keys: Iterable[tuple[str, int]],
-    *,
-    path: Path = PAYMENT_GUARD_PATH,
-) -> None:
-    with PAYMENT_GUARD_LOCK:
-        payload = _load_payment_submission_guard(path)
-        if payload is None:
-            return
-        remove = {(str(slug).strip(), int(target)) for slug, target in keys}
-        entries = [
-            item for item in payload.get("entries", [])
-            if isinstance(item, dict)
-            and (str(item.get("slug", "")).strip(), _int_or_none(item.get("target"))) not in remove
-        ]
-        if not entries:
-            path.unlink(missing_ok=True)
-            _fsync_parent(path)
-            return
-        payload["entries"] = entries
-        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-        temp = path.with_name(path.name + ".tmp")
-        with temp.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temp, 0o600)
-        temp.replace(path)
-        os.chmod(path, 0o600)
-        _fsync_parent(path)
-
-
-def clear_payment_submission_guard(path: Path = PAYMENT_GUARD_PATH) -> None:
-    with PAYMENT_GUARD_LOCK:
-        path.unlink(missing_ok=True)
-        _fsync_parent(path)
-
-
-def _recover_settings_from_payment_guard(settings: Settings) -> None:
-    try:
-        payload = _load_payment_submission_guard()
-    except PaymentGuardStateError as exc:
-        # Keep the bot controllable for diagnostics, but fail closed for LIVE.
-        settings.live_upgrades = False
-        settings.payment_hold_reason = (
-            "Persistent payment guard повреждён или недоступен; LIVE заблокирован "
-            "до полного сброса/исправления payment-submit-guard.json"
-        )
-        logger.critical("payment_submission_guard_invalid error=%s", exc)
-        return
-    if payload is None:
-        return
-    guard_id = _str_or_none(payload.get("guard_id"))
-    # A matching token means the exact post-volley state already reached
-    # settings.json; a leftover guard is only an unlink failure.
-    if guard_id is not None and guard_id == settings.payment_guard_token:
-        with contextlib.suppress(OSError):
-            clear_payment_submission_guard()
-        return
-
-    guarded: list[int] = []
-    targets = dict(settings.payment_hold_targets)
-    armed_keys: set[tuple[str, int]] = set()
-    legacy_unknown = False
-    for entry in payload.get("entries", []):
-        if not isinstance(entry, dict):
-            continue
-        slug = str(entry.get("slug", "")).strip()
-        target = _positive_int_or_none(entry.get("target"))
-        ids = _unique_ints(entry.get("saved_ids", []))
-        state = _str_or_none(entry.get("state"))
-        if state == "armed":
-            # No Stars RPC was sent. A watchdog restart while waiting near the
-            # target must never turn clean ammunition into a false payment hold.
-            if slug and target is not None:
-                armed_keys.add((slug, target))
-            logger.warning(
-                "payment_submission_guard_armed_recovered_safe slug=%s target=%s saved_ids=%s",
-                slug, target, ids,
-            )
-            continue
-        # state == submitted is a real ambiguous payment window. A v0038 guard
-        # has no state at all, so it remains fail-closed as legacy/unknown.
-        if state is None:
-            legacy_unknown = True
-        guarded.extend(ids)
-        if target is not None:
-            for saved_id in ids:
-                targets[str(saved_id)] = target
-
-    if armed_keys:
-        try:
-            remove_payment_submission_guard_entries(armed_keys)
-        except OSError as exc:
-            logger.error("payment_submission_guard_armed_cleanup_failed error=%s", exc)
-
-    guarded = _unique_ints(guarded)
-    if not guarded:
-        # All surviving entries were ARMED only; they are safe to discard and
-        # LIVE remains exactly as persisted in settings.json for auto-resume.
-        return
-    settings.payment_hold_saved_ids = _unique_ints([*settings.payment_hold_saved_ids, *guarded])
-    settings.payment_hold_targets = targets
-    settings.payment_hold_reason = (
-        "Обнаружен SUBMITTED payment guard после аварийного перезапуска; повторная "
-        "оплата заблокирована до сверки с Telegram"
-        if not legacy_unknown
-        else
-        "Обнаружен guard старой версии с неизвестным фактом submit; повторная оплата "
-        "заблокирована до сверки или явного полного сброса"
-    )
-    settings.payment_verification_url = None
-    settings.live_upgrades = False
-    logger.error(
-        "payment_submission_guard_recovered guard_id=%s saved_ids=%s legacy_unknown=%s",
-        guard_id, guarded, legacy_unknown,
-    )
-
-
 def _write_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> None:
     payload = {
         "version": APP_VERSION,
@@ -1216,7 +928,8 @@ def _write_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> None:
         "target_numbers": list(store.settings.target_numbers),
         "live_upgrades": bool(store.settings.live_upgrades),
         "volley_size": int(store.settings.volley_size),
-        "fast_volley_stagger_ms": int(store.settings.fast_volley_stagger_ms),
+        "dispatch_mode": fast_dispatch_mode(),
+        "fast_wait_response": effective_fast_wait_response(),
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     temp = path.with_name(path.name + ".tmp")
@@ -1255,7 +968,7 @@ def clear_full_operational_files() -> None:
     # runtime behaviour and are useful after a bug. Authorization *.session files
     # are never touched.
     for path in (
-        PAYMENT_GUARD_PATH,
+        LEGACY_PAYMENT_GUARD_PATH,
         SCANNER_RESUME_PATH,
         RATE_LIMIT_PATH,
         DIAGNOSTICS_PATH,
@@ -1286,7 +999,6 @@ def current_rss_mb() -> float:
 
 
 store = SettingsStore(SETTINGS_PATH)
-_recover_settings_from_payment_guard(store.settings)
 
 
 def effective_volley_size() -> int:
@@ -1295,11 +1007,17 @@ def effective_volley_size() -> int:
 
 
 def effective_fast_volley_stagger_ms() -> int:
-    """Return the persisted FAST inter-submit gap, clamped to a safe range."""
-    return min(
-        MAX_FAST_VOLLEY_STAGGER_MS,
-        max(0, int(store.settings.fast_volley_stagger_ms)),
-    )
+    """Compatibility metric: v0041 has no fixed millisecond stagger."""
+    return 0
+
+
+def effective_fast_wait_response() -> bool:
+    """Return whether FAST waits for each payment RPC response before queueing the next."""
+    return bool(store.settings.fast_wait_response)
+
+
+def fast_dispatch_mode() -> str:
+    return "sequential_rpc_response" if effective_fast_wait_response() else "sequential_next_tick"
 
 
 rate_limit = RateLimitStore(RATE_LIMIT_PATH)
@@ -2652,29 +2370,23 @@ class MTProtoService:
         items: list[tuple[SavedGiftInfo, PreparedUpgrade]],
         *,
         client: TelegramClient,
-        stagger_ms: int | None = None,
     ) -> list[UpgradeOutcome]:
-        """Submit prebuilt FAST payments with a tiny configurable stagger.
+        """Submit prebuilt Stars payments using one of two v0041 FAST modes.
 
-        Live simultaneous-burst testing showed that truly simultaneous ``sendStarsForm``
-        requests can collide with Telegram's duplicate-payment protection: one
-        request succeeds while another may return ``FORM_SUBMIT_DUPLICATE``.
-        v0039 keeps every form prebuilt and keeps ``ordered=False`` (so there is
-        no ~0.5 s invokeAfterMsg/dependency delay), but queues adjacent payment
-        requests a few milliseconds apart. The default is 10 ms and is persisted
-        in settings via ``/stagger``.
+        ``/otvet off`` (default) preserves the default NEXT-TICK behaviour: queue one
+        request to the already-hot MTProto sender, yield one asyncio loop turn,
+        then queue the next without waiting for Telegram.
 
-        Production still submits directly to the already-connected MTProto
-        sender, bypassing the TelegramClient request-retry loop. No failed or
-        ambiguous financial request is automatically submitted a second time.
+        ``/otvet on`` uses RESPONSE-CHAIN: queue one request, await only that raw
+        RPC future, and queue the next immediately when the future settles.  No
+        NFT verification, UI work, logging or disk I/O runs between the response
+        and the next queue operation.  A failed/ambiguous response is not retried;
+        the chain still proceeds to the next already-selected payment.
+
+        The durable payment guard remains completely absent from the firing path.
         """
         if not items:
             return []
-
-        if stagger_ms is None:
-            stagger_ms = self.store.settings.fast_volley_stagger_ms
-        stagger_ms = min(MAX_FAST_VOLLEY_STAGGER_MS, max(0, int(stagger_ms)))
-        stagger_ns = int(stagger_ms * 1_000_000)
 
         now = time.monotonic()
         for info, prepared in items:
@@ -2687,104 +2399,177 @@ class MTProtoService:
                     f"FAST-платёжная форма устарела: saved_id={info.saved_id}; оплата не отправлена"
                 )
 
+        wait_response = effective_fast_wait_response()
+        dispatch_mode = "sequential_rpc_response" if wait_response else "sequential_next_tick"
         snapshot_before = self.connection_snapshot(client)
+        transport = (
+            "telethon_sender_response_chain" if wait_response
+            else "telethon_sender_unordered_next_tick"
+        )
         record_payment_event(
             "fast_payment_batch_started",
             count=len(items),
             ordered=False,
-            stagger_ms=stagger_ms,
-            transport="telethon_sender_unordered_staggered",
+            dispatch_mode=dispatch_mode,
+            waits_for_previous_response=wait_response,
+            fixed_stagger_ms=0,
+            transport=transport,
             connection=snapshot_before,
             entries=[prepared_payment_debug(plan) for _info, plan in items],
         )
 
         raw_results: list[Any] = [None] * len(items)
         raw_errors: list[BaseException | None] = [None] * len(items)
-        transport = "telethon_sender_unordered_staggered"
         queue_offsets_ms: list[float | None] = [None] * len(items)
+        response_offsets_ms: list[float | None] = [None] * len(items)
         first_queue_ns: int | None = None
-        last_queue_ns: int | None = None
 
         sender = getattr(client, "_sender", None)
         sender_send = getattr(sender, "send", None)
         if callable(sender_send):
-            queued: list[tuple[int, Any]] = []
-            for index, (info, prepared) in enumerate(items):
-                if last_queue_ns is not None and stagger_ns > 0:
-                    remaining_ns = stagger_ns - (time.perf_counter_ns() - last_queue_ns)
-                    if remaining_ns > 0:
-                        await asyncio.sleep(remaining_ns / 1_000_000_000.0)
+            if wait_response:
+                # RESPONSE-CHAIN critical path.  The only await between queueing
+                # adjacent payments is the previous raw MTProto future itself.
+                for index, (_info, prepared) in enumerate(items):
+                    queue_ns = time.perf_counter_ns()
+                    prepared.fast_send_started_ns = queue_ns
+                    if first_queue_ns is None:
+                        first_queue_ns = queue_ns
+                    queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
+                    try:
+                        future = sender_send(prepared.request, ordered=False)
+                        if isinstance(future, (list, tuple)):
+                            futures = list(future)
+                            if len(futures) != 1:
+                                raise RuntimeError(
+                                    f"FAST sender вернул {len(futures)} future для одного запроса"
+                                )
+                            future = futures[0]
+                        try:
+                            raw_results[index] = await future
+                        except BaseException as exc:
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                                raise
+                            raw_errors[index] = exc
+                        finally:
+                            response_ns = time.perf_counter_ns()
+                            response_offsets_ms[index] = (response_ns - first_queue_ns) / 1_000_000.0
+                    except BaseException as exc:
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                            raise
+                        raw_errors[index] = exc
+                        response_ns = time.perf_counter_ns()
+                        response_offsets_ms[index] = (response_ns - first_queue_ns) / 1_000_000.0
+            else:
+                queued: list[tuple[int, Any]] = []
+                for index, (_info, prepared) in enumerate(items):
+                    queue_ns = time.perf_counter_ns()
+                    prepared.fast_send_started_ns = queue_ns
+                    if first_queue_ns is None:
+                        first_queue_ns = queue_ns
+                    queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
 
-                queue_ns = time.perf_counter_ns()
-                prepared.fast_send_started_ns = queue_ns
-                if first_queue_ns is None:
-                    first_queue_ns = queue_ns
-                queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
-                last_queue_ns = queue_ns
+                    try:
+                        future = sender_send(prepared.request, ordered=False)
+                        if isinstance(future, (list, tuple)):
+                            futures = list(future)
+                            if len(futures) != 1:
+                                raise RuntimeError(
+                                    f"FAST sender вернул {len(futures)} future для одного запроса"
+                                )
+                            future = futures[0]
+                        queued.append((index, future))
+                    except BaseException as exc:
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                            raise
+                        raw_errors[index] = exc
 
-                try:
-                    future = sender_send(prepared.request, ordered=False)
-                    if isinstance(future, (list, tuple)):
-                        futures = list(future)
-                        if len(futures) != 1:
-                            raise RuntimeError(
-                                f"FAST sender вернул {len(futures)} future для одного запроса"
-                            )
-                        future = futures[0]
-                    queued.append((index, future))
-                except BaseException as exc:
-                    if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                        raise
-                    # This specific request may already be ambiguous; never retry.
-                    raw_errors[index] = exc
+                    if index + 1 < len(items):
+                        await asyncio.sleep(0)
 
-            if queued:
-                settled = await asyncio.gather(
-                    *(future for _index, future in queued),
-                    return_exceptions=True,
-                )
-                for (index, _future), value in zip(queued, settled):
-                    if isinstance(value, BaseException):
-                        raw_errors[index] = value
-                    else:
-                        raw_results[index] = value
+                if queued:
+                    settled = await asyncio.gather(
+                        *(future for _index, future in queued),
+                        return_exceptions=True,
+                    )
+                    for (index, _future), value in zip(queued, settled):
+                        response_ns = time.perf_counter_ns()
+                        response_offsets_ms[index] = (response_ns - first_queue_ns) / 1_000_000.0
+                        if isinstance(value, BaseException):
+                            raw_errors[index] = value
+                        else:
+                            raw_results[index] = value
         else:
-            # Test/custom-client fallback only. Production TelegramClient always
-            # exposes _sender; the direct-sender path above is what avoids the
-            # normal client-level retry loop for Stars payments.
-            transport = "telethon_client_unordered_staggered_fallback"
-            tasks: list[tuple[int, asyncio.Task[Any]]] = []
-            for index, (_info, prepared) in enumerate(items):
-                if last_queue_ns is not None and stagger_ns > 0:
-                    remaining_ns = stagger_ns - (time.perf_counter_ns() - last_queue_ns)
-                    if remaining_ns > 0:
-                        await asyncio.sleep(remaining_ns / 1_000_000_000.0)
-                queue_ns = time.perf_counter_ns()
-                prepared.fast_send_started_ns = queue_ns
-                if first_queue_ns is None:
-                    first_queue_ns = queue_ns
-                queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
-                last_queue_ns = queue_ns
-                tasks.append(
-                    (index, asyncio.create_task(client(prepared.request, ordered=False)))
-                )
-            if tasks:
-                settled = await asyncio.gather(
-                    *(task for _index, task in tasks),
-                    return_exceptions=True,
-                )
-                for (index, _task), value in zip(tasks, settled):
-                    if isinstance(value, BaseException):
-                        raw_errors[index] = value
-                    else:
-                        raw_results[index] = value
+            if wait_response:
+                transport = "telethon_client_response_chain_fallback"
+                for index, (_info, prepared) in enumerate(items):
+                    queue_ns = time.perf_counter_ns()
+                    prepared.fast_send_started_ns = queue_ns
+                    if first_queue_ns is None:
+                        first_queue_ns = queue_ns
+                    queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
+                    try:
+                        raw_results[index] = await client(prepared.request, ordered=False)
+                    except BaseException as exc:
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                            raise
+                        raw_errors[index] = exc
+                    finally:
+                        response_ns = time.perf_counter_ns()
+                        response_offsets_ms[index] = (response_ns - first_queue_ns) / 1_000_000.0
+            else:
+                transport = "telethon_client_unordered_next_tick_fallback"
+                tasks: list[tuple[int, asyncio.Task[Any]]] = []
+                for index, (_info, prepared) in enumerate(items):
+                    queue_ns = time.perf_counter_ns()
+                    prepared.fast_send_started_ns = queue_ns
+                    if first_queue_ns is None:
+                        first_queue_ns = queue_ns
+                    queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
+                    tasks.append(
+                        (index, asyncio.create_task(client(prepared.request, ordered=False)))
+                    )
+                    if index + 1 < len(items):
+                        await asyncio.sleep(0)
+                if tasks:
+                    settled = await asyncio.gather(
+                        *(task for _index, task in tasks),
+                        return_exceptions=True,
+                    )
+                    for (index, _task), value in zip(tasks, settled):
+                        response_ns = time.perf_counter_ns()
+                        response_offsets_ms[index] = (response_ns - first_queue_ns) / 1_000_000.0
+                        if isinstance(value, BaseException):
+                            raw_errors[index] = value
+                        else:
+                            raw_results[index] = value
+
+        rounded_offsets = [round(value, 3) if value is not None else None for value in queue_offsets_ms]
+        rounded_response_offsets = [
+            round(value, 3) if value is not None else None for value in response_offsets_ms
+        ]
+        queue_deltas_ms: list[float | None] = []
+        previous: float | None = None
+        for value in queue_offsets_ms:
+            if value is None:
+                queue_deltas_ms.append(None)
+            elif previous is None:
+                queue_deltas_ms.append(0.0)
+                previous = value
+            else:
+                queue_deltas_ms.append(round(value - previous, 3))
+                previous = value
 
         record_payment_event(
             "fast_payment_batch_dispatched",
             count=len(items),
             ordered=False,
-            stagger_ms=stagger_ms,
-            queue_offsets_ms=[round(value, 3) if value is not None else None for value in queue_offsets_ms],
+            dispatch_mode=dispatch_mode,
+            waits_for_previous_response=wait_response,
+            fixed_stagger_ms=0,
+            queue_offsets_ms=rounded_offsets,
+            queue_deltas_ms=queue_deltas_ms,
+            response_offsets_ms=rounded_response_offsets,
             transport=transport,
             submitted_saved_ids=[info.saved_id for info, _prepared in items],
             connection=self.connection_snapshot(client),
@@ -2845,8 +2630,12 @@ class MTProtoService:
             count=len(items),
             phases=1,
             ordered=False,
-            stagger_ms=stagger_ms,
-            queue_offsets_ms=[round(value, 3) if value is not None else None for value in queue_offsets_ms],
+            dispatch_mode=dispatch_mode,
+            waits_for_previous_response=wait_response,
+            fixed_stagger_ms=0,
+            queue_offsets_ms=rounded_offsets,
+            queue_deltas_ms=queue_deltas_ms,
+            response_offsets_ms=rounded_response_offsets,
             transport=transport,
             connection_before=snapshot_before,
             connection_after=snapshot_after,
@@ -3168,8 +2957,6 @@ class Scanner:
         self._critical_form_ready: set[tuple[str, int]] = set()
         self._critical_form_unarmed: dict[tuple[str, int], str] = {}
         self._critical_form_retry_after: dict[tuple[str, int], float] = {}
-        self._payment_guard_keys: set[tuple[str, int]] = set()
-        self._payment_guard_id: str | None = None
         self.triggered: set[tuple[str, int]] = set()
         self.notified_missed: set[tuple[str, int]] = set()
         self.status_chat_id: int | None = None
@@ -3492,20 +3279,6 @@ class Scanner:
         self._critical_form_unarmed.clear()
         self._critical_form_retry_after.clear()
 
-    async def _clear_prearmed_payment_guards(self) -> None:
-        """Remove guards that this live process armed but never submitted."""
-        if not self._payment_guard_keys:
-            return
-        keys = set(self._payment_guard_keys)
-        try:
-            await asyncio.to_thread(remove_payment_submission_guard_entries, keys)
-        except OSError as exc:
-            logger.error("payment_submission_guard_cleanup_failed keys=%s error=%s", sorted(keys), exc)
-            return
-        self._payment_guard_keys.difference_update(keys)
-        if not self._payment_guard_keys:
-            self._payment_guard_id = None
-
     async def _prepare_fast_forms(
         self,
         peer: Any,
@@ -3587,28 +3360,6 @@ class Scanner:
             )
             return False
 
-        try:
-            guard_id = await asyncio.to_thread(
-                add_payment_submission_guard_entry,
-                slug=slug,
-                target=target,
-                saved_ids=[item.saved_id for item in candidates],
-                campaign_id=self._campaign_ids_by_slug.get(slug),
-            )
-        except OSError as exc:
-            reason = f"persistent payment guard не записан: {exc}"
-            self._critical_form_unarmed[key] = reason
-            self._critical_form_retry_after[key] = time.monotonic() + 15.0
-            runtime.last_error = f"FAST-залп не вооружён: {reason}"
-            logger.exception(
-                "fast_payment_guard_arm_failed slug=%s target=%s saved_ids=%s",
-                slug,
-                target,
-                [item.saved_id for item in candidates],
-            )
-            return False
-        self._payment_guard_id = guard_id
-        self._payment_guard_keys.add(key)
         self._critical_form_unarmed.pop(key, None)
         self._critical_form_retry_after.pop(key, None)
         self._critical_form_ready.add(key)
@@ -3989,14 +3740,6 @@ class Scanner:
             raise RuntimeError("Номера выстрела не заданы")
         rate_limit.clear_if_expired()
         rate_limit.assert_available()
-        if store.settings.live_upgrades:
-            try:
-                _load_payment_submission_guard()
-            except PaymentGuardStateError as exc:
-                raise RuntimeError(
-                    "Повреждён persistent payment guard; LIVE-запуск заблокирован до "
-                    "исправления payment-submit-guard.json"
-                ) from exc
         if not await self.service.is_authorized():
             raise RuntimeError("Telegram-аккаунт не авторизован")
         if active_shooter_count() > 1:
@@ -4011,7 +3754,6 @@ class Scanner:
         self.notified_missed.clear()
         self._form_refresh_retry_after.clear()
         self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
-        await self._clear_prearmed_payment_guards()
         self._reset_critical_form_state()
         self._plan_dirty = True
         self._groups.clear()
@@ -4105,7 +3847,7 @@ class Scanner:
             cluster_runtime.arm(campaign_id, first_target)
         cluster_runtime.notify_state_changed()
         logger.info(
-            "scanner_started version=%s shooter_id=%s mode=%s active_shooters=%s saved_ids=%s targets=%s live=%s volley=%s volley_limit=%s stagger_ms=%s adaptive=%s start_ms=%s min_ms=%s",
+            "scanner_started version=%s shooter_id=%s mode=%s active_shooters=%s saved_ids=%s targets=%s live=%s volley=%s volley_limit=%s dispatch_mode=%s adaptive=%s start_ms=%s min_ms=%s",
             APP_VERSION,
             SHOOTER_ID,
             "sniper" if effective_volley_size() == 1 else "volley",
@@ -4115,7 +3857,7 @@ class Scanner:
             store.settings.live_upgrades,
             effective_volley_size(),
             effective_max_volley_size(),
-            effective_fast_volley_stagger_ms(),
+            fast_dispatch_mode(),
             ADAPTIVE_SCAN,
             SCAN_START_INTERVAL_MS,
             SCAN_MIN_INTERVAL_MS,
@@ -4129,7 +3871,8 @@ class Scanner:
             live=bool(store.settings.live_upgrades),
             volley=effective_volley_size(),
             volley_limit=effective_max_volley_size(),
-            stagger_ms=effective_fast_volley_stagger_ms(),
+            dispatch_mode=fast_dispatch_mode(),
+            fast_wait_response=effective_fast_wait_response(),
         )
 
     async def stop(self, reason: str = "manual") -> None:
@@ -4166,8 +3909,7 @@ class Scanner:
         self.monitor_task = None
         self.form_refresh_task = None
         if not self._fast_fired:
-            await self._clear_prearmed_payment_guards()
-        runtime.active = False
+            runtime.active = False
         runtime.started_at = None
         if not preserve_resume:
             await asyncio.to_thread(_clear_scanner_resume_marker)
@@ -4547,8 +4289,7 @@ class Scanner:
             runtime.started_at = None
             await self._stop_payment_form_refresh_worker()
             if not self._fast_fired:
-                await self._clear_prearmed_payment_guards()
-            self._leave_fast_quiet()
+                    self._leave_fast_quiet()
             cluster_runtime.disarm()
             cluster_runtime.notify_state_changed()
             self.task = None
@@ -4743,34 +4484,6 @@ class Scanner:
                     + "; оплата не отправлена"
                 )
 
-            guard_payload = _load_payment_submission_guard()
-            guard_matches = False
-            if guard_payload is not None:
-                wanted = {item.saved_id for item in candidates}
-                for entry in guard_payload.get("entries", []):
-                    if not isinstance(entry, dict):
-                        continue
-                    if (
-                        str(entry.get("slug", "")).strip() == slug
-                        and _int_or_none(entry.get("target")) == int(target)
-                        and set(_unique_ints(entry.get("saved_ids", []))) == wanted
-                    ):
-                        guard_matches = True
-                        self._payment_guard_id = _str_or_none(guard_payload.get("guard_id"))
-                        self._payment_guard_keys.add((slug, int(target)))
-                        break
-            if not guard_matches:
-                # Normally armed 25 numbers earlier. This synchronous fallback is
-                # intentionally fail-closed for a lagging UDP follower: no Stars
-                # request may leave the process without a durable restart guard.
-                self._payment_guard_id = add_payment_submission_guard_entry(
-                    slug=slug,
-                    target=target,
-                    saved_ids=[item.saved_id for item in candidates],
-                    campaign_id=campaign_id,
-                )
-                self._payment_guard_keys.add((slug, int(target)))
-
             if client is None or not client.is_connected():
                 raise RuntimeError("FAST MTProto-соединение не готово; оплата не отправлена")
             rate_limit.assert_available()
@@ -4779,34 +4492,10 @@ class Scanner:
                 raise
             local_error = exc
 
-        # ARMED guards are safe while waiting. Flip to SUBMITTED only at the
-        # last possible pre-send point, after every other preflight check passed.
-        # This fixes the v0038 false payment-hold after watchdog restarts near a
-        # target. The tiny durable write happens once per volley, not per shot.
-        if local_error is None and client is not None:
-            guard_mark_started = time.perf_counter()
-            try:
-                self._payment_guard_id = mark_payment_submission_guard_submitted(
-                    slug=slug,
-                    target=target,
-                    saved_ids=[item.saved_id for item in candidates],
-                )
-                record_payment_event(
-                    "fast_payment_guard_submitted",
-                    slug=slug,
-                    target=target,
-                    saved_ids=[item.saved_id for item in candidates],
-                    durable_mark_ms=round((time.perf_counter() - guard_mark_started) * 1000.0, 3),
-                )
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                    raise
-                local_error = exc
-
         launch_started = time.perf_counter()
         if local_error is None and client is not None:
             # Fallback timestamp for adapters/tests. The production
-            # MTProtoService overwrites it at each actual staggered sender queue call.
+            # MTProtoService overwrites it at each actual sequential sender queue call.
             scheduled_ns = time.perf_counter_ns()
             for plan in plans:
                 plan.fast_send_started_ns = scheduled_ns
@@ -4868,19 +4557,10 @@ class Scanner:
                 error=runtime.last_error[:300],
             )
             store.settings.live_upgrades = False
-            preflight_saved = False
-            if self._payment_guard_id:
-                store.settings.payment_guard_token = self._payment_guard_id
             try:
                 await store.save()
-                preflight_saved = True
             except Exception:
                 logger.exception("fast_preflight_state_save_failed")
-            if preflight_saved and self._payment_guard_keys:
-                with contextlib.suppress(OSError):
-                    await asyncio.to_thread(clear_payment_submission_guard)
-                    self._payment_guard_keys.clear()
-                    self._payment_guard_id = None
             with contextlib.suppress(Exception):
                 await self.notify(
                     "⚠️ Локальный FAST-залп не отправлен, но сигнал другим стрелкам передан. "
@@ -4888,7 +4568,7 @@ class Scanner:
                 )
             return
 
-        # Yield directly into the staggered FAST task: no logging, disk write or
+        # Yield directly into the sequential FAST task: no logging, disk write or
         # UI work occurs before the payment pipeline gets its first event-loop
         # turn. Once a financial request is launched, a manual Stop must not
         # cancel it midway.
@@ -4957,7 +4637,7 @@ class Scanner:
         ]
         logger.warning(
             "fast_volley_completed shooter_id=%s source=%s campaign_id=%s slug=%s predecessor=%s target=%s "
-            "volley=%s volley_limit=%s stagger_ms=%s udp_peers_sent=%s first_send_start_ms=%.3f task_launch_ms=%.3f outcomes=%s",
+            "volley=%s volley_limit=%s dispatch_mode=%s udp_peers_sent=%s first_send_start_ms=%.3f task_launch_ms=%.3f outcomes=%s",
             SHOOTER_ID,
             source,
             campaign_id,
@@ -4966,7 +4646,7 @@ class Scanner:
             target,
             volley_size,
             effective_max_volley_size(),
-            effective_fast_volley_stagger_ms(),
+            fast_dispatch_mode(),
             peers_sent,
             runtime.fast_first_send_start_ms or 0.0,
             runtime.fast_task_launch_ms or 0.0,
@@ -4981,7 +4661,8 @@ class Scanner:
             target=target,
             volley=volley_size,
             volley_limit=effective_max_volley_size(),
-            stagger_ms=effective_fast_volley_stagger_ms(),
+            dispatch_mode=fast_dispatch_mode(),
+            fast_wait_response=effective_fast_wait_response(),
             first_send_start_ms=runtime.fast_first_send_start_ms,
             task_launch_ms=runtime.fast_task_launch_ms,
             send_start_offsets_ms=offsets,
@@ -4996,7 +4677,8 @@ class Scanner:
             target=target,
             volley=volley_size,
             volley_limit=effective_max_volley_size(),
-            stagger_ms=effective_fast_volley_stagger_ms(),
+            dispatch_mode=fast_dispatch_mode(),
+            fast_wait_response=effective_fast_wait_response(),
             udp_peers_sent=peers_sent,
             first_send_start_ms=runtime.fast_first_send_start_ms,
             task_launch_ms=runtime.fast_task_launch_ms,
@@ -5066,22 +4748,11 @@ class Scanner:
             runtime.last_error = "; ".join(details)[:500] or "FAST-залп не подтверждён"
 
         save_error: Exception | None = None
-        if self._payment_guard_id:
-            store.settings.payment_guard_token = self._payment_guard_id
         try:
             await store.save()
         except Exception as exc:
             save_error = exc
             logger.exception("fast_volley_state_save_failed")
-        else:
-            if self._payment_guard_keys:
-                try:
-                    await asyncio.to_thread(clear_payment_submission_guard)
-                except OSError:
-                    logger.exception("payment_submission_guard_clear_failed")
-                else:
-                    self._payment_guard_keys.clear()
-                    self._payment_guard_id = None
 
         await asyncio.to_thread(_clear_scanner_resume_marker)
 
@@ -7576,7 +7247,7 @@ def _full_log_snapshot_paths() -> list[Path]:
         DIAGNOSTICS_PATH,
         CATALOG_REPORT_PATH,
         RATE_LIMIT_PATH,
-        PAYMENT_GUARD_PATH,
+        LEGACY_PAYMENT_GUARD_PATH,
         SCANNER_RESUME_PATH,
         provision_store.config_path,
         provision_store.generation_path,
@@ -8013,8 +7684,8 @@ async def live_preflight(*, prepare: bool) -> str:
     warning = ""
     if operation_count > 1:
         warning = (
-            f"\n⚠️ Залп {operation_count}: запросы уйдут с шагом "
-            f"{effective_fast_volley_stagger_ms()} мс по одному номеру выстрела. "
+            f"\n⚠️ Залп {operation_count}: запросы уйдут последовательно NEXT-TICK — "
+            "следующий ставится после отправки предыдущего, но без ожидания ответа Telegram. "
             f"Максимальное списание — {paid_total} ⭐; часть подарков может получить следующие номера."
         )
 
@@ -8026,7 +7697,7 @@ async def live_preflight(*, prepare: bool) -> str:
         f"Текущий номер: <b>{counter.current}</b>\n"
         f"Выстрел FAST-залпа: <b>#{future_targets[0]}</b>\n"
         f"Размер залпа: <b>{operation_count}</b>\n"
-        f"Разница отправки FAST: <b>{effective_fast_volley_stagger_ms()} мс</b>\n"
+        "FAST-dispatch: <b>NEXT-TICK</b> · фиксированной задержки нет\n"
         f"Возможное списание: <b>{payment_text}</b>\n"
         f"Лимит одной операции: <b>{limit_text}</b>"
         f"{warning}\n\n"
@@ -8121,7 +7792,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0039 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0041 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -8445,15 +8116,26 @@ async def ping_handler(message: Message) -> None:
 
 
 def settings_summary_text() -> str:
+    wait_response = effective_fast_wait_response()
+    if wait_response:
+        dispatch_line = (
+            "FAST-dispatch: <b>ОТВЕТ ON</b> · RESPONSE-CHAIN\n"
+            "SEND #1 → только RPC-ответ Telegram → сразу SEND #2; "
+            "между ответом и следующим payment нет NFT-проверки, UI, guard или фиксированной паузы."
+        )
+    else:
+        dispatch_line = (
+            "FAST-dispatch: <b>ОТВЕТ OFF</b> · NEXT-TICK\n"
+            "Следующий payment ставится после queue предыдущего и одного оборота event loop; "
+            "ответ предыдущего платежа не ожидается."
+        )
     return (
         f"⚙️ <b>Настройки {APP_NAME} {APP_VERSION}</b>\n"
         f"FAST-залп: <b>{effective_volley_size()}</b>\n"
-        f"Разница отправки платежей: <b>{effective_fast_volley_stagger_ms()} мс</b>\n"
-        f"Тихий режим: <b>{FAST_QUIET_DISTANCE} номеров</b> до цели\n"
-        f"FAST-формы: <b>5 мин</b> далеко / <b>2 мин</b> в зоне ≤50\n\n"
-        f"Изменить задержку: <code>/stagger 10</code>\n"
-        f"Допустимо: <b>0–{MAX_FAST_VOLLEY_STAGGER_MS} мс</b>. "
-        "0 мс = одновременная постановка запросов. Изменение доступно только при остановленном сканере."
+        + dispatch_line
+        + "\nGuard: <b>полностью отключён</b> в критическом пути\n"
+        + f"Тихий режим: <b>{FAST_QUIET_DISTANCE} номеров</b> до цели\n"
+        + "FAST-формы: <b>5 мин</b> далеко / <b>2 мин</b> в зоне ≤50"
     )
 
 
@@ -8471,15 +8153,62 @@ async def help_handler(message: Message) -> None:
         return
     await message.answer(
         f"📖 <b>{APP_NAME} {APP_VERSION} — команды</b>\n"
-        f"<code>/stagger 10</code> — разница между стартом соседних FAST-платежей в миллисекундах; "
-        f"по умолчанию {DEFAULT_FAST_VOLLEY_STAGGER_MS} мс, диапазон 0–{MAX_FAST_VOLLEY_STAGGER_MS}.\n"
-        "<code>/stagger</code> — показать текущее значение.\n"
         "<code>/settings</code> — показать рабочие настройки.\n"
+        "<code>/otvet</code> — показать режим второго и следующих платежей.\n"
+        "<code>/otvet off</code> — по умолчанию NEXT-TICK: следующий payment без ожидания ответа Telegram.\n"
+        "<code>/otvet on</code> — RESPONSE-CHAIN: следующий payment сразу после RPC-ответа предыдущего.\n"
         "<code>/log_full</code> — выгрузить полный лог за последние 24 часа.\n"
-        "Кнопка <b>🗑 Сброс</b> — полный рабочий сброс: удаляет payment hold/guard, cooldown, цели, подарки, LIVE и временное состояние; авторизация и MTProto-session сохраняются.\n"
+        "<code>/stagger</code> — фиксированный stagger отключён; используется /otvet.\n"
+        "Кнопка <b>🗑 Сброс</b> — полный рабочий сброс: удаляет payment hold, cooldown, цели, подарки, LIVE и временное состояние; авторизация и MTProto-session сохраняются. /otvet после сброса снова OFF.\n"
         "<code>/version</code> — показать версию.\n\n"
-        "Задержка FAST меняется только при остановленном сканере. При изменении включённый LIVE автоматически выключается, "
-        "чтобы новый режим был подтверждён повторным включением оплаты.",
+        "Guard полностью убран из критического пути в обоих FAST-режимах.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(Command("otvet"))
+async def otvet_handler(message: Message) -> None:
+    if not await owner_guard_message(message):
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) == 1 or not parts[1].strip():
+        state = "ON" if effective_fast_wait_response() else "OFF"
+        mode = "RESPONSE-CHAIN" if effective_fast_wait_response() else "NEXT-TICK"
+        await message.answer(
+            f"⚡ /otvet сейчас: <b>{state}</b> · {mode}\n"
+            "OFF — следующий payment без ожидания ответа Telegram.\n"
+            "ON — следующий payment ставится сразу после raw RPC-ответа предыдущего.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    value = parts[1].strip().lower()
+    if value not in {"on", "off"}:
+        await message.answer("Использование: <code>/otvet on</code> или <code>/otvet off</code>.", reply_markup=main_keyboard())
+        return
+
+    enabled = value == "on"
+    changed = store.settings.fast_wait_response != enabled
+    if changed and runtime.active:
+        await scanner.stop("otvet_mode_change")
+    if changed:
+        store.settings.fast_wait_response = enabled
+        store.settings.live_upgrades = False
+        scanner.prepared.clear()
+        await store.save()
+        scanner._plan_dirty = True
+        cluster_runtime.notify_state_changed()
+        record_cluster_event(
+            "fast_otvet_mode_changed",
+            enabled=enabled,
+            dispatch_mode=fast_dispatch_mode(),
+        )
+
+    state = "ON" if enabled else "OFF"
+    mode = "RESPONSE-CHAIN" if enabled else "NEXT-TICK"
+    suffix = " LIVE выключен — включи оплату заново." if changed else ""
+    await message.answer(
+        f"✅ /otvet <b>{state}</b> · {mode}.{suffix}",
         reply_markup=main_keyboard(),
     )
 
@@ -8488,58 +8217,11 @@ async def help_handler(message: Message) -> None:
 async def stagger_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
-    if await reject_changes_while_running_message(message):
-        return
-    if store.settings.payment_hold_saved_ids:
-        await message.answer(PENDING_PAYMENT_HOLD_MESSAGE, reply_markup=main_keyboard())
-        return
-
-    text = (message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) == 1:
-        await message.answer(
-            f"⏱ Разница отправки FAST сейчас: <b>{effective_fast_volley_stagger_ms()} мс</b>.\n"
-            f"Изменить: <code>/stagger 10</code> (0–{MAX_FAST_VOLLEY_STAGGER_MS} мс).",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    raw = parts[1].strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        await message.answer(
-            f"Нужно целое число миллисекунд от 0 до {MAX_FAST_VOLLEY_STAGGER_MS}. "
-            "Пример: <code>/stagger 10</code>.",
-            reply_markup=main_keyboard(),
-        )
-        return
-    if not 0 <= value <= MAX_FAST_VOLLEY_STAGGER_MS:
-        await message.answer(
-            f"Допустимый диапазон: 0–{MAX_FAST_VOLLEY_STAGGER_MS} мс.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    live_was_enabled = bool(store.settings.live_upgrades)
-    store.settings.fast_volley_stagger_ms = value
-    if live_was_enabled:
-        store.settings.live_upgrades = False
-        scanner.prepared.clear()
-    await store.save()
-    cluster_runtime.notify_state_changed()
-    logger.info(
-        "fast_volley_stagger_changed shooter_id=%s stagger_ms=%s live_disabled=%s",
-        SHOOTER_ID, value, live_was_enabled,
-    )
-    record_payment_event(
-        "fast_volley_stagger_changed",
-        stagger_ms=value,
-        live_disabled=live_was_enabled,
-    )
-    suffix = "\n🛡 LIVE выключен — включи оплату заново." if live_was_enabled else ""
     await message.answer(
-        f"✅ Разница отправки FAST установлена: <b>{value} мс</b>.{suffix}",
+        "⏱ Фиксированный stagger в v0041 отключён. Используй <code>/otvet off</code> для NEXT-TICK "
+        "или <code>/otvet on</code> для цепочки «RPC-ответ предыдущего → сразу следующий payment». "
+        "Фактическая разница пишется в <code>/log_full</code> как queue_offsets_ms/queue_deltas_ms; "
+        "в режиме ON также пишется response_offsets_ms.",
         reply_markup=main_keyboard(),
     )
 
@@ -8574,7 +8256,7 @@ async def reset_handler(message: Message) -> None:
         return
     await message.answer(
         "🗑 <b>ПОЛНЫЙ рабочий сброс</b> удалит канал, выбранные подарки, цели, LIVE, "
-        "payment hold/guard, cooldown, resume-marker, кеши и временное состояние.\n\n"
+        "payment hold, cooldown, resume-marker, кеши и временное состояние.\n\n"
         "⚠️ Даже неподтверждённый payment hold будет удалён. Используй это как аварийный "
         "сброс только когда понимаешь, что старый платёж не надо повторять.\n\n"
         "Сохранятся только авторизация владельца бота, TG_API_ID/TG_API_HASH/телефон, "
@@ -8592,7 +8274,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         await scanner.stop("reset")
         await stress_tester.stop("reset")
         # Explicit emergency reset is the one place allowed to discard payment
-        # holds/guards. Authorization/session files are never touched.
+        # holds. Authorization/session files are never touched.
         await asyncio.to_thread(clear_full_operational_files)
         rate_limit.reset()
         await store.reset_operational()
@@ -8608,8 +8290,6 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         scanner._counter_meta.clear()
         scanner._campaign_ids_by_slug.clear()
         scanner._slug_by_campaign_id.clear()
-        scanner._payment_guard_keys.clear()
-        scanner._payment_guard_id = None
         scanner._reset_critical_form_state()
         scanner._form_refresh_retry_after.clear()
         scanner._fast_fired = False
@@ -8635,7 +8315,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Сброшено; авторизация сохранена")
         if callback.message:
             await callback.message.answer(
-                "🗑 Полный рабочий сброс выполнен. Payment hold/guard, cooldown и временное состояние очищены. Авторизация бота и Telegram-сессия сохранены.\n"
+                "🗑 Полный рабочий сброс выполнен. Payment hold, cooldown и временное состояние очищены. Авторизация бота и Telegram-сессия сохранены.\n"
                 "Сначала выбери канал, затем подарок и номер выстрела.",
                 reply_markup=main_keyboard(),
             )
@@ -8888,7 +8568,7 @@ async def write_diagnostics() -> None:
         },
         "live_upgrades": store.settings.live_upgrades,
         "scanner_resume_marker_present": SCANNER_RESUME_PATH.exists(),
-        "payment_guard_present": PAYMENT_GUARD_PATH.exists(),
+        "legacy_payment_guard_present": LEGACY_PAYMENT_GUARD_PATH.exists(),
         "max_upgrade_stars": MAX_UPGRADE_STARS,
         "fast_quiet_distance": FAST_QUIET_DISTANCE,
         "fast_disable_gc": FAST_DISABLE_GC,
@@ -8920,7 +8600,8 @@ async def write_diagnostics() -> None:
             "selected_saved_ids": store.settings.selected_saved_ids,
             "target_numbers": store.settings.target_numbers,
             "volley_size": store.settings.volley_size,
-            "fast_volley_stagger_ms": effective_fast_volley_stagger_ms(),
+            "fast_dispatch_mode": fast_dispatch_mode(),
+            "fast_wait_response": effective_fast_wait_response(),
             "api_id_present": bool(store.settings.api_id),
             "api_hash_present": bool(store.settings.api_hash),
             "phone_present": bool(store.settings.phone),
@@ -8944,8 +8625,7 @@ async def _auto_resume_scanner_after_crash(bot: Bot) -> bool:
     if marker is None:
         return False
 
-    # A SUBMITTED/legacy payment guard intentionally disables LIVE during module
-    # startup. Never auto-resume across an ambiguous financial result.
+    # Never auto-resume across an already-known ambiguous financial result.
     if store.settings.payment_hold_saved_ids or not store.settings.live_upgrades:
         logger.warning(
             "scanner_auto_resume_skipped live=%s holds=%s",
@@ -8986,7 +8666,8 @@ async def _auto_resume_scanner_after_crash(bot: Bot) -> bool:
         saved_ids=list(store.settings.selected_saved_ids),
         live=bool(store.settings.live_upgrades),
         volley=effective_volley_size(),
-        stagger_ms=effective_fast_volley_stagger_ms(),
+        dispatch_mode=fast_dispatch_mode(),
+        fast_wait_response=effective_fast_wait_response(),
     )
     owner = store.settings.owner_user_id
     if owner is not None:
