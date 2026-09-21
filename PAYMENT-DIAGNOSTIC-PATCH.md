@@ -1,6 +1,6 @@
-# Payment diagnostics and FAST volley — v0038
+# Payment diagnostics and FAST volley — v0039
 
-v0038 hardens multi-payment Stars volleys after the production `#444665` run.
+v0039 hardens multi-payment Stars volleys after the production `#444665` run.
 
 ## Что изменено
 
@@ -10,7 +10,7 @@ v0038 hardens multi-payment Stars volleys after the production `#444665` run.
 - Настройка `fast_volley_stagger_ms` сохраняется в `settings.json`; `/stagger 10` меняет её, `/settings` и `/help` показывают управление.
 - `invokeAfterMsg`/ordered dependency не используются, поэтому старой задержки порядка `521.728` мс нет.
 - Финансовый submit не использует client-level request retry. Неоднозначный результат не вызывает автоматический повтор платежа.
-- `gift-hunter-v0038-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_dispatched`, `fast_payment_batch_finished`, `stagger_ms`, реальные `queue_offsets_ms`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
+- `gift-hunter-v0039-payment-audit.jsonl` пишет `fast_payment_batch_started`, `fast_payment_batch_dispatched`, `fast_payment_batch_finished`, `stagger_ms`, реальные `queue_offsets_ms`, binding-поля, возраст формы, send-start и итог каждого экземпляра.
 - Между созданием локальной batch-task и prebuilt UDP FIRE по-прежнему нет await/log/disk I/O.
 
 ## Разбор production-сбоя v0034

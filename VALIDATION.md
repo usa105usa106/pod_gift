@@ -1,8 +1,20 @@
-# Validation — Gift Hunter v0038
+# Validation — Gift Hunter v0039
+
+## Restart/guard/reset hotfix — 21 сентября 2026
+
+Production-log v0038 показал watchdog stall `92.679` с до выстрела. На момент stall FAST-формы были только заранее подготовлены: в полном журнале не было ни одного `SendStarsForm` для текущего залпа. Однако старый pre-submit guard существовал уже в hot zone, и после рестарта v0038 ошибочно преобразовал оба чистых `saved_id` в `payment_hold`. Повторное «Обновить» не могло снять hold, потому что подарки закономерно оставались обычными.
+
+v0039 разделяет durable guard на два состояния. `ARMED` создаётся при подготовке форм и не означает факт оплаты. `SUBMITTED` записывается последней durable-операцией перед фактическим запуском FAST batch. Startup recovery игнорирует/очищает только `ARMED`, а `SUBMITTED` и legacy guard без состояния остаются fail-closed. Отдельные regression-тесты проверяют оба сценария.
+
+Для watchdog-restart добавлен durable `scanner-resume.json`. Hard exit через watchdog не выполняет graceful `scanner.stop()`, поэтому marker остаётся; после нового запуска план и FAST-формы пересобираются автоматически. Manual stop, полный Reset и завершённый залп удаляют marker; shutdown/redeploy активного сканера сохраняет его для автоматического продолжения. Watchdog теперь пишет `faulthandler.dump_traceback(all_threads=True)` в watchdog-log перед `os._exit(70)`.
+
+Кнопка `🗑 Сброс` теперь намеренно является аварийным escape hatch: очищает payment hold/guard, rate-limit/cooldown, resume-marker и остальное рабочее состояние, но не удаляет owner binding, API credentials, phone или MTProto session-файлы. Исторические логи сохраняются для диагностики.
+
+Финальный локальный прогон после изменений: `200` тестов `OK`; дополнительно проходят `py_compile`, `compileall`, AST и YAML compose. Живой Telegram/Stars submit в офлайн-валидации не выполнялся.
 
 ## FAST micro-stagger hotfix — 20 сентября 2026
 
-Живой тест v0036 подтвердил проблему полного совпадения payment-submit: две разные свежие формы для двух разных `saved_id` были поставлены в MTProto sender с одинаковым стартом `+2.145` мс после trigger. Один запрос подтвердил `#444776`, второй получил `FORM_SUBMIT_DUPLICATE`. Это произошло без reconnect, при разных `form_id` и свежих формах, поэтому v0038 разводит соседние `sendStarsForm` по времени.
+Живой тест v0036 подтвердил проблему полного совпадения payment-submit: две разные свежие формы для двух разных `saved_id` были поставлены в MTProto sender с одинаковым стартом `+2.145` мс после trigger. Один запрос подтвердил `#444776`, второй получил `FORM_SUBMIT_DUPLICATE`. Это произошло без reconnect, при разных `form_id` и свежих формах, поэтому v0039 разводит соседние `sendStarsForm` по времени.
 
 Production path остаётся прямым через `TelegramClient._sender` и `ordered=False`, но теперь запросы ставятся по одному с настраиваемым шагом. Значение по умолчанию — `10` мс. Между submit нет ожидания ответа предыдущего платежа и нет `invokeAfterMsg`; для залпа из 5 локальные queue-start ожидаются примерно `0/10/20/30/40` мс относительно первого. Реальный scheduler может добавить небольшую положительную задержку.
 
@@ -34,7 +46,7 @@ OK
 
 Также выполнены `compileall`, AST-разбор Python и YAML-разбор `docker-compose.yaml`. Живые Telegram/Stars-платежи в офлайн-проверке не выполнялись.
 
-## Финальный аудит v0038 — проверка 18 сентября 2026
+## Финальный аудит v0039 — проверка 18 сентября 2026
 
 Полный локальный regression-run после смены версии и исправления только критичных payment-safety edge-cases:
 
@@ -149,7 +161,7 @@ logic.py: 92%
 main.py: 57%
 ```
 
-## Критические исправления v0038
+## Критические исправления v0039
 
 ### Формы Stars при длительном ожидании и залп 50
 

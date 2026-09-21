@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import gc
+import faulthandler
 import html
 import inspect
 import json
@@ -88,7 +89,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0038"
+APP_VERSION = "v0039"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -101,6 +102,7 @@ STRESS_HISTORY_PATH = DATA_DIR / "stress-tests.jsonl"
 CATALOG_REPORT_PATH = DATA_DIR / "catalog-numbers-latest.json"
 RATE_LIMIT_PATH = DATA_DIR / "rate-limit.json"
 PAYMENT_GUARD_PATH = DATA_DIR / "payment-submit-guard.json"
+SCANNER_RESUME_PATH = DATA_DIR / "scanner-resume.json"
 PENDING_PAYMENT_HOLD_MESSAGE = (
     "Есть платёж с неподтверждённым результатом. Повторная оплата и изменение "
     "связанных настроек заблокированы до сверки с Telegram."
@@ -762,8 +764,6 @@ class SettingsStore:
         fields reset by default instead of being accidentally retained.
         """
         current = self.settings
-        if current.payment_hold_saved_ids:
-            raise RuntimeError(PENDING_PAYMENT_HOLD_MESSAGE)
 
         replacement = Settings(
             version=APP_VERSION,
@@ -884,6 +884,18 @@ class RateLimitStore:
             self.updated_at = time.time()
             self._save()
 
+    def reset(self) -> None:
+        """Forget every persisted FloodWait/cooldown during an explicit full reset."""
+        self.blocked_until = 0.0
+        self.source = None
+        self.wait_seconds = 0.0
+        self.updated_at = time.time()
+        try:
+            self.path.unlink(missing_ok=True)
+            _fsync_parent(self.path)
+        except OSError as exc:
+            logger.warning("rate_limit_state_reset_failed error=%s", exc)
+
     def _save(self) -> None:
         payload = {
             "blocked_until": self.blocked_until,
@@ -954,6 +966,12 @@ def _load_payment_submission_guard(path: Path = PAYMENT_GUARD_PATH) -> dict[str,
                 raise PaymentGuardStateError(f"payment guard entry has invalid target {path}")
             if not _unique_ints(entry.get("saved_ids", [])):
                 raise PaymentGuardStateError(f"payment guard entry has no saved_ids {path}")
+            state = _str_or_none(entry.get("state"))
+            # v0038 had no state field. Treat that legacy shape as unknown on
+            # recovery (fail closed), but accept it here so the Reset button can
+            # still clear it after an upgrade. New v0039 entries are explicit.
+            if state is not None and state not in {"armed", "submitted"}:
+                raise PaymentGuardStateError(f"payment guard entry has invalid state {path}")
         return payload
 
 
@@ -973,7 +991,7 @@ def add_payment_submission_guard_entry(
     """
     with PAYMENT_GUARD_LOCK:
         payload = _load_payment_submission_guard(path) or {}
-        # Every durable mutation gets a fresh generation token.  If clearing an
+        # Every new ARMED generation gets a fresh token.  If clearing an
         # already-confirmed guard failed and a later run arms another payment,
         # the old token stored in settings.json must never make startup mistake
         # the newer submission for stale cleanup residue.
@@ -991,6 +1009,7 @@ def add_payment_submission_guard_entry(
                 "target": key_target,
                 "saved_ids": _unique_ints(saved_ids),
                 "campaign_id": _str_or_none(campaign_id),
+                "state": "armed",
                 "armed_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1009,6 +1028,64 @@ def add_payment_submission_guard_entry(
         temp.replace(path)
         os.chmod(path, 0o600)
         _fsync_parent(path)
+        return guard_id
+
+
+def mark_payment_submission_guard_submitted(
+    *,
+    slug: str,
+    target: int,
+    saved_ids: Iterable[int],
+    path: Path = PAYMENT_GUARD_PATH,
+) -> str:
+    """Durably switch one pre-armed volley to SUBMITTED immediately before send.
+
+    ARMED means payment forms exist but no Stars RPC has been dispatched. A
+    watchdog/container restart while only ARMED is therefore safe and must not
+    create a payment hold. SUBMITTED is written as the last durable preflight
+    operation before the first sender call; a restart after that point stays
+    fail-closed because a payment may have reached Telegram.
+    """
+    with PAYMENT_GUARD_LOCK:
+        payload = _load_payment_submission_guard(path)
+        if payload is None:
+            raise PaymentGuardStateError("payment guard disappeared before submit")
+        key_slug = str(slug).strip()
+        key_target = int(target)
+        wanted = set(_unique_ints(saved_ids))
+        if not wanted:
+            raise PaymentGuardStateError("payment guard submit has no saved_ids")
+        match: dict[str, Any] | None = None
+        for entry in payload.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            if (
+                str(entry.get("slug", "")).strip() == key_slug
+                and _int_or_none(entry.get("target")) == key_target
+                and set(_unique_ints(entry.get("saved_ids", []))) == wanted
+            ):
+                match = entry
+                break
+        if match is None:
+            raise PaymentGuardStateError(
+                f"payment guard entry missing before submit: slug={key_slug} target={key_target}"
+            )
+        match["state"] = "submitted"
+        match["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        payload["version"] = APP_VERSION
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        temp = path.with_name(path.name + ".tmp")
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
+        temp.replace(path)
+        os.chmod(path, 0o600)
+        _fsync_parent(path)
+        guard_id = _str_or_none(payload.get("guard_id"))
+        if guard_id is None:
+            raise PaymentGuardStateError("payment guard lost guard_id before submit")
         return guard_id
 
 
@@ -1055,12 +1132,10 @@ def _recover_settings_from_payment_guard(settings: Settings) -> None:
         payload = _load_payment_submission_guard()
     except PaymentGuardStateError as exc:
         # Keep the bot controllable for diagnostics, but fail closed for LIVE.
-        # Scanner.start() and every guard arm also reject the malformed state,
-        # so no Stars request can leave while the durable evidence is unreadable.
         settings.live_upgrades = False
         settings.payment_hold_reason = (
             "Persistent payment guard повреждён или недоступен; LIVE заблокирован "
-            "до исправления payment-submit-guard.json"
+            "до полного сброса/исправления payment-submit-guard.json"
         )
         logger.critical("payment_submission_guard_invalid error=%s", exc)
         return
@@ -1068,8 +1143,7 @@ def _recover_settings_from_payment_guard(settings: Settings) -> None:
         return
     guard_id = _str_or_none(payload.get("guard_id"))
     # A matching token means the exact post-volley state already reached
-    # settings.json; a leftover guard is only an unlink failure and must not
-    # resurrect candidates that were confirmed or definitively failed.
+    # settings.json; a leftover guard is only an unlink failure.
     if guard_id is not None and guard_id == settings.payment_guard_token:
         with contextlib.suppress(OSError):
             clear_payment_submission_guard()
@@ -1077,31 +1151,126 @@ def _recover_settings_from_payment_guard(settings: Settings) -> None:
 
     guarded: list[int] = []
     targets = dict(settings.payment_hold_targets)
+    armed_keys: set[tuple[str, int]] = set()
+    legacy_unknown = False
     for entry in payload.get("entries", []):
         if not isinstance(entry, dict):
             continue
+        slug = str(entry.get("slug", "")).strip()
         target = _positive_int_or_none(entry.get("target"))
         ids = _unique_ints(entry.get("saved_ids", []))
+        state = _str_or_none(entry.get("state"))
+        if state == "armed":
+            # No Stars RPC was sent. A watchdog restart while waiting near the
+            # target must never turn clean ammunition into a false payment hold.
+            if slug and target is not None:
+                armed_keys.add((slug, target))
+            logger.warning(
+                "payment_submission_guard_armed_recovered_safe slug=%s target=%s saved_ids=%s",
+                slug, target, ids,
+            )
+            continue
+        # state == submitted is a real ambiguous payment window. A v0038 guard
+        # has no state at all, so it remains fail-closed as legacy/unknown.
+        if state is None:
+            legacy_unknown = True
         guarded.extend(ids)
         if target is not None:
             for saved_id in ids:
                 targets[str(saved_id)] = target
+
+    if armed_keys:
+        try:
+            remove_payment_submission_guard_entries(armed_keys)
+        except OSError as exc:
+            logger.error("payment_submission_guard_armed_cleanup_failed error=%s", exc)
+
     guarded = _unique_ints(guarded)
     if not guarded:
+        # All surviving entries were ARMED only; they are safe to discard and
+        # LIVE remains exactly as persisted in settings.json for auto-resume.
         return
     settings.payment_hold_saved_ids = _unique_ints([*settings.payment_hold_saved_ids, *guarded])
     settings.payment_hold_targets = targets
     settings.payment_hold_reason = (
-        "Обнаружен незавершённый persistent pre-submit guard; повторная оплата "
-        "заблокирована до сверки с Telegram"
+        "Обнаружен SUBMITTED payment guard после аварийного перезапуска; повторная "
+        "оплата заблокирована до сверки с Telegram"
+        if not legacy_unknown
+        else
+        "Обнаружен guard старой версии с неизвестным фактом submit; повторная оплата "
+        "заблокирована до сверки или явного полного сброса"
     )
     settings.payment_verification_url = None
     settings.live_upgrades = False
     logger.error(
-        "payment_submission_guard_recovered guard_id=%s saved_ids=%s",
-        guard_id,
-        guarded,
+        "payment_submission_guard_recovered guard_id=%s saved_ids=%s legacy_unknown=%s",
+        guard_id, guarded, legacy_unknown,
     )
+
+
+def _write_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> None:
+    payload = {
+        "version": APP_VERSION,
+        "shooter_id": SHOOTER_ID,
+        "selected_saved_ids": list(store.settings.selected_saved_ids),
+        "target_numbers": list(store.settings.target_numbers),
+        "live_upgrades": bool(store.settings.live_upgrades),
+        "volley_size": int(store.settings.volley_size),
+        "fast_volley_stagger_ms": int(store.settings.fast_volley_stagger_ms),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+    os.chmod(path, 0o600)
+    _fsync_parent(path)
+
+
+def _load_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("scanner_resume_marker_read_failed error=%s", exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _clear_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        _fsync_parent(path)
+    except OSError as exc:
+        logger.error("scanner_resume_marker_clear_failed error=%s", exc)
+
+
+def clear_full_operational_files() -> None:
+    """Clear every local operational/safety artifact while preserving auth/session/logs."""
+    # Historical logs/payment audit are deliberately retained: they do not affect
+    # runtime behaviour and are useful after a bug. Authorization *.session files
+    # are never touched.
+    for path in (
+        PAYMENT_GUARD_PATH,
+        SCANNER_RESUME_PATH,
+        RATE_LIMIT_PATH,
+        DIAGNOSTICS_PATH,
+        HEARTBEAT_PATH,
+        STRESS_REPORT_PATH,
+        STRESS_HISTORY_PATH,
+        CATALOG_REPORT_PATH,
+    ):
+        try:
+            path.unlink(missing_ok=True)
+            path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            path.with_suffix(".tmp").unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("full_reset_file_cleanup_failed path=%s error=%s", path, exc)
+    _fsync_parent(DATA_DIR / ".")
 
 
 def current_rss_mb() -> float:
@@ -2490,7 +2659,7 @@ class MTProtoService:
         Live simultaneous-burst testing showed that truly simultaneous ``sendStarsForm``
         requests can collide with Telegram's duplicate-payment protection: one
         request succeeds while another may return ``FORM_SUBMIT_DUPLICATE``.
-        v0038 keeps every form prebuilt and keeps ``ordered=False`` (so there is
+        v0039 keeps every form prebuilt and keeps ``ordered=False`` (so there is
         no ~0.5 s invokeAfterMsg/dependency delay), but queues adjacent payment
         requests a few milliseconds apart. The default is 10 ms and is persisted
         in settings via ``/stagger``.
@@ -3907,6 +4076,14 @@ class Scanner:
             await self._maybe_write_diagnostics(force=True)
             raise
 
+        try:
+            await asyncio.to_thread(_write_scanner_resume_marker)
+        except OSError as exc:
+            runtime.last_error = f"resume marker: {type(exc).__name__}: {exc}"
+            raise RuntimeError(
+                f"Не удалось записать marker восстановления сканера: {exc}"
+            ) from exc
+
         runtime.active = True
         runtime.started_at = time.monotonic()
         runtime.last_error = None
@@ -3956,6 +4133,13 @@ class Scanner:
         )
 
     async def stop(self, reason: str = "manual") -> None:
+        was_active = bool(runtime.active)
+        preserve_resume = (
+            reason == "shutdown"
+            and was_active
+            and bool(store.settings.selected_saved_ids)
+            and bool(store.settings.target_numbers)
+        )
         self.stop_event.set()
         task = self.task
         monitor = self.monitor_task
@@ -3985,6 +4169,10 @@ class Scanner:
             await self._clear_prearmed_payment_guards()
         runtime.active = False
         runtime.started_at = None
+        if not preserve_resume:
+            await asyncio.to_thread(_clear_scanner_resume_marker)
+        else:
+            logger.warning("scanner_resume_marker_preserved reason=shutdown")
         self._leave_fast_quiet()
         cluster_runtime.disarm()
         cluster_runtime.notify_state_changed()
@@ -4591,6 +4779,30 @@ class Scanner:
                 raise
             local_error = exc
 
+        # ARMED guards are safe while waiting. Flip to SUBMITTED only at the
+        # last possible pre-send point, after every other preflight check passed.
+        # This fixes the v0038 false payment-hold after watchdog restarts near a
+        # target. The tiny durable write happens once per volley, not per shot.
+        if local_error is None and client is not None:
+            guard_mark_started = time.perf_counter()
+            try:
+                self._payment_guard_id = mark_payment_submission_guard_submitted(
+                    slug=slug,
+                    target=target,
+                    saved_ids=[item.saved_id for item in candidates],
+                )
+                record_payment_event(
+                    "fast_payment_guard_submitted",
+                    slug=slug,
+                    target=target,
+                    saved_ids=[item.saved_id for item in candidates],
+                    durable_mark_ms=round((time.perf_counter() - guard_mark_started) * 1000.0, 3),
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                local_error = exc
+
         launch_started = time.perf_counter()
         if local_error is None and client is not None:
             # Fallback timestamp for adapters/tests. The production
@@ -4870,6 +5082,8 @@ class Scanner:
                 else:
                     self._payment_guard_keys.clear()
                     self._payment_guard_id = None
+
+        await asyncio.to_thread(_clear_scanner_resume_marker)
 
         lines = [
             f"⚡ <b>{APP_NAME} {APP_VERSION}: залп завершён</b>",
@@ -7363,6 +7577,7 @@ def _full_log_snapshot_paths() -> list[Path]:
         CATALOG_REPORT_PATH,
         RATE_LIMIT_PATH,
         PAYMENT_GUARD_PATH,
+        SCANNER_RESUME_PATH,
         provision_store.config_path,
         provision_store.generation_path,
         *sorted(provision_store.root.glob("hunter-*.lifecycle.json")),
@@ -7906,7 +8121,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0038 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0039 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -8261,6 +8476,7 @@ async def help_handler(message: Message) -> None:
         "<code>/stagger</code> — показать текущее значение.\n"
         "<code>/settings</code> — показать рабочие настройки.\n"
         "<code>/log_full</code> — выгрузить полный лог за последние 24 часа.\n"
+        "Кнопка <b>🗑 Сброс</b> — полный рабочий сброс: удаляет payment hold/guard, cooldown, цели, подарки, LIVE и временное состояние; авторизация и MTProto-session сохраняются.\n"
         "<code>/version</code> — показать версию.\n\n"
         "Задержка FAST меняется только при остановленном сканере. При изменении включённый LIVE автоматически выключается, "
         "чтобы новый режим был подтверждён повторным включением оплаты.",
@@ -8357,8 +8573,12 @@ async def reset_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
     await message.answer(
-        "Сбросить канал, выбранные подарки, номера выстрела, LIVE, slug-привязки и временное состояние?\n\n"
-        "Сохранятся авторизация владельца бота, TG_API_ID/TG_API_HASH/телефон и MTProto-сессия.",
+        "🗑 <b>ПОЛНЫЙ рабочий сброс</b> удалит канал, выбранные подарки, цели, LIVE, "
+        "payment hold/guard, cooldown, resume-marker, кеши и временное состояние.\n\n"
+        "⚠️ Даже неподтверждённый payment hold будет удалён. Используй это как аварийный "
+        "сброс только когда понимаешь, что старый платёж не надо повторять.\n\n"
+        "Сохранятся только авторизация владельца бота, TG_API_ID/TG_API_HASH/телефон, "
+        "MTProto *.session и исторические логи.",
         reply_markup=reset_confirm_keyboard(),
     )
 
@@ -8371,11 +8591,11 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
     if action == "yes":
         await scanner.stop("reset")
         await stress_tester.stop("reset")
-        try:
-            await store.reset_operational()
-        except RuntimeError as exc:
-            await callback.answer(str(exc)[:180], show_alert=True)
-            return
+        # Explicit emergency reset is the one place allowed to discard payment
+        # holds/guards. Authorization/session files are never touched.
+        await asyncio.to_thread(clear_full_operational_files)
+        rate_limit.reset()
+        await store.reset_operational()
 
         # Clear only operational memory.  The connected TelegramClient, its
         # authorization flag and every *.session database remain untouched.
@@ -8386,6 +8606,15 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         scanner.notified_missed.clear()
         scanner._groups.clear()
         scanner._counter_meta.clear()
+        scanner._campaign_ids_by_slug.clear()
+        scanner._slug_by_campaign_id.clear()
+        scanner._payment_guard_keys.clear()
+        scanner._payment_guard_id = None
+        scanner._reset_critical_form_state()
+        scanner._form_refresh_retry_after.clear()
+        scanner._fast_fired = False
+        scanner._fast_client = None
+        scanner._fast_peer = None
         scanner._plan_dirty = True
         scanner.status_chat_id = None
         scanner.status_message_id = None
@@ -8398,7 +8627,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         runtime.__dict__.clear()
         runtime.__dict__.update(fresh_runtime.__dict__)
         logger.info(
-            "operational_reset_complete authorization_preserved=true owner_bound=%s mtproto_configured=%s",
+            "full_operational_reset_complete authorization_preserved=true owner_bound=%s mtproto_configured=%s",
             store.settings.owner_user_id is not None,
             mtproto.configured(),
         )
@@ -8406,7 +8635,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Сброшено; авторизация сохранена")
         if callback.message:
             await callback.message.answer(
-                "🗑 Все рабочие настройки сброшены. Авторизация бота и Telegram-сессия сохранены.\n"
+                "🗑 Полный рабочий сброс выполнен. Payment hold/guard, cooldown и временное состояние очищены. Авторизация бота и Telegram-сессия сохранены.\n"
                 "Сначала выбери канал, затем подарок и номер выстрела.",
                 reply_markup=main_keyboard(),
             )
@@ -8533,9 +8762,17 @@ def _watchdog_worker() -> None:
             )
             try:
                 os.write(fd, line.encode("utf-8", errors="replace"))
+                os.write(fd, b"watchdog_stack_dump_begin\n")
+                # Dump every Python thread before the hard restart. This gives
+                # /log_full a concrete blocking stack if the event loop stalls
+                # again instead of only reporting the 90-second symptom.
+                with os.fdopen(os.dup(fd), "a", encoding="utf-8", closefd=True) as stream:
+                    faulthandler.dump_traceback(file=stream, all_threads=True)
+                    stream.flush()
+                os.write(fd, b"watchdog_stack_dump_end\n")
             finally:
                 os.close(fd)
-        except OSError:
+        except (OSError, RuntimeError):
             pass
         try:
             config = cluster_runtime.applied_config or provision_store.load_config()
@@ -8650,6 +8887,8 @@ async def write_diagnostics() -> None:
             ),
         },
         "live_upgrades": store.settings.live_upgrades,
+        "scanner_resume_marker_present": SCANNER_RESUME_PATH.exists(),
+        "payment_guard_present": PAYMENT_GUARD_PATH.exists(),
         "max_upgrade_stars": MAX_UPGRADE_STARS,
         "fast_quiet_distance": FAST_QUIET_DISTANCE,
         "fast_disable_gc": FAST_DISABLE_GC,
@@ -8698,6 +8937,67 @@ async def write_diagnostics() -> None:
         temp.replace(DIAGNOSTICS_PATH)
     except OSError as exc:
         logger.debug("diagnostics_write_failed error=%s", exc)
+
+
+async def _auto_resume_scanner_after_crash(bot: Bot) -> bool:
+    marker = await asyncio.to_thread(_load_scanner_resume_marker)
+    if marker is None:
+        return False
+
+    # A SUBMITTED/legacy payment guard intentionally disables LIVE during module
+    # startup. Never auto-resume across an ambiguous financial result.
+    if store.settings.payment_hold_saved_ids or not store.settings.live_upgrades:
+        logger.warning(
+            "scanner_auto_resume_skipped live=%s holds=%s",
+            store.settings.live_upgrades,
+            store.settings.payment_hold_saved_ids,
+        )
+        await asyncio.to_thread(_clear_scanner_resume_marker)
+        return False
+    if not store.settings.selected_saved_ids or not store.settings.target_numbers:
+        logger.warning("scanner_auto_resume_skipped reason=incomplete_settings")
+        await asyncio.to_thread(_clear_scanner_resume_marker)
+        return False
+
+    try:
+        await scanner.start()
+    except Exception as exc:
+        logger.exception("scanner_auto_resume_failed")
+        await asyncio.to_thread(_clear_scanner_resume_marker)
+        owner = store.settings.owner_user_id
+        if owner is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    owner,
+                    "⚠️ После аварийного рестарта не удалось автоматически восстановить "
+                    f"сканер: {html.escape(str(exc))}",
+                )
+        return False
+
+    logger.warning(
+        "scanner_auto_resumed_after_crash targets=%s saved_ids=%s live=%s",
+        store.settings.target_numbers,
+        store.settings.selected_saved_ids,
+        store.settings.live_upgrades,
+    )
+    record_payment_event(
+        "scanner_auto_resumed_after_crash",
+        targets=list(store.settings.target_numbers),
+        saved_ids=list(store.settings.selected_saved_ids),
+        live=bool(store.settings.live_upgrades),
+        volley=effective_volley_size(),
+        stagger_ms=effective_fast_volley_stagger_ms(),
+    )
+    owner = store.settings.owner_user_id
+    if owner is not None:
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                owner,
+                "♻️ <b>Gift Hunter восстановлен после аварийного рестарта.</b>\n"
+                "Сканер и LIVE-план автоматически пересобраны, FAST-формы получены заново.\n"
+                f"Цель: <b>{', '.join('#' + str(x) for x in store.settings.target_numbers)}</b>",
+            )
+    return True
 
 
 async def run_bot() -> None:
@@ -8752,6 +9052,7 @@ async def run_bot() -> None:
             version=APP_VERSION,
             pid=os.getpid(),
         )
+        await _auto_resume_scanner_after_crash(bot)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     except Exception as exc:
         failed = True

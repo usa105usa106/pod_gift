@@ -1,15 +1,13 @@
-Gift Hunter v0038 — Release Manifest — 10 ms FAST micro-stagger hotfix
+Gift Hunter v0039 — Release Manifest — guard/restart/full-reset hotfix
 
 Validation summary:
-- Live v0036 test: two different fresh payment forms were queued at the same +2.145 ms trigger offset; one returned FORM_SUBMIT_DUPLICATE and the other confirmed #444776.
-- v0038 keeps forms prebuilt and ordered=False, but queues adjacent SendStarsFormRequest submits with a persisted 10 ms gap by default; it does not wait for the previous payment response.
-- Production submit uses the already-connected Telethon MTProto sender directly, bypassing TelegramClient request-level retry logic for Stars submits.
-- No payment is automatically re-submitted after an RPC/transport ambiguity; results are verified/held instead.
-- New persistent setting: fast_volley_stagger_ms (0..1000), default 10 ms; /stagger, /settings, Settings button and /help are included.
-- Payment audit records stagger_ms and actual queue_offsets_ms for every volley.
-- Existing dynamic form refresh policy is unchanged: >50 numbers = 300 s; <=50 numbers = 120 s plus full forced refresh on entry.
-- Scanner/exact-number detection, quiet-zone logic and target logic are unchanged by this hotfix.
-- Full local regression run: 198 tests, OK.
+- FAST payment micro-stagger remains configurable, default 10 ms.
+- Durable payment guard now has explicit ARMED vs SUBMITTED states. ARMED is safe across restart; only SUBMITTED/legacy-unknown recovers to payment hold.
+- Scanner resume marker restores an active plan/forms after watchdog/hard restart when there is no ambiguous submitted payment.
+- Watchdog writes an all-thread Python stack dump before hard exit for postmortem /log_full analysis.
+- Reset button performs a full operational reset (including payment hold/guard, cooldown and resume marker) while preserving owner/API/phone and MTProto session authorization.
+- Historical logs/payment audit are preserved by Reset for diagnostics.
+- Full local regression run: 200 tests, OK.
 - Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with 6 services.
 - No live Telegram/Stars payment was executed as part of offline validation.
 
@@ -17,23 +15,23 @@ Files (SHA256  bytes  path):
 e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
 f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  .env.example
 8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
-161e5bad00526c4ea43bdaa5b2c855971a406d96ed9e7a7766c3f7b420d84457        9661  AUDIT-LOGGING.md
-ee0cea5f812536622d145bbb94912a88e9edb817e73f9e4d8837ff5a8bb4ee80       35924  CHANGELOG.md
+edef6caae5519e5212a7639695724c2355eecf14955d3556eff15dae04ae7d39        9661  AUDIT-LOGGING.md
+8912e710a8e59edfa6dc708a3ba045ffeb599248a1736996bf6a8777f67de87f       38050  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-cfd1420f59e0f7c1652a16fc2216b3401d65074cf080ee1d0dc77cfa8f6110d1        3039  PAYMENT-DIAGNOSTIC-PATCH.md
-20baf29f0dc53c880ce6ca60fb14457b87b5718bc3b763f87aa490d77dccd556       31385  README.md
-737f1064ae3567d4f490477b09c36674fd8086ea415240e9cb57c170bf539679       21161  VALIDATION.md
-819406f20e7ffb63358e1f3303b2978b6bfea5de610a0fd93f069b60a01e7cfa        7663  bootstrap.py
+8ff6911c51f7d30fca852f443762fc0df825507caf7026da4cda244c15161f85        3039  PAYMENT-DIAGNOSTIC-PATCH.md
+df4200d24742e6d108301985405f8e4ff3258f5f167d4cb3c8008838b0c37016       33577  README.md
+ae23c44993fcb59c3b79032d017e6e3456208cee965541d3cf534822425398ad       23883  VALIDATION.md
+f9a7eb3283cb8f7a251193fa5ce7ca42cf9766d29da0f1fddfe069954949f102        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
 d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
-b1fd500e3aab9174d720262e90f7c8a65e7d5861aae69f3c6924e1b4cfe3187e        1533  healthcheck.py
+298aba9c79a20afe11f6a31349f6397dd94c07345d1ef82605f96bf68b174c2a        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-c391206698bf97c1905a7465e63a4a0d0b6b6b20507e13451388a0fdf003f316      392395  main.py
+9a46ba23cb9545360353f9cbc55c1c7ef16cf0a892e4ac6ea29e1521ec41af87      406356  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
-ebb9748e2b1faaf00f3c15b74d6164ab1a120bdd4b1076fe410c82fd2e5016e2        2109  tests/test_bootstrap.py
+07eeb423bcee63628887c0ab758a4974ab5cfe86b9f3783190c11d397624d81c        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-32bcf393dacaa8fb439ab9363f2b96916351a96ad8a66a7ef5896e13758a05c7      168610  tests/test_runtime.py
-2edcf0db9e389d3d228d9313c192ec3724967cd8afeb094f8e4b2cde9b4b51af       21823  tests/test_source_guards.py
+4135837dcf97d6956711b2192bff10175af70297d90cc2c56dd036638a94a9d8      170445  tests/test_runtime.py
+401c9b9c30eafefe412b9dcec6148f67d0263be8a55d1623a114c983c397a884       21909  tests/test_source_guards.py
