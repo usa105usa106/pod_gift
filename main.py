@@ -89,7 +89,7 @@ def env_float(name: str, default: float, *, minimum: float | None = None) -> flo
     return max(minimum, value) if minimum is not None else value
 
 
-APP_VERSION = "v0041"
+APP_VERSION = "v0042"
 APP_NAME = "Gift Hunter"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -199,12 +199,16 @@ MAX_PRIMARY_VOLLEY_SIZE = 50
 MAX_SECONDARY_VOLLEY_SIZE = 50
 DEFAULT_FAST_QUIET_DISTANCE = 10
 FAST_QUIET_DISTANCE = env_int("FAST_QUIET_DISTANCE", DEFAULT_FAST_QUIET_DISTANCE, minimum=1)
-# v0041 deliberately uses no fixed millisecond stagger. /otvet off preserves the
-# default NEXT-TICK path; /otvet on waits only for the previous raw payment RPC
-# future before queueing the next request. Neither mode uses a durable payment
-# guard or an automatic financial retry.
+# v0042 keeps both v0041 dispatch modes and adds an experimental fixed pack.
+# /pachka on (default) is intentionally restricted to exactly two selected
+# saved gifts: one form for gift A at t=0 and five distinct forms for gift B at
+# absolute offsets 20/35/50/75/100 ms from the first sender queue.  /pachka off
+# falls back to the unchanged /otvet off|on modes. No durable payment guard is
+# used in any firing path.
 DEFAULT_FAST_VOLLEY_STAGGER_MS = 0
 MAX_FAST_VOLLEY_STAGGER_MS = 1000
+PACHKA_OFFSETS_MS = (0, 20, 35, 50, 75, 100)
+PACHKA_EXTRA_FORM_COUNT = 4  # prepared[B] + 4 extras = five B forms
 # Force-refresh the full FAST payment set once when the frontier enters the same
 # 50-number near-target zone used by the faster form-refresh policy. This value
 # is built in deliberately: old Coolify FAST_FORM_FREEZE_DISTANCE settings are
@@ -664,6 +668,7 @@ class Settings:
     volley_size: int = 1
     fast_volley_stagger_ms: int = DEFAULT_FAST_VOLLEY_STAGGER_MS
     fast_wait_response: bool = False
+    pachka_enabled: bool = True
     slug_map: dict[str, str] = field(default_factory=dict)
     payment_hold_saved_ids: list[int] = field(default_factory=list)
     payment_hold_targets: dict[str, int] = field(default_factory=dict)
@@ -719,6 +724,7 @@ class SettingsStore:
             volley_size=min(max_volley_size_for_shooter(SHOOTER_ID), max(1, _int_or_none(nested.get("volley_size")) or 1)),
             fast_volley_stagger_ms=0,
             fast_wait_response=parse_bool(nested.get("fast_wait_response", False), False),
+            pachka_enabled=parse_bool(nested.get("pachka_enabled", True), True),
             slug_map={str(k): str(v) for k, v in (nested.get("slug_map", {}) or {}).items() if v},
             payment_hold_saved_ids=_unique_ints(nested.get("payment_hold_saved_ids", [])),
             payment_hold_targets={
@@ -930,6 +936,7 @@ def _write_scanner_resume_marker(path: Path = SCANNER_RESUME_PATH) -> None:
         "volley_size": int(store.settings.volley_size),
         "dispatch_mode": fast_dispatch_mode(),
         "fast_wait_response": effective_fast_wait_response(),
+        "pachka_enabled": effective_pachka_enabled(),
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     temp = path.with_name(path.name + ".tmp")
@@ -1007,16 +1014,22 @@ def effective_volley_size() -> int:
 
 
 def effective_fast_volley_stagger_ms() -> int:
-    """Compatibility metric: v0041 has no fixed millisecond stagger."""
+    """Compatibility metric: v0042 has no fixed millisecond stagger."""
     return 0
 
 
 def effective_fast_wait_response() -> bool:
-    """Return whether FAST waits for each payment RPC response before queueing the next."""
+    """Return whether legacy FAST waits for each payment RPC response before the next."""
     return bool(store.settings.fast_wait_response)
 
 
+def effective_pachka_enabled() -> bool:
+    return bool(store.settings.pachka_enabled)
+
+
 def fast_dispatch_mode() -> str:
+    if effective_pachka_enabled():
+        return "pachka_0_20_35_50_75_100"
     return "sequential_rpc_response" if effective_fast_wait_response() else "sequential_next_tick"
 
 
@@ -2364,6 +2377,252 @@ class MTProtoService:
             detail=f"{type(exc).__name__}: {exc}; FAST-повтор не отправлялся",
         )
 
+    async def execute_upgrade_pachka(
+        self,
+        peer: Any,
+        first_info: SavedGiftInfo,
+        second_info: SavedGiftInfo,
+        plans: list[PreparedUpgrade],
+        *,
+        client: TelegramClient,
+    ) -> tuple[list[UpgradeOutcome], list[UpgradeOutcome]]:
+        """Fire six prebuilt forms at 0/20/35/50/75/100 ms without response waits.
+
+        The first request is permanently bound to ``first_info.saved_id``. The
+        remaining five are permanently bound to ``second_info.saved_id``. Every
+        request/form is validated before the first financial RPC is queued. The
+        timing loop never fetches a form, changes a saved_id, verifies an NFT,
+        writes settings, or waits for a previous payment response.
+        """
+        if len(plans) != len(PACHKA_OFFSETS_MS):
+            raise RuntimeError(
+                f"PACHKA требует {len(PACHKA_OFFSETS_MS)} форм, получено {len(plans)}"
+            )
+        infos = [first_info, *([second_info] * (len(PACHKA_OFFSETS_MS) - 1))]
+        expected_ids = [info.saved_id for info in infos]
+        now = time.monotonic()
+        form_ids: list[int] = []
+        for index, (info, prepared) in enumerate(zip(infos, plans)):
+            if prepared.saved_id != info.saved_id or prepared.request is None:
+                raise RuntimeError(
+                    f"PACHKA binding mismatch slot={index} expected={info.saved_id} got={prepared.saved_id}"
+                )
+            if prepared.prepaid:
+                raise RuntimeError("PACHKA не поддерживает prepaid request")
+            if now - prepared.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+                raise RuntimeError(
+                    f"PACHKA form устарела slot={index} saved_id={info.saved_id}"
+                )
+            request_form_id = _int_or_none(getattr(prepared.request, "form_id", None))
+            request_invoice_saved_id = invoice_saved_id(getattr(prepared.request, "invoice", None))
+            if (
+                prepared.form_id is None
+                or request_form_id != prepared.form_id
+                or invoice_saved_id(prepared.invoice) != info.saved_id
+                or request_invoice_saved_id != info.saved_id
+            ):
+                raise RuntimeError(
+                    f"PACHKA invalid request slot={index} saved_id={info.saved_id} form_id={prepared.form_id}"
+                )
+            form_ids.append(int(prepared.form_id))
+        if len(form_ids) != len(set(form_ids)):
+            raise RuntimeError("PACHKA preflight обнаружил повторяющийся form_id")
+        if expected_ids != [first_info.saved_id, *([second_info.saved_id] * 5)]:
+            raise RuntimeError("PACHKA saved_id envelope нарушен")
+
+        dispatch_mode = "pachka_0_20_35_50_75_100"
+        snapshot_before = self.connection_snapshot(client)
+        transport = "telethon_sender_absolute_deadlines"
+        record_payment_event(
+            "pachka_payment_batch_started",
+            count=len(plans),
+            dispatch_mode=dispatch_mode,
+            planned_offsets_ms=list(PACHKA_OFFSETS_MS),
+            locked_saved_ids=[first_info.saved_id, second_info.saved_id],
+            entries=[prepared_payment_debug(plan) for plan in plans],
+            connection=snapshot_before,
+        )
+
+        raw_results: list[Any] = [None] * len(plans)
+        raw_errors: list[BaseException | None] = [None] * len(plans)
+        queue_offsets_ms: list[float | None] = [None] * len(plans)
+        response_offsets_ms: list[float | None] = [None] * len(plans)
+        first_queue_ns: int | None = None
+        loop = asyncio.get_running_loop()
+        sender = getattr(client, "_sender", None)
+        sender_send = getattr(sender, "send", None)
+        futures: dict[int, Any] = {}
+        scheduled_handles: list[asyncio.Handle] = []
+        all_dispatched: asyncio.Future[None] = loop.create_future()
+
+        def mark_response(index: int) -> None:
+            if first_queue_ns is not None and response_offsets_ms[index] is None:
+                response_offsets_ms[index] = (
+                    time.perf_counter_ns() - first_queue_ns
+                ) / 1_000_000.0
+
+        def queue_sender(index: int) -> None:
+            nonlocal first_queue_ns
+            prepared = plans[index]
+            queue_ns = time.perf_counter_ns()
+            prepared.fast_send_started_ns = queue_ns
+            if first_queue_ns is None:
+                first_queue_ns = queue_ns
+            queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
+            try:
+                future = sender_send(prepared.request, ordered=False)
+                if isinstance(future, (list, tuple)):
+                    future_list = list(future)
+                    if len(future_list) != 1:
+                        raise RuntimeError(
+                            f"PACHKA sender вернул {len(future_list)} future для slot={index}"
+                        )
+                    future = future_list[0]
+                futures[index] = future
+                add_done = getattr(future, "add_done_callback", None)
+                if callable(add_done):
+                    add_done(lambda _future, idx=index: mark_response(idx))
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                raw_errors[index] = exc
+                mark_response(index)
+            finally:
+                if index == len(plans) - 1 and not all_dispatched.done():
+                    all_dispatched.set_result(None)
+
+        def queue_client(index: int) -> None:
+            nonlocal first_queue_ns
+            prepared = plans[index]
+            queue_ns = time.perf_counter_ns()
+            prepared.fast_send_started_ns = queue_ns
+            if first_queue_ns is None:
+                first_queue_ns = queue_ns
+            queue_offsets_ms[index] = (queue_ns - first_queue_ns) / 1_000_000.0
+            try:
+                task = asyncio.create_task(client(prepared.request, ordered=False))
+                futures[index] = task
+                task.add_done_callback(lambda _future, idx=index: mark_response(idx))
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                    raise
+                raw_errors[index] = exc
+                mark_response(index)
+            finally:
+                if index == len(plans) - 1 and not all_dispatched.done():
+                    all_dispatched.set_result(None)
+
+        queue_func = queue_sender if callable(sender_send) else queue_client
+        if not callable(sender_send):
+            transport = "telethon_client_absolute_deadlines_fallback"
+
+        # Queue t=0 synchronously. All later callbacks are anchored to its actual
+        # sender timestamp, not to trigger detection or task creation time.
+        queue_func(0)
+        assert first_queue_ns is not None
+        for index, offset_ms in enumerate(PACHKA_OFFSETS_MS[1:], start=1):
+            elapsed_ns = time.perf_counter_ns() - first_queue_ns
+            remaining_s = max(0.0, (offset_ms * 1_000_000 - elapsed_ns) / 1_000_000_000.0)
+            scheduled_handles.append(loop.call_later(remaining_s, queue_func, index))
+
+        try:
+            await all_dispatched
+        finally:
+            for handle in scheduled_handles:
+                if not handle.cancelled() and handle.when() > loop.time():
+                    handle.cancel()
+
+        if futures:
+            ordered_indices = sorted(futures)
+            settled = await asyncio.gather(
+                *(futures[index] for index in ordered_indices),
+                return_exceptions=True,
+            )
+            for index, value in zip(ordered_indices, settled):
+                if response_offsets_ms[index] is None:
+                    mark_response(index)
+                if isinstance(value, BaseException):
+                    raw_errors[index] = value
+                else:
+                    raw_results[index] = value
+
+        rounded_queue = [round(value, 3) if value is not None else None for value in queue_offsets_ms]
+        rounded_response = [
+            round(value, 3) if value is not None else None for value in response_offsets_ms
+        ]
+        actual_errors = [
+            None if actual is None else round(actual - planned, 3)
+            for planned, actual in zip(PACHKA_OFFSETS_MS, queue_offsets_ms)
+        ]
+        record_payment_event(
+            "pachka_payment_batch_dispatched",
+            count=len(plans),
+            dispatch_mode=dispatch_mode,
+            planned_offsets_ms=list(PACHKA_OFFSETS_MS),
+            queue_offsets_ms=rounded_queue,
+            schedule_error_ms=actual_errors,
+            response_offsets_ms=rounded_response,
+            locked_saved_ids=[first_info.saved_id, second_info.saved_id],
+            submitted_saved_ids=expected_ids,
+            form_ids=form_ids,
+            transport=transport,
+            connection=self.connection_snapshot(client),
+        )
+
+        attempt_outcomes: list[UpgradeOutcome] = []
+        jobs: list[asyncio.Task[UpgradeOutcome]] = []
+        for info, plan, result, error in zip(infos, plans, raw_results, raw_errors):
+            if error is not None:
+                jobs.append(
+                    asyncio.create_task(
+                        self._fast_outcome_from_exception(peer, info, plan.request, error)
+                    )
+                )
+            else:
+                jobs.append(
+                    asyncio.create_task(
+                        self._interpret_upgrade_result(peer, info.saved_id, result)
+                    )
+                )
+        settled_outcomes = await asyncio.gather(*jobs, return_exceptions=True)
+        for value in settled_outcomes:
+            if isinstance(value, UpgradeOutcome):
+                attempt_outcomes.append(value)
+            elif isinstance(value, BaseException):
+                attempt_outcomes.append(
+                    UpgradeOutcome(
+                        "unknown",
+                        detail=f"{type(value).__name__}: {value}; PACHKA verification failed",
+                    )
+                )
+            else:
+                attempt_outcomes.append(
+                    UpgradeOutcome("unknown", detail="Неожиданный PACHKA result")
+                )
+
+        def collapse(values: list[UpgradeOutcome]) -> UpgradeOutcome:
+            for status in ("confirmed", "verification", "unknown", "failed"):
+                for outcome in values:
+                    if outcome.status == status:
+                        return outcome
+            return UpgradeOutcome("unknown", detail="PACHKA не вернула результат")
+
+        gift_outcomes = [attempt_outcomes[0], collapse(attempt_outcomes[1:])]
+        record_payment_event(
+            "pachka_payment_batch_finished",
+            dispatch_mode=dispatch_mode,
+            planned_offsets_ms=list(PACHKA_OFFSETS_MS),
+            queue_offsets_ms=rounded_queue,
+            schedule_error_ms=actual_errors,
+            response_offsets_ms=rounded_response,
+            locked_saved_ids=[first_info.saved_id, second_info.saved_id],
+            attempt_statuses=[outcome.status for outcome in attempt_outcomes],
+            gift_statuses=[outcome.status for outcome in gift_outcomes],
+            connection_before=snapshot_before,
+            connection_after=self.connection_snapshot(client),
+        )
+        return gift_outcomes, attempt_outcomes
+
     async def execute_upgrade_fast_batch(
         self,
         peer: Any,
@@ -2371,9 +2630,9 @@ class MTProtoService:
         *,
         client: TelegramClient,
     ) -> list[UpgradeOutcome]:
-        """Submit prebuilt Stars payments using one of two v0041 FAST modes.
+        """Submit prebuilt Stars payments using the preserved v0041 fallback modes.
 
-        ``/otvet off`` (default) preserves the default NEXT-TICK behaviour: queue one
+        When ``/pachka off`` is selected, ``/otvet off`` preserves NEXT-TICK: queue one
         request to the already-hot MTProto sender, yield one asyncio loop turn,
         then queue the next without waiting for Telegram.
 
@@ -2951,6 +3210,12 @@ class Scanner:
         self.form_refresh_task: asyncio.Task[None] | None = None
         self.stop_event = asyncio.Event()
         self.prepared: dict[int, PreparedUpgrade] = {}
+        # PACHKA keeps four extra forms for the second locked saved gift. The
+        # ordinary prepared[second_id] form is the 20 ms attempt, so together
+        # they make five B attempts and six forms total including gift A.
+        self.pachka_prepared: dict[int, list[PreparedUpgrade]] = {}
+        self._pachka_locked_saved_ids: tuple[int, int] | None = None
+        self._pachka_refresh_retry_after: float = 0.0
         self._form_refresh_retry_after: dict[int, float] = {}
         self._form_refresh_lock = asyncio.Lock()
         self._form_refresh_latency_ewma_s = FORM_REFRESH_LATENCY_INITIAL_SECONDS
@@ -2994,6 +3259,77 @@ class Scanner:
             backoff_factor=SCAN_BACKOFF_FACTOR,
             backoff_floor_ms=SCAN_BACKOFF_FLOOR_MS,
         )
+
+    def clear_prepared_state(self) -> None:
+        """Drop all payment forms/locks without touching authorization or selection."""
+        self.prepared.clear()
+        self.pachka_prepared.clear()
+        self._pachka_locked_saved_ids = None
+        self._pachka_refresh_retry_after = 0.0
+        self._reset_critical_form_state()
+
+    @staticmethod
+    def _pachka_pair_from_group(group: list[SavedGiftInfo]) -> list[SavedGiftInfo]:
+        """Return exactly the two user-selected gifts in selection order."""
+        selected_ids = _unique_ints(store.settings.selected_saved_ids)
+        if effective_volley_size() != 2:
+            raise RuntimeError("/pachka on требует размер залпа ровно 2")
+        if len(selected_ids) != 2:
+            raise RuntimeError("/pachka on требует выбрать ровно два подарка")
+        by_id = {item.saved_id: item for item in group if item.can_upgrade}
+        missing = [saved_id for saved_id in selected_ids if saved_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                "PACHKA lock: выбранные saved_id недоступны: " + ",".join(map(str, missing))
+            )
+        return [by_id[selected_ids[0]], by_id[selected_ids[1]]]
+
+    def _pachka_submission_plans(
+        self, candidates: list[SavedGiftInfo]
+    ) -> list[PreparedUpgrade]:
+        """Return [A@0, B@20, B@35, B@50, B@75, B@100], fully RAM-bound."""
+        if len(candidates) != 2:
+            raise RuntimeError("PACHKA preflight: нужны ровно два locked подарка")
+        locked = (candidates[0].saved_id, candidates[1].saved_id)
+        if self._pachka_locked_saved_ids != locked:
+            raise RuntimeError(
+                f"PACHKA lock mismatch: armed={self._pachka_locked_saved_ids}, firing={locked}"
+            )
+        first = self.prepared.get(locked[0])
+        second = self.prepared.get(locked[1])
+        extras = list(self.pachka_prepared.get(locked[1], []))
+        if first is None or second is None or len(extras) != PACHKA_EXTRA_FORM_COUNT:
+            raise RuntimeError("PACHKA forms не полностью подготовлены")
+        plans = [first, second, *extras]
+        expected_ids = [locked[0], *([locked[1]] * 5)]
+        now = time.monotonic()
+        form_ids: list[int] = []
+        for plan, expected_id in zip(plans, expected_ids):
+            if plan.saved_id != expected_id or plan.request is None:
+                raise RuntimeError(
+                    f"PACHKA binding mismatch: expected_saved_id={expected_id}, plan_saved_id={plan.saved_id}"
+                )
+            if plan.prepaid:
+                raise RuntimeError("PACHKA работает только с обычными Stars payment forms")
+            if now - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+                raise RuntimeError(
+                    f"PACHKA form устарела: saved_id={plan.saved_id}, form_id={plan.form_id}"
+                )
+            request_form_id = _int_or_none(getattr(plan.request, "form_id", None))
+            request_invoice_saved_id = invoice_saved_id(getattr(plan.request, "invoice", None))
+            if (
+                plan.form_id is None
+                or request_form_id != plan.form_id
+                or invoice_saved_id(plan.invoice) != expected_id
+                or request_invoice_saved_id != expected_id
+            ):
+                raise RuntimeError(
+                    f"PACHKA request binding invalid: saved_id={expected_id}, form_id={plan.form_id}"
+                )
+            form_ids.append(int(plan.form_id))
+        if len(form_ids) != len(set(form_ids)):
+            raise RuntimeError("PACHKA требует шесть разных form_id; найден дубликат")
+        return plans
 
     def _enter_fast_quiet(self) -> None:
         if self._quiet_mode:
@@ -3208,6 +3544,13 @@ class Scanner:
         # upgrade does not pause to fetch a payment form after the first success.
         selected_ids = {item.saved_id for item in infos}
         self.prepared = {saved_id: plan for saved_id, plan in self.prepared.items() if saved_id in selected_ids}
+        if not effective_pachka_enabled():
+            self.pachka_prepared.clear()
+            self._pachka_locked_saved_ids = None
+        elif self._pachka_locked_saved_ids is not None and set(self._pachka_locked_saved_ids) != selected_ids:
+            self.pachka_prepared.clear()
+            self._pachka_locked_saved_ids = None
+
         if store.settings.live_upgrades:
             for slug, group in groups.items():
                 current = counters[slug].current
@@ -3217,7 +3560,12 @@ class Scanner:
                     raise RuntimeError(
                         f"Для залпа {effective_volley_size()} выбрано только {len(group)} подарков"
                     )
-                for candidate in group[:required]:
+                plan_candidates = (
+                    self._pachka_pair_from_group(group)
+                    if effective_pachka_enabled()
+                    else group[:required]
+                )
+                for candidate in plan_candidates:
                     existing = self.prepared.get(candidate.saved_id)
                     if existing is not None and time.monotonic() - existing.created_at <= PREPARE_REFRESH_SECONDS:
                         continue
@@ -3228,9 +3576,18 @@ class Scanner:
                         candidate.saved_id,
                         self.prepared[candidate.saved_id].cost,
                     )
+                if effective_pachka_enabled():
+                    await self._refresh_pachka_extras(peer, plan_candidates, force=False)
 
     def _fast_candidates_from_ram(self) -> list[SavedGiftInfo]:
         """Return the currently armed FAST candidates without network or disk I/O."""
+        if effective_pachka_enabled():
+            for group in self._groups.values():
+                try:
+                    return self._pachka_pair_from_group(group)
+                except RuntimeError:
+                    continue
+            return []
         required = effective_volley_size()
         output: list[SavedGiftInfo] = []
         selected = set(store.settings.selected_saved_ids)
@@ -3240,14 +3597,136 @@ class Scanner:
             )
         return output[:required]
 
-    @staticmethod
-    def _selected_fast_candidates(group: list[SavedGiftInfo]) -> list[SavedGiftInfo]:
+    def _selected_fast_candidates(self, group: list[SavedGiftInfo]) -> list[SavedGiftInfo]:
+        if effective_pachka_enabled():
+            try:
+                return self._pachka_pair_from_group(group)
+            except RuntimeError:
+                return []
         required = effective_volley_size()
         selected = set(store.settings.selected_saved_ids)
         return [
             item for item in group
             if item.saved_id in selected and item.can_upgrade
         ][:required]
+
+    async def _refresh_pachka_extras(
+        self,
+        peer: Any,
+        candidates: list[SavedGiftInfo],
+        *,
+        force: bool = False,
+    ) -> int:
+        """Prepare/refresh the four extra B forms as one atomic in-memory set."""
+        if not effective_pachka_enabled():
+            self.pachka_prepared.clear()
+            self._pachka_locked_saved_ids = None
+            return 0
+
+        pair = self._pachka_pair_from_group(candidates)
+        first, second = pair
+        locked = (first.saved_id, second.saved_id)
+        now = time.monotonic()
+        refresh_after_s, target_distance = self._payment_form_refresh_policy()
+        old_extras = list(self.pachka_prepared.get(second.saved_id, []))
+        old_lock = self._pachka_locked_saved_ids
+        primary_form_ids = {
+            int(plan.form_id)
+            for saved_id in locked
+            if (plan := self.prepared.get(saved_id)) is not None
+            and not plan.prepaid
+            and plan.form_id is not None
+        }
+        old_extra_form_ids = [
+            int(plan.form_id)
+            for plan in old_extras
+            if plan.form_id is not None
+        ]
+        valid_old = (
+            old_lock == locked
+            and len(old_extras) == PACHKA_EXTRA_FORM_COUNT
+            and len(old_extra_form_ids) == PACHKA_EXTRA_FORM_COUNT
+            and len(set(old_extra_form_ids)) == PACHKA_EXTRA_FORM_COUNT
+            and not (set(old_extra_form_ids) & primary_form_ids)
+            and all(
+                plan.saved_id == second.saved_id
+                and plan.request is not None
+                and not plan.prepaid
+                and invoice_saved_id(plan.invoice) == second.saved_id
+                and _int_or_none(getattr(plan.request, "form_id", None)) == plan.form_id
+                and invoice_saved_id(getattr(plan.request, "invoice", None)) == second.saved_id
+                and now - plan.created_at < PAYMENT_FORM_MAX_AGE_SECONDS
+                for plan in old_extras
+            )
+        )
+        due = force or not valid_old or any(
+            now - plan.created_at >= refresh_after_s for plan in old_extras
+        )
+        if not due:
+            return 0
+        if not force and self._pachka_refresh_retry_after > now:
+            return 0
+
+        fresh: list[PreparedUpgrade] = []
+        seen = set(primary_form_ids)
+        try:
+            for slot in range(PACHKA_EXTRA_FORM_COUNT):
+                async with self._form_refresh_lock:
+                    request_started = time.perf_counter()
+                    try:
+                        plan = await self.service.prepare_upgrade(peer, second)
+                    finally:
+                        self._observe_form_refresh_latency(time.perf_counter() - request_started)
+                self._validate_prepared_binding(second, plan)
+                if plan.prepaid or plan.form_id is None:
+                    raise RuntimeError("PACHKA extra form должна быть обычной paid form")
+                form_id = int(plan.form_id)
+                if form_id in seen:
+                    raise RuntimeError(
+                        f"PACHKA duplicate form_id={form_id} slot={slot + 1}"
+                    )
+                seen.add(form_id)
+                fresh.append(plan)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            self._pachka_refresh_retry_after = time.monotonic() + 15.0
+            runtime.payment_form_refresh_failures += 1
+            runtime.payment_form_last_refresh_error = f"PACHKA: {type(exc).__name__}: {exc}"[:500]
+            logger.error(
+                "pachka_form_refresh_failed locked_ids=%s old_extra_count=%s error=%s",
+                locked,
+                len(old_extras),
+                exc,
+            )
+            record_payment_event(
+                "pachka_form_refresh_failed",
+                locked_saved_ids=list(locked),
+                old_extra_count=len(old_extras),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            if force:
+                raise
+            return 0
+
+        # Swap only after all four forms are valid and mutually unique.
+        self.pachka_prepared = {second.saved_id: fresh}
+        self._pachka_locked_saved_ids = locked
+        self._pachka_refresh_retry_after = 0.0
+        runtime.payment_form_refresh_count += len(fresh)
+        runtime.payment_form_last_refresh_at = datetime.now(timezone.utc).isoformat()
+        runtime.payment_form_last_refresh_error = None
+        record_payment_event(
+            "pachka_forms_refreshed",
+            locked_saved_ids=list(locked),
+            second_saved_id=second.saved_id,
+            extra_form_ids=[plan.form_id for plan in fresh],
+            refresh_after_s=refresh_after_s,
+            target_distance=target_distance,
+            force=force,
+        )
+        return len(fresh)
 
     def _fast_ammo_error(self, candidates: list[SavedGiftInfo]) -> str | None:
         """Return why the in-RAM FAST volley is not fully armed, without I/O."""
@@ -3272,6 +3751,31 @@ class Scanner:
 
         if len(paid_form_ids) != len(set(paid_form_ids)):
             return "обнаружены повторяющиеся form_id"
+
+        if effective_pachka_enabled():
+            if required != 2 or len(_unique_ints(store.settings.selected_saved_ids)) != 2:
+                return "/pachka on требует залп 2 и ровно два выбранных подарка"
+            locked = (candidates[0].saved_id, candidates[1].saved_id)
+            if self._pachka_locked_saved_ids != locked:
+                return f"PACHKA lock не готов: expected={locked}, armed={self._pachka_locked_saved_ids}"
+            extras = list(self.pachka_prepared.get(locked[1], []))
+            if len(extras) != PACHKA_EXTRA_FORM_COUNT:
+                return f"PACHKA extra forms: нужно {PACHKA_EXTRA_FORM_COUNT}, готово {len(extras)}"
+            all_ids = list(paid_form_ids)
+            for plan in extras:
+                if plan.saved_id != locked[1] or plan.request is None:
+                    return f"PACHKA extra binding повреждён для saved_id={locked[1]}"
+                if plan.prepaid or now - plan.created_at > PAYMENT_FORM_MAX_AGE_SECONDS:
+                    return f"PACHKA extra form устарела/не paid для saved_id={locked[1]}"
+                try:
+                    self._validate_prepared_binding(candidates[1], plan)
+                except Exception as exc:
+                    return f"PACHKA extra saved_id={locked[1]}: {exc}"
+                if plan.form_id is None:
+                    return f"PACHKA extra form_id отсутствует для saved_id={locked[1]}"
+                all_ids.append(int(plan.form_id))
+            if len(all_ids) != 6 or len(all_ids) != len(set(all_ids)):
+                return "PACHKA требует ровно шесть разных form_id"
         return None
 
     def _reset_critical_form_state(self) -> None:
@@ -3335,10 +3839,16 @@ class Scanner:
             refreshed_ids=refreshed_ids,
         )
         missing_refreshes = sorted(required_refresh_ids - refreshed_ids)
+        pachka_error: str | None = None
+        if not missing_refreshes and effective_pachka_enabled():
+            try:
+                await self._refresh_pachka_extras(peer, candidates, force=True)
+            except Exception as exc:
+                pachka_error = f"PACHKA refresh: {type(exc).__name__}: {exc}"
         reason = (
             "forced refresh не завершён для saved_id=" + ",".join(map(str, missing_refreshes))
             if missing_refreshes
-            else self._fast_ammo_error(candidates)
+            else pachka_error or self._fast_ammo_error(candidates)
         )
         if reason is not None:
             self._critical_form_unarmed[key] = reason
@@ -3382,9 +3892,12 @@ class Scanner:
 
     def _update_payment_form_age_metric(self) -> None:
         now = time.monotonic()
+        plans = list(self.prepared.values()) + [
+            plan for extra in self.pachka_prepared.values() for plan in extra
+        ]
         ages = [
             max(0.0, now - plan.created_at)
-            for plan in self.prepared.values()
+            for plan in plans
             if not plan.prepaid
         ]
         runtime.payment_form_oldest_age_s = round(max(ages), 3) if ages else None
@@ -3688,6 +4201,10 @@ class Scanner:
             ):
                 try:
                     await self._refresh_due_payment_forms(peer)
+                    if effective_pachka_enabled():
+                        candidates = self._fast_candidates_from_ram()
+                        if len(candidates) == 2:
+                            await self._refresh_pachka_extras(peer, candidates, force=False)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -4392,14 +4909,7 @@ class Scanner:
         broadcast: bool = True,
         source: str = "local",
     ) -> None:
-        """Launch prebuilt requests and relay FIRE without control-plane work.
-
-        A confirmed exact predecessor claims the one-shot latch immediately.  A
-        healthy detector creates its own payment tasks first and then broadcasts
-        the prebuilt HMAC packet with no ``await`` between those operations.  If
-        local RAM preflight fails, the detector still broadcasts so healthy peers
-        are not forced to wait for their own slower Telegram observation.
-        """
+        """Launch prebuilt requests and relay FIRE without control-plane work."""
         if self._fast_fired:
             return
 
@@ -4408,7 +4918,7 @@ class Scanner:
             raise RuntimeError("FAST campaign_id не подготовлен для выбранной коллекции")
 
         # Claim before any branch so duplicate local/UDP detections cannot create
-        # a second volley.  Everything below up to FIRE broadcast is RAM-only.
+        # a second volley. Everything through task creation is RAM-only.
         self._fast_fired = True
         runtime.fast_fired = True
         runtime.fast_fire_source = source
@@ -4416,20 +4926,25 @@ class Scanner:
         self.triggered.add((slug, target))
         self.stop_event.set()
 
+        pachka = effective_pachka_enabled()
         volley_size = effective_volley_size()
         runtime.fast_volley_size = volley_size
         candidates: list[SavedGiftInfo] = []
         plans: list[PreparedUpgrade] = []
-        batch_task: asyncio.Task[list[UpgradeOutcome]] | None = None
+        pachka_plans: list[PreparedUpgrade] = []
+        batch_task: asyncio.Task[Any] | None = None
         local_error: BaseException | None = None
         client = self._fast_client
 
         try:
-            candidates = [
-                item
-                for item in group
-                if item.saved_id in store.settings.selected_saved_ids and item.can_upgrade
-            ][:volley_size]
+            if pachka:
+                candidates = self._pachka_pair_from_group(group)
+            else:
+                candidates = [
+                    item
+                    for item in group
+                    if item.saved_id in store.settings.selected_saved_ids and item.can_upgrade
+                ][:volley_size]
             if len(candidates) != volley_size:
                 raise RuntimeError(
                     f"FAST-залп {volley_size} невозможен: доступно {len(candidates)} подарков"
@@ -4475,14 +4990,25 @@ class Scanner:
                 plan.fast_send_started_ns = None
                 plans.append(plan)
 
-            paid_form_ids = [int(plan.form_id) for plan in plans if not plan.prepaid and plan.form_id is not None]
+            paid_form_ids = [
+                int(plan.form_id)
+                for plan in plans
+                if not plan.prepaid and plan.form_id is not None
+            ]
             if len(paid_form_ids) != len(set(paid_form_ids)):
-                duplicates = sorted({value for value in paid_form_ids if paid_form_ids.count(value) > 1})
+                duplicates = sorted(
+                    {value for value in paid_form_ids if paid_form_ids.count(value) > 1}
+                )
                 raise RuntimeError(
                     "FAST duplicate payment form_id detected before submit: "
                     + ",".join(str(value) for value in duplicates)
                     + "; оплата не отправлена"
                 )
+
+            if pachka:
+                pachka_plans = self._pachka_submission_plans(candidates)
+                for plan in pachka_plans:
+                    plan.fast_send_started_ns = None
 
             if client is None or not client.is_connected():
                 raise RuntimeError("FAST MTProto-соединение не готово; оплата не отправлена")
@@ -4494,19 +5020,32 @@ class Scanner:
 
         launch_started = time.perf_counter()
         if local_error is None and client is not None:
-            # Fallback timestamp for adapters/tests. The production
-            # MTProtoService overwrites it at each actual sequential sender queue call.
+            # Fallback timestamps for adapters/tests. Production MTProto methods
+            # overwrite each timestamp at the actual sender queue call.
             scheduled_ns = time.perf_counter_ns()
-            for plan in plans:
+            timing_plans = pachka_plans if pachka else plans
+            for plan in timing_plans:
                 plan.fast_send_started_ns = scheduled_ns
-            batch_task = asyncio.create_task(
-                self.service.execute_upgrade_fast_batch(
-                    peer,
-                    list(zip(candidates, plans)),
-                    client=client,
-                ),
-                name=f"fast-volley-batch-{SHOOTER_ID}-{campaign_id[:8]}-{target}",
-            )
+            if pachka:
+                batch_task = asyncio.create_task(
+                    self.service.execute_upgrade_pachka(
+                        peer,
+                        candidates[0],
+                        candidates[1],
+                        pachka_plans,
+                        client=client,
+                    ),
+                    name=f"pachka-batch-{SHOOTER_ID}-{campaign_id[:8]}-{target}",
+                )
+            else:
+                batch_task = asyncio.create_task(
+                    self.service.execute_upgrade_fast_batch(
+                        peer,
+                        list(zip(candidates, plans)),
+                        client=client,
+                    ),
+                    name=f"fast-volley-batch-{SHOOTER_ID}-{campaign_id[:8]}-{target}",
+                )
         launch_finished = time.perf_counter()
         peers_sent = 0
         if broadcast:
@@ -4523,7 +5062,7 @@ class Scanner:
             runtime.last_error = f"{type(local_error).__name__}: {local_error}"
             logger.error(
                 "fast_local_preflight_failed_relayed shooter_id=%s source=%s campaign_id=%s "
-                "slug=%s predecessor=%s target=%s volley=%s udp_peers_sent=%s error=%s",
+                "slug=%s predecessor=%s target=%s volley=%s dispatch_mode=%s udp_peers_sent=%s error=%s",
                 SHOOTER_ID,
                 source,
                 campaign_id,
@@ -4531,6 +5070,7 @@ class Scanner:
                 counter.current,
                 target,
                 volley_size,
+                fast_dispatch_mode(),
                 peers_sent,
                 runtime.last_error,
             )
@@ -4542,8 +5082,12 @@ class Scanner:
                 predecessor=counter.current,
                 target=target,
                 volley=volley_size,
+                dispatch_mode=fast_dispatch_mode(),
                 error=runtime.last_error[:500],
-                plans=[prepared_payment_debug(plan) for plan in plans],
+                plans=[
+                    prepared_payment_debug(plan)
+                    for plan in (pachka_plans if pachka_plans else plans)
+                ],
             )
             record_cluster_event(
                 "fast_local_preflight_failed_relayed",
@@ -4553,6 +5097,7 @@ class Scanner:
                 predecessor=counter.current,
                 target=target,
                 volley=volley_size,
+                dispatch_mode=fast_dispatch_mode(),
                 udp_peers_sent=peers_sent,
                 error=runtime.last_error[:300],
             )
@@ -4568,58 +5113,101 @@ class Scanner:
                 )
             return
 
-        # Yield directly into the sequential FAST task: no logging, disk write or
-        # UI work occurs before the payment pipeline gets its first event-loop
-        # turn. Once a financial request is launched, a manual Stop must not
-        # cancel it midway.
+        # Yield directly into the payment task. Once financial requests launch,
+        # Stop cannot cancel the pack/chain midway.
+        outcomes: list[UpgradeOutcome]
+        attempt_outcomes: list[UpgradeOutcome] = []
         if batch_task is None:
-            raw_results: list[Any] = [
+            outcomes = [
                 UpgradeOutcome("unknown", detail="FAST batch task отсутствует")
                 for _candidate in candidates
             ]
+            if pachka:
+                attempt_outcomes = [
+                    UpgradeOutcome("unknown", detail="PACHKA batch task отсутствует")
+                    for _plan in pachka_plans
+                ]
         else:
             try:
-                raw_results = await asyncio.shield(batch_task)
+                batch_value = await asyncio.shield(batch_task)
             except asyncio.CancelledError:
-                raw_results = await batch_task
+                batch_value = await batch_task
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
-                raw_results = [
+                outcomes = [
                     UpgradeOutcome(
                         "unknown",
                         detail=f"{type(exc).__name__}: {exc}; FAST batch завершился аварийно",
                     )
                     for _candidate in candidates
                 ]
+                if pachka:
+                    attempt_outcomes = [
+                        UpgradeOutcome(
+                            "unknown",
+                            detail=f"{type(exc).__name__}: {exc}; PACHKA batch завершился аварийно",
+                        )
+                        for _plan in pachka_plans
+                    ]
+            else:
+                if pachka:
+                    if (
+                        isinstance(batch_value, tuple)
+                        and len(batch_value) == 2
+                        and isinstance(batch_value[0], list)
+                        and isinstance(batch_value[1], list)
+                    ):
+                        outcomes = batch_value[0]
+                        attempt_outcomes = batch_value[1]
+                    else:
+                        outcomes = [
+                            UpgradeOutcome("unknown", detail="Неожиданный результат PACHKA batch")
+                            for _candidate in candidates
+                        ]
+                        attempt_outcomes = [
+                            UpgradeOutcome("unknown", detail="Неожиданный результат PACHKA attempt")
+                            for _plan in pachka_plans
+                        ]
+                else:
+                    raw_results = batch_value if isinstance(batch_value, list) else []
+                    outcomes = []
+                    for result in raw_results:
+                        if isinstance(result, UpgradeOutcome):
+                            outcomes.append(result)
+                        elif isinstance(result, BaseException):
+                            outcomes.append(
+                                UpgradeOutcome(
+                                    "unknown",
+                                    detail=f"{type(result).__name__}: {result}; FAST-повтор не отправлялся",
+                                )
+                            )
+                        else:
+                            outcomes.append(
+                                UpgradeOutcome("unknown", detail="Неожиданный результат FAST-залпа")
+                            )
+                    while len(outcomes) < len(candidates):
+                        outcomes.append(UpgradeOutcome("unknown", detail="FAST result отсутствует"))
 
+        timing_plans = pachka_plans if pachka else plans
         trigger_at = self._fast_trigger_detected_at
         offsets: list[float | None] = []
-        for plan in plans:
+        for plan in timing_plans:
             if plan.fast_send_started_ns is None or trigger_at is None:
                 offsets.append(None)
             else:
-                offsets.append(max(0.0, plan.fast_send_started_ns / 1_000_000.0 - trigger_at * 1000.0))
+                offsets.append(
+                    max(
+                        0.0,
+                        plan.fast_send_started_ns / 1_000_000.0 - trigger_at * 1000.0,
+                    )
+                )
         runtime.fast_send_start_offsets_ms = offsets
         valid_offsets = [value for value in offsets if value is not None]
         runtime.fast_first_send_start_ms = min(valid_offsets) if valid_offsets else None
         runtime.fast_trigger_to_submit_ms = runtime.fast_first_send_start_ms
 
-        outcomes: list[UpgradeOutcome] = []
-        for result in raw_results:
-            if isinstance(result, UpgradeOutcome):
-                outcomes.append(result)
-            elif isinstance(result, BaseException):
-                outcomes.append(
-                    UpgradeOutcome(
-                        "unknown",
-                        detail=f"{type(result).__name__}: {result}; FAST-повтор не отправлялся",
-                    )
-                )
-            else:
-                outcomes.append(
-                    UpgradeOutcome("unknown", detail="Неожиданный результат FAST-залпа")
-                )
+        gift_offsets = offsets[:2] if pachka else offsets
         outcome_log = [
             {
                 "saved_id": candidate.saved_id,
@@ -4630,14 +5218,38 @@ class Scanner:
                 "form_age_ms": round(max(0.0, time.monotonic() - plan.created_at) * 1000.0, 3),
                 "status": outcome.status,
                 "actual_num": outcome.actual_num,
-                "send_start_ms": offsets[index],
+                "send_start_ms": gift_offsets[index] if index < len(gift_offsets) else None,
                 "detail": (outcome.detail or "")[:180],
             }
             for index, (candidate, plan, outcome) in enumerate(zip(candidates, plans, outcomes))
         ]
+        pachka_attempt_log: list[dict[str, Any]] = []
+        if pachka:
+            attempt_infos = [candidates[0], *([candidates[1]] * 5)]
+            for index, (info, plan) in enumerate(zip(attempt_infos, pachka_plans)):
+                outcome = (
+                    attempt_outcomes[index]
+                    if index < len(attempt_outcomes)
+                    else UpgradeOutcome("unknown", detail="PACHKA attempt result отсутствует")
+                )
+                pachka_attempt_log.append(
+                    {
+                        "slot": index + 1,
+                        "planned_offset_ms": PACHKA_OFFSETS_MS[index],
+                        "saved_id": info.saved_id,
+                        "form_id": plan.form_id,
+                        "request_form_id": _int_or_none(getattr(plan.request, "form_id", None)),
+                        "request_invoice_saved_id": invoice_saved_id(getattr(plan.request, "invoice", None)),
+                        "send_start_ms": offsets[index] if index < len(offsets) else None,
+                        "status": outcome.status,
+                        "actual_num": outcome.actual_num,
+                        "detail": (outcome.detail or "")[:180],
+                    }
+                )
+
         logger.warning(
             "fast_volley_completed shooter_id=%s source=%s campaign_id=%s slug=%s predecessor=%s target=%s "
-            "volley=%s volley_limit=%s dispatch_mode=%s udp_peers_sent=%s first_send_start_ms=%.3f task_launch_ms=%.3f outcomes=%s",
+            "volley=%s volley_limit=%s dispatch_mode=%s udp_peers_sent=%s first_send_start_ms=%.3f task_launch_ms=%.3f outcomes=%s pachka_attempts=%s",
             SHOOTER_ID,
             source,
             campaign_id,
@@ -4651,6 +5263,7 @@ class Scanner:
             runtime.fast_first_send_start_ms or 0.0,
             runtime.fast_task_launch_ms or 0.0,
             json.dumps(outcome_log, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(pachka_attempt_log, ensure_ascii=False, separators=(",", ":")) if pachka else "[]",
         )
         record_payment_event(
             "fast_volley_completed",
@@ -4663,10 +5276,18 @@ class Scanner:
             volley_limit=effective_max_volley_size(),
             dispatch_mode=fast_dispatch_mode(),
             fast_wait_response=effective_fast_wait_response(),
+            pachka_enabled=pachka,
+            pachka_locked_saved_ids=(
+                list(self._pachka_locked_saved_ids)
+                if self._pachka_locked_saved_ids is not None
+                else None
+            ),
+            pachka_planned_offsets_ms=list(PACHKA_OFFSETS_MS) if pachka else None,
             first_send_start_ms=runtime.fast_first_send_start_ms,
             task_launch_ms=runtime.fast_task_launch_ms,
             send_start_offsets_ms=offsets,
             outcomes=outcome_log,
+            pachka_attempts=pachka_attempt_log,
         )
         record_cluster_event(
             "fast_volley_completed",
@@ -4679,13 +5300,18 @@ class Scanner:
             volley_limit=effective_max_volley_size(),
             dispatch_mode=fast_dispatch_mode(),
             fast_wait_response=effective_fast_wait_response(),
+            pachka_enabled=pachka,
             udp_peers_sent=peers_sent,
             first_send_start_ms=runtime.fast_first_send_start_ms,
             task_launch_ms=runtime.fast_task_launch_ms,
             send_start_offsets_ms=offsets,
             outcomes=outcome_log,
+            pachka_attempts=pachka_attempt_log,
         )
         await self._finish_fast_volley(candidates, counter, target, outcomes)
+        if pachka:
+            self.pachka_prepared.clear()
+            self._pachka_locked_saved_ids = None
 
     async def _finish_fast_volley(
         self,
@@ -5419,7 +6045,7 @@ class ClusterRuntime:
             if runtime.stress_active:
                 await stress_tester.stop("cluster_config_notice")
         store.settings.live_upgrades = False
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         self.disarm()
         with contextlib.suppress(Exception):
             await store.save()
@@ -5549,7 +6175,7 @@ class ClusterRuntime:
             if runtime.stress_active:
                 await stress_tester.stop("cluster_deactivated")
         store.settings.live_upgrades = False
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         self.disarm()
         with contextlib.suppress(Exception):
             await store.save()
@@ -6563,7 +7189,7 @@ async def shooter_count_button_handler(message: Message, state: FSMContext) -> N
     if stress_was_active:
         await stress_tester.stop("cluster_reconfigure")
     store.settings.live_upgrades = False
-    scanner.prepared.clear()
+    scanner.clear_prepared_state()
     cluster_runtime.disarm()
     cluster_runtime.notify_state_changed()
     await store.save()
@@ -6611,7 +7237,7 @@ async def shooter_count_handler(message: Message, state: FSMContext) -> None:
         store.settings.live_upgrades = False
         settings_changed = True
     if scanner.prepared:
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
     if settings_changed:
         await store.save()
     logger.info(
@@ -6811,7 +7437,7 @@ async def channel_callback_handler(callback: CallbackQuery) -> None:
                 await safe_edit_markup(callback.message, channels_keyboard(choices))
             return
         choice = await mtproto.select_channel(int(action))
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         cluster_runtime.notify_state_changed()
         await callback.answer("Канал выбран", show_alert=True)
         if callback.message:
@@ -6877,7 +7503,7 @@ async def toggle_gift_selection(saved_id: int, valid_ids: set[int]) -> None:
             raise RuntimeError("Экземпляр больше недоступен. Нажми «Обновить».")
         selected.append(saved_id)
     store.settings.selected_saved_ids = _unique_ints(selected)
-    scanner.prepared.clear()
+    scanner.clear_prepared_state()
     store.settings.live_upgrades = False
     await store.save()
     cluster_runtime.notify_state_changed()
@@ -6956,7 +7582,7 @@ async def targets_value_handler(message: Message, state: FSMContext) -> None:
         return
     store.settings.target_numbers = targets
     store.settings.live_upgrades = False
-    scanner.prepared.clear()
+    scanner.clear_prepared_state()
     await store.save()
     cluster_runtime.notify_state_changed()
     await state.clear()
@@ -7644,7 +8270,16 @@ async def live_preflight(*, prepare: bool) -> str:
         raise RuntimeError(
             f"Для залпа {operation_count} выбрано только {len(infos)} подарков"
         )
-    planned_infos = infos[:operation_count]
+    if effective_pachka_enabled():
+        if operation_count != 2 or len(_unique_ints(store.settings.selected_saved_ids)) != 2:
+            raise RuntimeError("/pachka on требует залп 2 и ровно два выбранных подарка")
+        by_id = {info.saved_id: info for info in infos}
+        selected_ids = _unique_ints(store.settings.selected_saved_ids)
+        if any(saved_id not in by_id for saved_id in selected_ids):
+            raise RuntimeError("PACHKA lock не может привязать выбранные saved_id")
+        planned_infos = [by_id[selected_ids[0]], by_id[selected_ids[1]]]
+    else:
+        planned_infos = infos[:operation_count]
     planned_targets = [future_targets[0]] * operation_count
     plans: list[PreparedUpgrade | None] = []
     for candidate in planned_infos:
@@ -7653,6 +8288,12 @@ async def live_preflight(*, prepare: bool) -> str:
             plan = await mtproto.prepare_upgrade(peer, candidate)
             scanner.prepared[candidate.saved_id] = plan
         plans.append(plan)
+
+    if prepare and effective_pachka_enabled():
+        await scanner._refresh_pachka_extras(peer, planned_infos, force=True)
+        pack_reason = scanner._fast_ammo_error(planned_infos)
+        if pack_reason is not None:
+            raise RuntimeError(f"PACHKA не вооружена: {pack_reason}")
 
     costs: list[int] = []
     prepaid_count = 0
@@ -7682,12 +8323,25 @@ async def live_preflight(*, prepare: bool) -> str:
         payment_text = f"до {paid_total} ⭐ суммарно"
     limit_text = f"{MAX_UPGRADE_STARS} ⭐" if MAX_UPGRADE_STARS else "без лимита"
     warning = ""
-    if operation_count > 1:
+    if effective_pachka_enabled():
+        dispatch_text = "PACHKA · 0/20/35/50/75/100 мс · 6 разных forms → только 2 locked saved_id"
         warning = (
-            f"\n⚠️ Залп {operation_count}: запросы уйдут последовательно NEXT-TICK — "
-            "следующий ставится после отправки предыдущего, но без ожидания ответа Telegram. "
-            f"Максимальное списание — {paid_total} ⭐; часть подарков может получить следующие номера."
+            "\n⚠️ PACHKA: Gift A получает один request в t=0; Gift B — пять заранее "
+            "подготовленных разных forms в t=20/35/50/75/100 мс. Ни один request не может "
+            "переключиться на третий saved_id. /otvet сохранён, но применяется только при /pachka off."
         )
+    else:
+        dispatch_text = (
+            "RESPONSE-CHAIN · ответ предыдущего → сразу следующий"
+            if effective_fast_wait_response()
+            else "NEXT-TICK · без ожидания ответа Telegram"
+        )
+        if operation_count > 1:
+            warning = (
+                f"\n⚠️ Залп {operation_count}: режим {dispatch_text}. "
+                f"Максимальное списание по выбранным подаркам — {paid_total} ⭐; "
+                "часть подарков может получить следующие номера."
+            )
 
     return (
         "⚠️ <b>Подтверждение LIVE</b>\n"
@@ -7697,13 +8351,13 @@ async def live_preflight(*, prepare: bool) -> str:
         f"Текущий номер: <b>{counter.current}</b>\n"
         f"Выстрел FAST-залпа: <b>#{future_targets[0]}</b>\n"
         f"Размер залпа: <b>{operation_count}</b>\n"
-        "FAST-dispatch: <b>NEXT-TICK</b> · фиксированной задержки нет\n"
+        f"FAST-dispatch: <b>{dispatch_text}</b>\n"
         f"Возможное списание: <b>{payment_text}</b>\n"
         f"Лимит одной операции: <b>{limit_text}</b>"
         f"{warning}\n\n"
-        "Платёжные формы и сами MTProto-запросы подготовлены заранее. После точного появления "
-        "номера выстрела минус один FAST отправит залп без дополнительной проверки выстрела, без записи на диск "
-        "и без автоматического повтора. Точный номер не гарантируется."
+        "Платёжные формы и MTProto-запросы подготовлены заранее. После точного появления "
+        "номера выстрела минус один FAST отправит выбранный режим без дополнительной проверки выстрела "
+        "и без записи guard на диск. Точный номер не гарантируется."
     )
 
 
@@ -7723,7 +8377,7 @@ async def volley_toggle_handler(message: Message) -> None:
     live_was_enabled = store.settings.live_upgrades
     if live_was_enabled:
         store.settings.live_upgrades = False
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
     await store.save()
     logger.info(
         "volley_size_changed shooter_id=%s volley=%s volley_limit=%s live_disabled=%s",
@@ -7763,7 +8417,7 @@ async def payment_toggle_handler(message: Message) -> None:
         return
     if store.settings.live_upgrades:
         store.settings.live_upgrades = False
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         await store.save()
         cluster_runtime.notify_state_changed()
         logger.info("live_disabled_by_toggle")
@@ -7792,7 +8446,7 @@ async def payment_toggle_handler(message: Message) -> None:
 async def payment_confirm_handler(callback: CallbackQuery) -> None:
     """Reject confirmation buttons left in chat by older versions.
 
-    Gift Hunter v0041 uses the reply-keyboard payment switch itself as confirmation, so a
+    Gift Hunter v0042 uses the reply-keyboard payment switch itself as confirmation, so a
     stale inline button must never change the current LIVE state.
     """
     if not await owner_guard_callback(callback):
@@ -8117,17 +8771,20 @@ async def ping_handler(message: Message) -> None:
 
 def settings_summary_text() -> str:
     wait_response = effective_fast_wait_response()
-    if wait_response:
+    otvet_line = (
+        "ОТВЕТ ON · RESPONSE-CHAIN: SEND #1 → raw RPC-ответ → сразу следующий"
+        if wait_response
+        else "ОТВЕТ OFF · NEXT-TICK: следующий payment без ожидания ответа"
+    )
+    if effective_pachka_enabled():
         dispatch_line = (
-            "FAST-dispatch: <b>ОТВЕТ ON</b> · RESPONSE-CHAIN\n"
-            "SEND #1 → только RPC-ответ Telegram → сразу SEND #2; "
-            "между ответом и следующим payment нет NFT-проверки, UI, guard или фиксированной паузы."
+            "FAST-dispatch: <b>PACHKA ON</b> · 0/20/35/50/75/100 мс\n"
+            "Жёсткая оболочка: ровно 2 selected saved_id; Gift A = 1 form, Gift B = 5 разных forms.\n"
+            f"/otvet сохранён как <b>{'ON' if wait_response else 'OFF'}</b>, но пока PACHKA ON он не участвует в выстреле."
         )
     else:
         dispatch_line = (
-            "FAST-dispatch: <b>ОТВЕТ OFF</b> · NEXT-TICK\n"
-            "Следующий payment ставится после queue предыдущего и одного оборота event loop; "
-            "ответ предыдущего платежа не ожидается."
+            "FAST-dispatch: <b>PACHKA OFF</b> · используется /otvet\n" + otvet_line
         )
     return (
         f"⚙️ <b>Настройки {APP_NAME} {APP_VERSION}</b>\n"
@@ -8154,14 +8811,70 @@ async def help_handler(message: Message) -> None:
     await message.answer(
         f"📖 <b>{APP_NAME} {APP_VERSION} — команды</b>\n"
         "<code>/settings</code> — показать рабочие настройки.\n"
-        "<code>/otvet</code> — показать режим второго и следующих платежей.\n"
-        "<code>/otvet off</code> — по умолчанию NEXT-TICK: следующий payment без ожидания ответа Telegram.\n"
+        "<code>/pachka</code> — показать режим пачки.\n"
+        "<code>/pachka on</code> — по умолчанию: 6 разных forms, offsets 0/20/35/50/75/100 мс, строго два selected saved_id.\n"
+        "<code>/pachka off</code> — отключить пачку и использовать старый режим /otvet.\n"
+        "<code>/otvet off</code> — NEXT-TICK: следующий payment без ожидания ответа Telegram.\n"
         "<code>/otvet on</code> — RESPONSE-CHAIN: следующий payment сразу после RPC-ответа предыдущего.\n"
         "<code>/log_full</code> — выгрузить полный лог за последние 24 часа.\n"
-        "<code>/stagger</code> — фиксированный stagger отключён; используется /otvet.\n"
-        "Кнопка <b>🗑 Сброс</b> — полный рабочий сброс: удаляет payment hold, cooldown, цели, подарки, LIVE и временное состояние; авторизация и MTProto-session сохраняются. /otvet после сброса снова OFF.\n"
+        "<code>/stagger</code> — показывает актуальные режимы задержки.\n"
+        "Кнопка <b>🗑 Сброс</b> — полный рабочий сброс; авторизация и MTProto-session сохраняются. "
+        "После сброса /pachka снова ON, /otvet снова OFF.\n"
         "<code>/version</code> — показать версию.\n\n"
-        "Guard полностью убран из критического пути в обоих FAST-режимах.",
+        "Guard полностью убран из критического пути во всех FAST-режимах.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(Command("pachka"))
+async def pachka_handler(message: Message) -> None:
+    if not await owner_guard_message(message):
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) == 1 or not parts[1].strip():
+        state = "ON" if effective_pachka_enabled() else "OFF"
+        fallback = "RESPONSE-CHAIN" if effective_fast_wait_response() else "NEXT-TICK"
+        await message.answer(
+            f"📦 /pachka сейчас: <b>{state}</b>\n"
+            "ON — ровно два выбранных подарка: A@0 мс, B@20/35/50/75/100 мс; всего 6 разных forms.\n"
+            f"OFF — используется старый /otvet: <b>{fallback}</b>.\n"
+            "PACHKA никогда не подставляет третий saved_id.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    value = parts[1].strip().lower()
+    if value not in {"on", "off"}:
+        await message.answer(
+            "Использование: <code>/pachka on</code> или <code>/pachka off</code>.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    enabled = value == "on"
+    changed = store.settings.pachka_enabled != enabled
+    if changed and runtime.active:
+        await scanner.stop("pachka_mode_change")
+    if changed:
+        store.settings.pachka_enabled = enabled
+        store.settings.live_upgrades = False
+        scanner.clear_prepared_state()
+        await store.save()
+        scanner._plan_dirty = True
+        cluster_runtime.notify_state_changed()
+        record_cluster_event(
+            "fast_pachka_mode_changed",
+            enabled=enabled,
+            dispatch_mode=fast_dispatch_mode(),
+            offsets_ms=list(PACHKA_OFFSETS_MS),
+        )
+
+    state = "ON" if enabled else "OFF"
+    suffix = " LIVE выключен — включи оплату заново." if changed else ""
+    fallback = "RESPONSE-CHAIN" if effective_fast_wait_response() else "NEXT-TICK"
+    mode = "0/20/35/50/75/100 мс" if enabled else f"/otvet → {fallback}"
+    await message.answer(
+        f"✅ /pachka <b>{state}</b> · {mode}.{suffix}",
         reply_markup=main_keyboard(),
     )
 
@@ -8174,17 +8887,26 @@ async def otvet_handler(message: Message) -> None:
     if len(parts) == 1 or not parts[1].strip():
         state = "ON" if effective_fast_wait_response() else "OFF"
         mode = "RESPONSE-CHAIN" if effective_fast_wait_response() else "NEXT-TICK"
+        pack_note = (
+            "\n📦 Сейчас /pachka ON, поэтому этот режим сохранён как fallback и начнёт действовать после /pachka off."
+            if effective_pachka_enabled()
+            else ""
+        )
         await message.answer(
             f"⚡ /otvet сейчас: <b>{state}</b> · {mode}\n"
             "OFF — следующий payment без ожидания ответа Telegram.\n"
-            "ON — следующий payment ставится сразу после raw RPC-ответа предыдущего.",
+            "ON — следующий payment ставится сразу после raw RPC-ответа предыдущего."
+            + pack_note,
             reply_markup=main_keyboard(),
         )
         return
 
     value = parts[1].strip().lower()
     if value not in {"on", "off"}:
-        await message.answer("Использование: <code>/otvet on</code> или <code>/otvet off</code>.", reply_markup=main_keyboard())
+        await message.answer(
+            "Использование: <code>/otvet on</code> или <code>/otvet off</code>.",
+            reply_markup=main_keyboard(),
+        )
         return
 
     enabled = value == "on"
@@ -8194,7 +8916,7 @@ async def otvet_handler(message: Message) -> None:
     if changed:
         store.settings.fast_wait_response = enabled
         store.settings.live_upgrades = False
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         await store.save()
         scanner._plan_dirty = True
         cluster_runtime.notify_state_changed()
@@ -8202,13 +8924,15 @@ async def otvet_handler(message: Message) -> None:
             "fast_otvet_mode_changed",
             enabled=enabled,
             dispatch_mode=fast_dispatch_mode(),
+            pachka_enabled=effective_pachka_enabled(),
         )
 
     state = "ON" if enabled else "OFF"
     mode = "RESPONSE-CHAIN" if enabled else "NEXT-TICK"
     suffix = " LIVE выключен — включи оплату заново." if changed else ""
+    pack_note = " PACHKA сейчас ON: /otvet сохранён как fallback." if effective_pachka_enabled() else ""
     await message.answer(
-        f"✅ /otvet <b>{state}</b> · {mode}.{suffix}",
+        f"✅ /otvet <b>{state}</b> · {mode}.{suffix}{pack_note}",
         reply_markup=main_keyboard(),
     )
 
@@ -8218,10 +8942,10 @@ async def stagger_handler(message: Message) -> None:
     if not await owner_guard_message(message):
         return
     await message.answer(
-        "⏱ Фиксированный stagger в v0041 отключён. Используй <code>/otvet off</code> для NEXT-TICK "
-        "или <code>/otvet on</code> для цепочки «RPC-ответ предыдущего → сразу следующий payment». "
-        "Фактическая разница пишется в <code>/log_full</code> как queue_offsets_ms/queue_deltas_ms; "
-        "в режиме ON также пишется response_offsets_ms.",
+        "⏱ В v0042: <code>/pachka on</code> использует абсолютные offsets "
+        "<b>0/20/35/50/75/100 мс</b>. При <code>/pachka off</code> работают старые "
+        "<code>/otvet off</code> NEXT-TICK и <code>/otvet on</code> RESPONSE-CHAIN. "
+        "Фактические queue/response offsets и ошибка расписания пишутся в <code>/log_full</code>.",
         reply_markup=main_keyboard(),
     )
 
@@ -8283,7 +9007,7 @@ async def reset_confirm_handler(callback: CallbackQuery, state: FSMContext) -> N
         # authorization flag and every *.session database remain untouched.
         await state.clear()
         mtproto.clear_operational_cache()
-        scanner.prepared.clear()
+        scanner.clear_prepared_state()
         scanner.triggered.clear()
         scanner.notified_missed.clear()
         scanner._groups.clear()
@@ -8602,6 +9326,13 @@ async def write_diagnostics() -> None:
             "volley_size": store.settings.volley_size,
             "fast_dispatch_mode": fast_dispatch_mode(),
             "fast_wait_response": effective_fast_wait_response(),
+            "pachka_enabled": effective_pachka_enabled(),
+            "pachka_offsets_ms": list(PACHKA_OFFSETS_MS),
+            "pachka_locked_saved_ids": list(scanner._pachka_locked_saved_ids) if scanner._pachka_locked_saved_ids else None,
+            "pachka_prepared_extra_form_ids": {
+                str(saved_id): [plan.form_id for plan in plans]
+                for saved_id, plans in scanner.pachka_prepared.items()
+            },
             "api_id_present": bool(store.settings.api_id),
             "api_hash_present": bool(store.settings.api_hash),
             "phone_present": bool(store.settings.phone),
@@ -8668,6 +9399,7 @@ async def _auto_resume_scanner_after_crash(bot: Bot) -> bool:
         volley=effective_volley_size(),
         dispatch_mode=fast_dispatch_mode(),
         fast_wait_response=effective_fast_wait_response(),
+        pachka_enabled=effective_pachka_enabled(),
     )
     owner = store.settings.owner_user_id
     if owner is not None:

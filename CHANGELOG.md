@@ -1,5 +1,18 @@
 # Changelog
 
+## v0042 — PACHKA 0/20/35/50/75/100 мс + сохранённые режимы v0041
+
+- Добавлена команда `/pachka on|off`; по умолчанию после установки/полного Reset стоит `/pachka on`.
+- `PACHKA ON` жёстко требует залп `2` и ровно два выбранных `saved_id`. Первый подарок A получает одну заранее подготовленную форму в `t=0`; второй подарок B получает пять **разных** заранее подготовленных форм в `t=20/35/50/75/100 мс`. Всего до выстрела готовы 6 разных `form_id`.
+- Все смещения абсолютные относительно фактического queue первого payment в уже подключённый MTProto sender. Второй и последующие requests не ждут RPC-ответов предыдущих.
+- Добавлена жёсткая оболочка binding: PACHKA фиксирует пару выбранных `saved_id` до выстрела, валидирует invoice/request каждого из шести payment forms и не имеет кода подстановки третьего подарка. Схема binding всегда `A,B,B,B,B,B`.
+- Все 6 `form_id` обязаны быть уникальны. Четыре дополнительные B-формы обслуживаются тем же background refresh и теми же safety-age правилами; при смене выбранных подарков комплект сбрасывается.
+- `/pachka off` полностью возвращает сохранённый функцион v0041. `/otvet off` = NEXT-TICK; `/otvet on` = RESPONSE-CHAIN, где следующий payment ставится сразу после raw RPC-ответа предыдущего. Состояние `/otvet` сохраняется как fallback даже пока PACHKA включена.
+- Persistent payment guard по-прежнему отсутствует во всех firing paths; до первого Stars submit нет guard/fsync.
+- Payment-audit для PACHKA пишет planned offsets, реальные queue/response offsets, schedule error, 6 form_id и locked saved_id.
+- Добавлены regression-тесты: 6 уникальных forms только на два выбранных подарка; реальный asyncio scheduling 0/20/35/50/75/100 мс при искусственно задержанных до 150 мс RPC-ответах; возврат неизменённых `/otvet on/off` после `/pachka off`.
+- Финальный локальный regression-run текущего дерева: `202` теста `OK`; живые Telegram/Stars-платежи v0042 в офлайн-проверке не выполнялись.
+
 ## v0041 — два FAST-режима: NEXT-TICK + RESPONSE-CHAIN, без payment guard
 
 - По умолчанию сохранён быстрый режим: `/otvet off` → `NEXT-TICK`. Первый `SendStarsFormRequest` ставится сразу, затем один `await asyncio.sleep(0)` и следующий payment — без ожидания Telegram.

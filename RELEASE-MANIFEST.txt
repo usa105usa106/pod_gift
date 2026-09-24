@@ -1,39 +1,40 @@
-Gift Hunter v0041 — Release Manifest — NEXT-TICK + RESPONSE-CHAIN / no payment guard
+Gift Hunter v0042 — Release Manifest — PACHKA + v0041 fallback modes / no payment guard
 
 Validation summary:
-- Default /otvet off preserves NEXT-TICK: queue payment #1, yield one asyncio event-loop turn, then queue #2 without waiting for Telegram.
-- /otvet on enables RESPONSE-CHAIN: queue #1, await only its raw RPC future, then queue #2 immediately; no NFT verification/UI/disk work occurs between the response and next payment.
-- Persistent payment guard is absent from the firing path; no guard fsync occurs before the first Stars submit. Legacy guard files are cleanup-only.
-- No fixed millisecond stagger is used; /stagger is informational and /otvet selects the dispatch strategy.
-- Production submit remains ordered=False and uses the already-connected Telethon sender directly, without invokeAfterMsg and without automatic financial retry.
-- Payment audit records dispatch mode, wait flag, queue offsets/deltas and raw response offsets.
-- Scanner resume/watchdog/full Reset behaviour is preserved. Reset clears operational state and returns /otvet to OFF while preserving owner/API/phone and MTProto session authorization.
-- Historical logs/payment audit are preserved by Reset for diagnostics.
-- Final local regression run: 199 tests, OK.
-- Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with 6 services.
-- No live Telegram/Stars payment was executed as part of offline validation.
+- /pachka ON is the default after install/reset and requires exactly volley=2 with exactly two selected saved_id values.
+- Six distinct payment forms are fully prepared before fire and hard-bound as A,B,B,B,B,B.
+- Absolute sender queue schedule: A@0 ms; B@20/35/50/75/100 ms. Later requests do not wait for earlier RPC responses.
+- Every form_id must be unique; every invoice/request saved_id binding is validated before the first Stars submit. No third gift can be substituted by the PACHKA path.
+- /pachka OFF restores the preserved v0041 behavior: /otvet OFF = NEXT-TICK; /otvet ON = RESPONSE-CHAIN. The execute_upgrade_fast_batch implementation body is unchanged from v0041.
+- Persistent payment guard remains absent from every firing path; legacy guard files are cleanup/diagnostic only.
+- Existing scanner/exact/quiet/form-refresh/watchdog/resume/reset/cluster behavior is retained; extra B forms join the existing payment-form refresh/safety lifecycle.
+- Payment audit records planned offsets, actual queue offsets, schedule errors, response offsets, all six form_id values and locked saved_id values.
+- Final local regression run: 202 tests, OK.
+- Python py_compile/compileall + AST parsing succeed; docker-compose.yaml parses with exactly 6 services.
+- Offline scheduler regression holds RPC responses for 150 ms and still queues all 6 requests by the 0/20/35/50/75/100 ms schedule.
+- No live Telegram/Stars payment was executed as part of v0042 offline validation.
 
 Files (SHA256  bytes  path):
 e18783f0f95ce8910f7dc62f1f8ab4c92f13084aaab9a02427d2b5d264343ec4         166  .dockerignore
 f9be51eea118c9306f4371baadd13b6e652142b78793d6e4a8caa9b7d462c692        2256  .env.example
 8b24d591dfbcd9118754cfc63d40bd704ba7fa34b8d013c55c2559ced29626f6         153  .gitignore
-92f34fe3328664ded24456b8516bcef7595d5aedb51c45ba6990064e44e03fb7        9872  AUDIT-LOGGING.md
-cd1eb6654e5dff94c49eb3ca939b621053fac440b4e77e60675259436e8da7bb       40218  CHANGELOG.md
+33571d08f079d18e44bf58ccba9abf0fe9d563fadcca60fe5950e62740f0da59        9872  AUDIT-LOGGING.md
+32e162dc82efd4ece673473b37a9813c01e01232562fb772a80628b49ef3d817       43148  CHANGELOG.md
 ea22a7964c730d2063657d3604a052094a2303e9ccea16ab59a0246fe68ce795         722  Dockerfile
-b3d122614c3837c954c483daf4babaaac5116caed6dde49f14c9744931663c33        2275  PAYMENT-DIAGNOSTIC-PATCH.md
-e76181809f3d0863338d06d3bba1d8b7fe5f786416d11cc97f29b81da49b9a6f       31743  README.md
-e1ec3f6b34e650b735ecd45214ff16cd96c043ba73b0522bde494c06da93fc67       20546  VALIDATION.md
-04d7ee1de5f6a786cbc1bd91733393a7f5cea90000778a7ec783785670208d62        7663  bootstrap.py
+57f6558af8dccdc1a8a2383d2c07dc216070394a22d1d65fdaa30ad8d4c334fc        2275  PAYMENT-DIAGNOSTIC-PATCH.md
+89995c7430b03ac1ebe49bada0a566e85ae012aba8768030139c44d979ca5367       32444  README.md
+f16bd5d6be0f04d32e60c8ba190cabd67234a7b0d91593dc94d7af64583ec1ec       22472  VALIDATION.md
+b9648999ad99cca29fb3f910c3e3e2e1962208a7b2572c5286b6c05578512f16        7663  bootstrap.py
 5ed86152b1458131a3d1375e62ba816fd3a00c62b7a0f801340af7b275e7b2aa       37284  cluster.py
 d37a492dd3bb4bf53c36083b86deed068cabb7c649163ecdd4f4e8164d02aaa6        5506  docker-compose.yaml
-7f262ad5a902aa0473bda0b45a66ae09e0325ab07e2d6c823222fd1570b067bb        1533  healthcheck.py
+9801e03d95ac379dab85b1b2967efe29752a1b19b936d96ebcd38824a61c3ed2        1533  healthcheck.py
 8ba697beab2720a697aa9ac7502499a62fef471504f73fdb33a7712a9af9b93d       10781  logic.py
-c746de6242a0a59ff685dd24c9707a4e4091a0215110d18d7062b630827c95b6      392814  main.py
+ebd97fc88ca54a76766b2a2b22b0359d3d9e2a8a0dbc92a77103045ca86aad95      427900  main.py
 7f65e97e5105dd845c587d5bb0722526a63799d0c38b4539cbe9c2b74b8e17d4          85  requirements.txt
 959929b71c3fd2898dbde2c6477f57630e6e32a818361127fbf962696ee70398          54  tests/__init__.py
 591c2a9cac004fa875c581f29e52325eaa7e0aa7552b77b9eb336a25d026e922        4020  tests/stub_modules.py
-e46668179bd7c69e53035f68f23bee6468e2ecae608069b583894f508e51766a        2109  tests/test_bootstrap.py
+a3f71f7725a62d3b77382c30db230d5602d6aadf15c5b58ce9d790c763489ecc        2109  tests/test_bootstrap.py
 6bc313e71f0abcd5fb9d3e8c5f7550357946ddf11b5c9e3117d4f2ae1b8427cc       19868  tests/test_cluster.py
 fef9c06c9019e93f499a156dd0f478833ee2cc28ab9d1997b84f3ea042f6c530        4494  tests/test_logic.py
-d439cf03621574d87f9a41d3d5f1ef3704f510a39082c7f88b7e82a49a9748ca      169885  tests/test_runtime.py
-5f44426efca2b4d1402dfcc262cca2e232e0fe82063cc115732504b6f1c8136e       22150  tests/test_source_guards.py
+2a13805a26c41ad81a67d98f081740b85aada9af2f9e24da0d0c786388d8e1ed      175939  tests/test_runtime.py
+95c6efc46d3793cd1bb1f8297754588d4b30955b20138695638af315cb63b3b2       22150  tests/test_source_guards.py

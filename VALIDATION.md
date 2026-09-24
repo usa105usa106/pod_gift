@@ -1,4 +1,14 @@
-# Validation — Gift Hunter v0041
+# Validation — Gift Hunter v0042
+
+## PACHKA 0/20/35/50/75/100 мс — 24 сентября 2026
+
+Новый default-mode `/pachka on` проверяется как отдельный заранее подготовленный financial schedule для ровно двух selected gifts. До начала submit существуют шесть разных `form_id`; binding обязан быть строго `A,B,B,B,B,B`, и invoice/request каждого слота обязан содержать ожидаемый `saved_id`. Третий подарок из группы не может попасть в PACHKA-план.
+
+Asyncio regression-тест использует искусственный sender, который удерживает каждый RPC response минимум `150` мс. Несмотря на это, все шесть requests ставятся без ожидания response по плану `0/20/35/50/75/100` мс; это отдельно подтверждает, что PACHKA не деградирует в RESPONSE-CHAIN. Тайминги в production дополнительно пишутся как planned offset, actual queue offset, schedule error и response offset.
+
+При `/pachka off` код возвращается к сохранённому v0041 path: `/otvet off` = NEXT-TICK, `/otvet on` = raw RPC RESPONSE-CHAIN. Guard остаётся полностью удалённым из hot path. Полный Reset возвращает `/pachka on` и `/otvet off`, сохраняя owner/API/phone и MTProto session.
+
+Финальный локальный regression-run: `202` теста `OK`. Дополнительно выполнены `py_compile`, `compileall`, AST-разбор всех Python-файлов и YAML-разбор `docker-compose.yaml` с шестью сервисами. Живой Telegram/Stars submit для PACHKA в офлайн-проверке не выполнялся.
 
 ## Два FAST-режима + удаление payment guard — 21 сентября 2026
 
